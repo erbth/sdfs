@@ -36,7 +36,7 @@ void dd_ctx::initialize_sock()
 
 	for (port = SDFS_DD_PORT_START; port <= SDFS_DD_PORT_END; port++)
 	{
-		sock.set_errno(socket(AF_INET6, SOCK_STREAM, 0), "socket");
+		sock.set_errno(socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0), "socket");
 
 		addr.sin6_port = htons(port);
 

@@ -100,4 +100,8 @@ T next_power_of_two(T i)
 	return v;
 }
 
+/* Throws runtime_error if not enough data could be read/written */
+void simple_read(int fd, char* buf, size_t size);
+void simple_write(int fd, const char* buf, size_t size);
+
 #endif /* __COMMON_UTILS_H */

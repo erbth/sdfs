@@ -44,22 +44,6 @@ size_t get_device_size(int fd)
 }
 
 
-void simple_read(int fd, char* buf, size_t size)
-{
-	size_t pos = 0;
-	while (pos < size)
-	{
-		auto ret = read(fd, buf + pos, size - pos);
-		if (ret < 0)
-			throw system_error(errno, generic_category(), "pread");
-
-		if (ret == 0)
-			throw runtime_error("encountered EOF");
-
-		pos += ret;
-	}
-}
-
 void simple_pread(int fd, char* buf, size_t size, off_t offset)
 {
 	size_t pos = 0;
@@ -124,7 +108,7 @@ void DeviceInfo::serialize_header(char* buffer)
 	ser::swrite_u64(ptr, size);
 }
 
-void DeviceInfo::parse_header(char* buffer)
+void DeviceInfo::parse_header(const char* buffer)
 {
 	auto ptr = buffer;
 	if (memcmp(ptr, SDFS_DD_MAGIC, sizeof(SDFS_DD_MAGIC)) != 0)

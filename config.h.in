@@ -9,7 +9,7 @@
 #define SDFS_DD_MAGIC "sdfs-dd v1;"
 
 #define SDFS_CTRL_PORT		10300
-#define SDFS_MGR_PORT		10309
+#define SDFS_DD_MGR_PORT	10309
 #define SDFS_DD_PORT_START	10310
 #define SDFS_DD_PORT_END	10399
 

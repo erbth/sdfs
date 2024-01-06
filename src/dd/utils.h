@@ -11,9 +11,6 @@ extern "C" {
  * function throws a runtime_error */
 size_t get_device_size(int fd);
 
-/* Throws runtime_error if not enough data could be read/written */
-void simple_read(int fd, char* buf, size_t size);
-
 void simple_pread(int fd, char* buf, size_t size, off_t offset);
 void simple_pwrite(int fd, char* buf, size_t size, off_t offset);
 
@@ -34,7 +31,7 @@ public:
 	void serialize_header(char* buffer);
 
 	/* Expects 4096 bytes */
-	void parse_header(char* buffer);
+	void parse_header(const char* buffer);
 };
 
 /* Ensures that the size is correct */

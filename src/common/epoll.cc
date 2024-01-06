@@ -86,7 +86,7 @@ void Epoll::_remove_fd(int fd, bool ignore_unknown)
 	if (i == fdinfos.end())
 	{
 		if (ignore_unknown)
-			return
+			return;
 
 		throw invalid_argument("No such fd");
 	}
@@ -120,20 +120,20 @@ void Epoll::process_events(int timeout)
 	{
 		int fd = evts[i].data.fd;
 
-		bool found = false;
+		/* Ensure fdinfos can be changed during cb (i.e. when adding or removing
+		 * fds) */
+		fd_ready_cb_t cb;
 		for (auto& fi : fdinfos)
 		{
 			if (fi.fd == fd)
 			{
-				fi.cb(fd, evts[i].events);
-
-				found = true;
+				cb = fi.cb;
 				break;
 			}
 		}
 
-		if (!found)
-			throw runtime_error("got event for unknown fd");
+		if (cb)
+			cb(fd, evts[i].events);
 	}
 }
 
