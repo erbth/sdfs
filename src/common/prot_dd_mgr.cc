@@ -12,9 +12,9 @@ using namespace ser;
 
 namespace prot
 {
+
 namespace dd_mgr_fe
 {
-
 namespace req
 {
 	query_dds::query_dds()
@@ -141,6 +141,106 @@ namespace reply
 		};
 	}
 };
-
 };
+
+namespace dd_mgr_be
+{
+namespace req
+{
+	register_dd::register_dd()
+		: msg((unsigned) msg_nums::REGISTER_DD)
+	{
+	}
+
+	size_t register_dd::serialize(char* buf) const
+	{
+		size_t size = 4 + 4 + 2;
+
+		if (buf)
+		{
+			swrite_u32(buf, num);
+			swrite_u32(buf, id);
+			swrite_u16(buf, port);
+		}
+
+		return size;
+	}
+
+	void register_dd::parse(const char* buf, size_t size)
+	{
+		if (size != 4 + 6)
+			throw invalid_msg_size(num, size);
+
+		id = sread_u32(buf);
+		port = sread_u16(buf);
+	}
+
+	unique_ptr<msg> parse(const char* buf, size_t size)
+	{
+		if (size < 4)
+			throw invalid_msg_size(0, size);
+
+		int n = sread_u32(buf);
+		switch (n)
+		{
+			case (unsigned) msg_nums::REGISTER_DD:
+			{
+				auto msg = make_unique<register_dd>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			default:
+				throw invalid_msg_num(n);
+		};
+	}
+};
+
+namespace reply
+{
+	register_dd::register_dd()
+		: msg((unsigned) msg_nums::REGISTER_DD)
+	{
+	}
+
+	size_t register_dd::serialize(char* buf) const
+	{
+		size_t size = 4;
+
+		if (buf)
+		{
+			swrite_u32(buf, num);
+		}
+
+		return size;
+	}
+
+	void register_dd::parse(const char* buf, size_t size)
+	{
+		if (size != 4)
+			throw invalid_msg_size(num, size);
+	}
+
+	unique_ptr<msg> parse(const char* buf, size_t size)
+	{
+		if (size < 4)
+			throw invalid_msg_size(0, size);
+
+		int n = sread_u32(buf);
+		switch (n)
+		{
+			case (unsigned) msg_nums::REGISTER_DD:
+			{
+				auto msg = make_unique<register_dd>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			default:
+				throw invalid_msg_num(n);
+		};
+	}
+};
+};
+
 };

@@ -13,4 +13,7 @@
 #define SDFS_DD_PORT_START	10310
 #define SDFS_DD_PORT_END	10399
 
+#define SDFS_RUN_DIR			"/run/sdfs"
+#define SDFS_DD_MGR_SOCKET_PATH	"/run/sdfs/dd-mgr/backend.sock"
+
 #endif /* __SDFS_CONFIG_H */

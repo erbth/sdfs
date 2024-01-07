@@ -1,18 +1,32 @@
+#include <filesystem>
 #include "config.h"
 #include "dd_mgr_ctx.h"
 #include "common/serialization.h"
 #include "common/utils.h"
 #include "common/dynamic_buffer.h"
+#include "common/msg_utils.h"
 
 extern "C" {
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 }
 
 using namespace std;
+
+
+dd_mgr_dd::dd_mgr_dd(WrappedFD&& fd)
+	: fd(move(fd))
+{
+}
+
+int dd_mgr_dd::get_fd()
+{
+	return fd.get_fd();
+}
 
 
 dd_mgr_client::dd_mgr_client(WrappedFD&& fd)
@@ -41,6 +55,41 @@ dd_mgr_ctx::~dd_mgr_ctx()
 
 void dd_mgr_ctx::initialize_unix_socket()
 {
+	ufd.set_errno(socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0), "socket(unix)");
+
+	/* Create run directory if required */
+	ensure_sdfs_run_dir("dd-mgr");
+
+	/* Remove socket if exists already */
+	auto s = filesystem::symlink_status(SDFS_DD_MGR_SOCKET_PATH);
+	if (exists(s))
+	{
+		if (!is_socket(s))
+			throw runtime_error("unix socket file exists but is not a socket");
+
+		check_syscall(unlink(SDFS_DD_MGR_SOCKET_PATH), "unlink(unix socket)");
+	}
+
+	/* Bind socket */
+	struct sockaddr_un addr = {
+		.sun_family = AF_UNIX
+	};
+
+	auto path_len = strlen(SDFS_DD_MGR_SOCKET_PATH) + 1;
+	if (path_len > sizeof(addr.sun_path))
+		throw runtime_error("unix socket path too long");
+
+	memcpy(addr.sun_path, SDFS_DD_MGR_SOCKET_PATH, path_len);
+
+	check_syscall(
+			bind(ufd.get_fd(), (const struct sockaddr*) &addr, sizeof(addr)),
+			"bind(unix)");
+
+	/* Start listening */
+	check_syscall(listen(ufd.get_fd(), 50), "listen(unix)");
+
+	epoll.add_fd(ufd.get_fd(), EPOLLIN,
+			bind_front(&dd_mgr_ctx::on_dd_conn, this));
 }
 
 void dd_mgr_ctx::initialize_tcp()
@@ -82,6 +131,136 @@ void dd_mgr_ctx::on_signal(int s)
 {
 	if (s == SIGINT || s == SIGTERM)
 		quit_requested = true;
+}
+
+
+void dd_mgr_ctx::on_dd_conn(int fd, uint32_t events)
+{
+	WrappedFD wfd;
+	wfd.set_errno(
+			accept4(fd, nullptr, nullptr, SOCK_CLOEXEC),
+			"accept4(unix)");
+
+	dds.push_back(move(wfd));
+
+	try
+	{
+		epoll.add_fd(dds.back().get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP,
+				bind_front(&dd_mgr_ctx::on_dd_fd, this));
+	}
+	catch (...)
+	{
+		dds.pop_back();
+		throw;
+	}
+}
+
+void dd_mgr_ctx::on_dd_fd(int fd, uint32_t events)
+{
+	auto i = dds.begin();
+	for (; i != dds.end(); i++)
+	{
+		if (i->get_fd() == fd)
+			break;
+	}
+
+	if (i == dds.end())
+		throw runtime_error("Got epoll event for invalid dd fd");
+
+	auto& dd = *i;
+	bool remove_dd = false;
+
+	if (events & EPOLLIN)
+	{
+		unique_ptr<prot::msg> msg;
+		try
+		{
+			msg = receive_packet_msg<prot::dd_mgr_be::req::parse>(dd.get_fd(), 0);
+		}
+		catch (const prot::exception& e)
+		{
+			fprintf(stderr, "Invalid message from dd: %s\n", e.what());
+		}
+
+		if (msg)
+		{
+			if (process_dd_message(dd, *msg))
+				remove_dd = true;
+		}
+		else
+		{
+			remove_dd = true;
+		}
+	}
+
+	if (events & (EPOLLHUP | EPOLLRDHUP))
+		remove_dd = true;
+
+	if (remove_dd)
+	{
+		epoll.remove_fd(fd);
+		dds.erase(i);
+	}
+}
+
+bool dd_mgr_ctx::process_dd_message(dd_mgr_dd& dd, const prot::msg& msg)
+{
+	switch (msg.num)
+	{
+	case (unsigned) prot::dd_mgr_be::req::msg_nums::REGISTER_DD:
+		return process_dd_message(dd,
+				static_cast<const prot::dd_mgr_be::req::register_dd&>(msg));
+
+	default:
+		fprintf(stderr, "protocol violation via unix domain socket\n");
+		return true;
+	}
+}
+
+bool dd_mgr_ctx::process_dd_message(
+		dd_mgr_dd& dd, const prot::dd_mgr_be::req::register_dd& msg)
+{
+	if (dd.registered)
+	{
+		fprintf(stderr, "multiple register-dd messages from single dd\n");
+		return true;
+	}
+
+	if (msg.id < 1 || msg.port < SDFS_DD_PORT_START || msg.port > SDFS_DD_PORT_END)
+	{
+		fprintf(stderr, "invalid dd id or port\n");
+		return true;
+	}
+
+	for (const auto& o : dds)
+	{
+		if (o.registered)
+		{
+			if (o.id == msg.id || o.port == msg.port)
+			{
+				fprintf(stderr, "multiple dds with identical settings\n");
+				return true;
+			}
+			break;
+		}
+	}
+
+	dd.id = msg.id;
+	dd.port = msg.port;
+	dd.registered = true;
+
+	/* Reply */
+	prot::dd_mgr_be::reply::register_dd reply;
+
+	try
+	{
+		send_packet_msg(dd.get_fd(), reply);
+		return false;
+	}
+	catch (const system_error&)
+	{
+		return true;
+	}
 }
 
 
@@ -206,15 +385,13 @@ bool dd_mgr_ctx::process_client_message(dd_mgr_client& c, const char* buf, size_
 	switch (msg->num)
 	{
 	case (unsigned) prot::dd_mgr_fe::req::msg_nums::QUERY_DDS:
-		return dd_mgr_ctx::process_client_message(c,
+		return process_client_message(c,
 				static_cast<prot::dd_mgr_fe::req::query_dds&>(*msg));
 
 	default:
 		fprintf(stderr, "protocol violation via tcp\n");
 		return true;
 	}
-
-	return false;
 }
 
 bool dd_mgr_ctx::process_client_message(
@@ -222,7 +399,16 @@ bool dd_mgr_ctx::process_client_message(
 {
 	prot::dd_mgr_fe::reply::query_dds reply;
 
-	/* TODO */
+	for (auto& dd : dds)
+	{
+		if (dd.registered)
+		{
+			decltype(reply)::dd desc;
+			desc.id = dd.id;
+			desc.port = dd.port;
+			reply.dds.push_back(desc);
+		}
+	}
 
 	return send_to_client(c, reply);
 }

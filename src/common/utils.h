@@ -73,7 +73,8 @@ public:
 };
 
 
-inline int check_syscall(int ret, const char* msg)
+template <typename T>
+inline T check_syscall(T ret, const char* msg)
 {
 	if (ret < 0)
 		throw std::system_error(errno, std::generic_category(), msg);
@@ -103,5 +104,8 @@ T next_power_of_two(T i)
 /* Throws runtime_error if not enough data could be read/written */
 void simple_read(int fd, char* buf, size_t size);
 void simple_write(int fd, const char* buf, size_t size);
+
+void ensure_sdfs_run_dir();
+void ensure_sdfs_run_dir(const std::string& subdir);
 
 #endif /* __COMMON_UTILS_H */

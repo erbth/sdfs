@@ -9,8 +9,15 @@
 
 struct dd_mgr_dd final
 {
+	WrappedFD fd;
+
+	unsigned id = 0;
 	int port = 0;
+
 	bool registered = false;
+
+	dd_mgr_dd(WrappedFD&& fd);
+	int get_fd();
 };
 
 struct dd_mgr_client final
@@ -45,6 +52,12 @@ protected:
 	void initialize_tcp();
 
 	void on_signal(int s);
+
+	void on_dd_conn(int fd, uint32_t events);
+	void on_dd_fd(int fd, uint32_t events);
+
+	bool process_dd_message(dd_mgr_dd& dd, const prot::msg& msg);
+	bool process_dd_message(dd_mgr_dd& dd, const prot::dd_mgr_be::req::register_dd& msg);
 
 	void on_client_conn(int fd, uint32_t events);
 	void on_client_fd(int fd, uint32_t events);

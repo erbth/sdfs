@@ -7,6 +7,8 @@ add_executable(sdfs-dd
 	../common/epoll.cc
 	../common/signalfd.cc
 	../common/strformat.cc
+	../common/prot_common.cc
+	../common/prot_dd_mgr.cc
 )
 
 add_executable(sdfs-mkdd

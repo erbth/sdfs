@@ -1,5 +1,8 @@
 #include "config.h"
 #include "dd_ctx.h"
+#include "common/dynamic_buffer.h"
+#include "common/prot_dd_mgr.h"
+#include "common/msg_utils.h"
 
 extern "C" {
 #include <sys/types.h>
@@ -7,6 +10,7 @@ extern "C" {
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 }
@@ -69,6 +73,45 @@ void dd_ctx::initialize_sock()
 
 void dd_ctx::initialize_mgr()
 {
+	mgr_sock.set_errno(
+			socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0),
+			"socket(mgr)");
+
+	/* Connect to mgr */
+	struct sockaddr_un addr = {
+		.sun_family = AF_UNIX
+	};
+
+	auto path_len = strlen(SDFS_DD_MGR_SOCKET_PATH) + 1;
+	if (path_len > sizeof(addr.sun_path))
+		throw runtime_error("unix socket path too long");
+
+	memcpy(addr.sun_path, SDFS_DD_MGR_SOCKET_PATH, path_len);
+
+	check_syscall(
+			connect(mgr_sock.get_fd(), (const struct sockaddr*) &addr, sizeof(addr)),
+			"connect(mgr)");
+
+	/* Send number and port */
+	prot::dd_mgr_be::req::register_dd msg;
+	msg.id = di.id;
+	msg.port = port;
+
+	dynamic_buffer buf;
+	buf.ensure_size(msg.serialize(nullptr));
+	auto msg_len = msg.serialize(buf.ptr());
+
+	check_syscall(
+			write(mgr_sock.get_fd(), buf.ptr(), msg_len),
+			"write(mgr)");
+
+	/* Wait for response */
+	auto ret_msg = receive_packet_msg<prot::dd_mgr_be::reply::parse>(mgr_sock.get_fd(), 5000);
+	if (!ret_msg)
+		throw runtime_error("Error while registering at dd-mgr");
+
+	if (ret_msg->num != (unsigned) prot::dd_mgr_be::reply::msg_nums::REGISTER_DD)
+		throw runtime_error("Invalid response while registering at dd-mgr");
 }
 
 void dd_ctx::initialize()

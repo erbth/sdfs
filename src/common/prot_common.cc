@@ -14,6 +14,7 @@ msg::~msg()
 {
 }
 
+
 exception::exception(const string& msg)
 	: msg(msg)
 {

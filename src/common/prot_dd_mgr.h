@@ -55,6 +55,47 @@ namespace dd_mgr_fe
 	};
 };
 
+/* MGR backend (unix domain socket, used by dds) */
+namespace dd_mgr_be
+{
+	namespace req
+	{
+		enum struct msg_nums : unsigned {
+			REGISTER_DD = 1
+		};
+
+		struct register_dd : public msg
+		{
+			register_dd();
+
+			unsigned id;
+			int port;
+
+			size_t serialize(char* buf) const override;
+			void parse(const char* buf, size_t size);
+		};
+
+		std::unique_ptr<msg> parse(const char* buf, size_t size);
+	};
+
+	namespace reply
+	{
+		enum struct msg_nums : unsigned {
+			REGISTER_DD = 1
+		};
+
+		struct register_dd : public msg
+		{
+			register_dd();
+
+			size_t serialize(char* buf) const override;
+			void parse(const char* buf, size_t size);
+		};
+
+		std::unique_ptr<msg> parse(const char* buf, size_t size);
+	};
+};
+
 };
 
 #endif /* __COMMON_PROT_DD_MGR_H */
