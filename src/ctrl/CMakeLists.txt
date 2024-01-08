@@ -1,10 +1,12 @@
-add_executable(sdfs-dd-mgr
-	dd_mgr.cc
-	dd_mgr_ctx.cc
+add_executable(sdfs-ctrl
+	ctrl.cc
+	ctrl_ctx.cc
 	../common/utils.cc
 	../common/exceptions.cc
-	../common/epoll.cc
 	../common/signalfd.cc
+	../common/epoll.cc
+	../common/file_config.cc
 	../common/prot_common.cc
 	../common/prot_dd_mgr.cc
+	../common/prot_dd.cc
 )

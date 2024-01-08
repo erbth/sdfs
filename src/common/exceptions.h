@@ -10,7 +10,7 @@
 class invalid_cmd_args : public std::exception
 {
 protected:
-	std::string msg;
+	const std::string msg;
 
 public:
 	invalid_cmd_args(const std::string& msg);
@@ -21,6 +21,30 @@ class cmd_args_help : public std::exception
 {
 public:
 	cmd_args_help();
+	const char* what() const noexcept override;
+};
+
+class gai_exception : public std::exception
+{
+protected:
+	const std::string msg;
+
+public:
+	gai_exception(int code, const std::string& msg);
+	const char* what() const noexcept override;
+};
+
+class io_timeout_exception : public std::exception
+{
+public:
+	io_timeout_exception();
+	const char* what() const noexcept override;
+};
+
+class io_eof_exception : public std::exception
+{
+public:
+	io_eof_exception();
 	const char* what() const noexcept override;
 };
 

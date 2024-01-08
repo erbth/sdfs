@@ -8,12 +8,15 @@
 /* The trailing semicolon after the version makes the value easier to compare */
 #define SDFS_DD_MAGIC "sdfs-dd v1;"
 
-#define SDFS_CTRL_PORT		10300
-#define SDFS_DD_MGR_PORT	10309
-#define SDFS_DD_PORT_START	10310
-#define SDFS_DD_PORT_END	10399
+#define SDFS_CTRL_PORT			10300
+#define SDFS_CTRL_SYNC_PORT		10308
+#define SDFS_DD_MGR_PORT		10309
+#define SDFS_DD_PORT_START		10310
+#define SDFS_DD_PORT_END		10399
 
 #define SDFS_RUN_DIR			"/run/sdfs"
 #define SDFS_DD_MGR_SOCKET_PATH	"/run/sdfs/dd-mgr/backend.sock"
+
+#define SDFS_CONFIG_FILE	"/etc/sdfs/sdfs.conf"
 
 #endif /* __SDFS_CONFIG_H */

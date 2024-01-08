@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "config.h"
 #include "dd_ctx.h"
 #include "common/dynamic_buffer.h"
@@ -25,6 +26,9 @@ dd_ctx::dd_ctx(const string& device_file)
 
 dd_ctx::~dd_ctx()
 {
+	for (auto c : clients)
+		epoll.remove_fd(c->get_fd());
+
 	if (sock)
 		epoll.remove_fd_ignore_unknown(sock.get_fd());
 }
@@ -138,7 +142,139 @@ void dd_ctx::on_signal(int s)
 
 void dd_ctx::on_listen_sock(int fd, uint32_t events)
 {
-	printf("new client\n");
+	WrappedFD wfd;
+	wfd.set_errno(accept4(fd, nullptr, nullptr, SOCK_CLOEXEC), "accept");
+
+	auto client = make_shared<dd_client>();
+	client->wfd = move(wfd);
+
+	epoll.add_fd(client->get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP,
+			bind_front(&dd_ctx::on_client_fd, this, client));
+
+	clients.push_back(client);
+}
+
+
+void dd_ctx::on_client_fd(shared_ptr<dd_client> client, int fd, uint32_t events)
+{
+	if (fd != client->get_fd())
+		throw runtime_error("Got epoll event for invalid fd");
+
+	bool remove_client = false;
+
+	if (events & EPOLLIN)
+	{
+		const size_t read_chunk = 100 * 1024;
+		client->rd_buf.ensure_size(client->rd_buf_pos + read_chunk);
+
+		auto ret = read(
+				client->get_fd(),
+				client->rd_buf.ptr() + client->rd_buf_pos,
+				read_chunk);
+
+		if (ret >= 0)
+		{
+			client->rd_buf_pos += ret;
+
+			/* Check if the message has been completely received */
+			if (client->rd_buf_pos >= 4)
+			{
+				size_t msg_len = ser::read_u32(client->rd_buf.ptr());
+
+				if (client->rd_buf_pos >= msg_len + 4)
+				{
+					/* Move the message buffer out */
+					dynamic_buffer msg_buf(move(client->rd_buf));
+
+					client->rd_buf_pos -= msg_len + 4;
+					client->rd_buf.ensure_size(client->rd_buf_pos);
+					memcpy(
+							client->rd_buf.ptr(),
+							msg_buf.ptr() + (msg_len + 4),
+							client->rd_buf_pos);
+
+					/* Process the message */
+					if (process_client_message(client, move(msg_buf), msg_len))
+						remove_client = true;
+				}
+			}
+		}
+		else
+		{
+			remove_client = true;
+		}
+	}
+
+	if (events & (EPOLLHUP | EPOLLRDHUP))
+		remove_client = true;
+
+	if (remove_client)
+	{
+		epoll.remove_fd(fd);
+
+		/* Remove client from list */
+		auto i = find(clients.begin(), clients.end(), client);
+		if (i == clients.end())
+			throw runtime_error("Failed to remove client from list");
+
+		clients.erase(i);
+	}
+}
+
+bool dd_ctx::process_client_message(shared_ptr<dd_client> client,
+		dynamic_buffer&& buf, size_t msg_len)
+{
+	unique_ptr<prot::msg> msg;
+
+	try
+	{
+		msg = prot::dd::req::parse(buf.ptr() + 4, msg_len);
+	}
+	catch (const prot::exception& e)
+	{
+		fprintf(stderr, "Invalid message from client: %s\n", e.what());
+		return true;
+	}
+
+	switch (msg->num)
+	{
+		case prot::dd::req::GETATTR:
+			return process_client_message(
+					client,
+					static_cast<prot::dd::req::getattr&>(*msg));
+
+		default:
+			fprintf(stderr, "protocol violation\n");
+			return true;
+	}
+}
+
+bool dd_ctx::process_client_message(shared_ptr<dd_client> client,
+		const prot::dd::req::getattr& msg)
+{
+	auto reply = make_shared<prot::dd::reply::getattr>();
+
+	reply->id = di.id;
+	memcpy(reply->gid, di.gid, sizeof(di.gid));
+	reply->size = di.size;
+	reply->usable_size = di.usable_size();
+
+	return send_to_client(client, reply, nullopt);
+}
+
+bool dd_ctx::send_to_client(shared_ptr<dd_client> client,
+		shared_ptr<prot::msg> msg, optional<fixed_aligned_buffer>&& buf)
+{
+	try
+	{
+		send_stream_msg(client->get_fd(), *msg);
+	}
+	catch (const system_error&)
+	{
+		return true;
+	}
+
+	return false;
 }
 
 
@@ -148,21 +284,17 @@ void dd_ctx::on_epoll_ready(int res)
 		throw runtime_error("async poll on epoll fd failed");
 
 	epoll.process_events(0);
+
+	io_uring.submit_poll(epoll.get_fd(), POLLIN,
+			bind_front(&dd_ctx::on_epoll_ready, this));
 }
 
 
 void dd_ctx::main()
 {
 	io_uring.submit_poll(epoll.get_fd(), POLLIN,
-			bind(&dd_ctx::on_epoll_ready, this, placeholders::_1));
+			bind_front(&dd_ctx::on_epoll_ready, this));
 
 	while (!quit_requested)
 		io_uring.process_requests(true);
-}
-
-
-/* Controllers */
-dd_client::dd_client(int fd)
-	: wfd(fd)
-{
 }

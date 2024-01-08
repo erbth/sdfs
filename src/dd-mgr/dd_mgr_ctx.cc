@@ -45,6 +45,9 @@ dd_mgr_ctx::~dd_mgr_ctx()
 	for (auto& c : clients)
 		epoll.remove_fd(c.get_fd());
 
+	for (auto& dd : dds)
+		epoll.remove_fd(dd.get_fd());
+
 	if (tfd)
 		epoll.remove_fd_ignore_unknown(tfd.get_fd());
 
