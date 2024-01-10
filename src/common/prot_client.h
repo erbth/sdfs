@@ -1,18 +1,20 @@
-#ifndef __COMMON_PROT_DD_H
-#define __COMMON_PROT_DD_H
+#ifndef __COMMON_PROT_CLIENT_H
+#define __COMMON_PROT_CLIENT_H
 
 #include <memory>
 #include "common/prot_common.h"
 
 namespace prot
 {
-namespace dd
+namespace client
 {
 
 namespace req
 {
 	enum msg_nums : unsigned {
 		GETATTR = 1,
+		GETFATTR,
+		LISTDIR,
 		READ,
 		WRITE
 	};
@@ -22,24 +24,6 @@ namespace req
 		getattr();
 		size_t serialize(char* buf) const override;
 		void parse(const char* buf, size_t size);
-	};
-
-	struct read
-	{
-		uint64_t request_id;
-
-		size_t offset;
-		size_t length;
-	};
-
-	struct write
-	{
-		uint64_t request_id;
-
-		size_t offset;
-		size_t length;
-
-		const char* buf;
 	};
 
 	std::unique_ptr<msg> parse(const char* buf, size_t size);
@@ -49,38 +33,26 @@ namespace reply
 {
 	enum msg_nums : unsigned {
 		GETATTR = 1,
+		GETFATTR,
+		LISTDIR,
 		READ,
 		WRITE
 	};
 
 	struct getattr : public msg
 	{
-		unsigned id;
-		char gid[16];
+		size_t size_total;
+		size_t size_used;
 
-		size_t size;
-		size_t usable_size;
+		size_t inodes_total;
+		size_t inodes_used;
 
 		getattr();
 		size_t serialize(char* buf) const override;
 		void parse(const char* buf, size_t size);
 
 	protected:
-		static constexpr size_t msg_size = 4 + 16 + 8 + 8;
-	};
-
-	struct read
-	{
-		uint64_t request_id;
-		unsigned result;
-
-		const char* buf;
-	};
-
-	struct write
-	{
-		uint64_t request_id;
-		unsigned result;
+		static constexpr size_t msg_size = 4*8;
 	};
 
 	std::unique_ptr<msg> parse(const char* buf, size_t size);
@@ -89,4 +61,4 @@ namespace reply
 };
 };
 
-#endif /* __COMMON_PROT_DD_H */
+#endif /* __COMMON_PROT_CLIENT_H */

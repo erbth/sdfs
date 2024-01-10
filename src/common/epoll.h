@@ -1,7 +1,7 @@
 #ifndef __COMMON_EPOLL_H
 #define __COMMON_EPOLL_H
 
-#include <vector>
+#include <map>
 #include <functional>
 #include "common/utils.h"
 
@@ -9,6 +9,8 @@ extern "C" {
 #include <sys/epoll.h>
 }
 
+/* Events for successfully removed fds (i.e. remov_fd/remove_fd_ignore_unknown
+ * did not throw an exception) will never be reported */
 class Epoll final
 {
 public:
@@ -17,13 +19,7 @@ public:
 protected:
 	WrappedFD wfd;
 
-	struct fdinfo
-	{
-		int fd;
-		fd_ready_cb_t cb;
-	};
-
-	std::vector<fdinfo> fdinfos;
+	std::map<int, fd_ready_cb_t> cbs;
 
 	void cleanup();
 
@@ -33,7 +29,9 @@ public:
 	Epoll();
 	~Epoll();
 
+	/* If this function throws, the cb will not have been added */
 	void add_fd(int fd, uint32_t events, fd_ready_cb_t cb);
+
 	void change_events(int fd, uint32_t events);
 	void remove_fd(int fd);
 	void remove_fd_ignore_unknown(int fd);

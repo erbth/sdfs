@@ -1,10 +1,13 @@
-#include "config.h"
+#include <cstring>
+#include <algorithm>
 #include <regex>
+#include "config.h"
 #include "ctrl_ctx.h"
 #include "common/exceptions.h"
 #include "common/prot_dd_mgr.h"
 #include "common/prot_dd.h"
 #include "common/msg_utils.h"
+#include "common/serialization.h"
 
 extern "C" {
 #include <sys/types.h>
@@ -30,11 +33,39 @@ ctrl_ctx::~ctrl_ctx()
 	if (sync_lfd)
 		epoll.remove_fd_ignore_unknown(sync_lfd.get_fd());
 
+	while (clients.size() > 0)
+		remove_client(clients.begin());
+
 	for (auto& dd : dds)
 	{
 		if (dd.wfd)
 			epoll.remove_fd(dd.wfd.get_fd());
 	}
+}
+
+
+void ctrl_ctx::remove_client(list<ctrl_client>::iterator i)
+{
+	auto& c = *i;
+
+	epoll.remove_fd(c.get_fd());
+
+	clients.erase(i);
+}
+
+void ctrl_ctx::remove_client(ctrl_client* cptr)
+{
+	auto i = clients.begin();
+	for (;i != clients.end(); i++)
+	{
+		if (&(*i) == cptr)
+			break;
+	}
+
+	if (i == clients.end())
+		throw invalid_argument("no such client in client list");
+
+	remove_client(i);
 }
 
 
@@ -76,6 +107,8 @@ void ctrl_ctx::initialize_cfg()
 	/* Check that at least one dd and at least one dd host are defined */
 	if (cfg.dds.size() <= 0 || cfg.dd_hosts.size() <= 0)
 		throw runtime_error("At least one dd and dd-host must be defined");
+
+	printf("controller id: %u\n\n", id);
 }
 
 void ctrl_ctx::initialize_dd_host(const string& addr_str)
@@ -248,7 +281,8 @@ void ctrl_ctx::initialize_connect_dds()
 		throw runtime_error("unconnected dds present");
 }
 
-void ctrl_ctx::initialize_listeners()
+
+struct sockaddr_in6 determine_bind_address(const optional<const string>& bind_addr_str)
 {
 	struct sockaddr_in6 addr{};
 
@@ -279,6 +313,12 @@ void ctrl_ctx::initialize_listeners()
 
 	addr.sin6_family = AF_INET6;
 
+	return addr;
+}
+
+void ctrl_ctx::initialize_sync_listener()
+{
+	auto addr = determine_bind_address(bind_addr_str);
 
 	/* Create sync socket */
 	sync_lfd.set_errno(
@@ -295,7 +335,11 @@ void ctrl_ctx::initialize_listeners()
 
 	epoll.add_fd(sync_lfd.get_fd(),
 			EPOLLIN, bind_front(&ctrl_ctx::on_sync_lfd, this));
+}
 
+void ctrl_ctx::initialize_client_listener()
+{
+	auto addr = determine_bind_address(bind_addr_str);
 
 	/* Create client socket */
 	client_lfd.set_errno(
@@ -325,11 +369,12 @@ void ctrl_ctx::initialize()
 	/* Build data map */
 
 	/* Create listening socket for other controllers */
+	initialize_sync_listener();
 
 	/* Connect to other controllers */
 
 	/* Create listening sockets */
-	initialize_listeners();
+	initialize_client_listener();
 }
 
 
@@ -344,21 +389,189 @@ void ctrl_ctx::on_signal(int s)
 
 void ctrl_ctx::on_sync_lfd(int fd, uint32_t events)
 {
-	auto cfd = check_syscall(
-			accept4(fd, nullptr, nullptr, SOCK_CLOEXEC),
-			"accept");
-
-	close(cfd);
+	WrappedFD wfd;
+	wfd.set_errno(accept4(fd, nullptr, nullptr, SOCK_CLOEXEC), "accept");
 }
 
 
 void ctrl_ctx::on_client_lfd(int fd, uint32_t events)
 {
+	WrappedFD wfd;
+	wfd.set_errno(accept4(fd, nullptr, nullptr, SOCK_CLOEXEC), "accept");
+
+	clients.emplace_back();
+	clients.back().wfd = move(wfd);
+
+	try
+	{
+		epoll.add_fd(clients.back().get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP,
+				bind_front(&ctrl_ctx::on_client_fd, this, &clients.back()));
+	}
+	catch (...)
+	{
+		clients.pop_back();
+		throw;
+	}
 }
 
 
 void ctrl_ctx::on_dd_fd(int fd, uint32_t events)
 {
+}
+
+
+void ctrl_ctx::on_client_fd(ctrl_client* client, int fd, uint32_t events)
+{
+	if (fd != client->get_fd())
+		throw runtime_error("Got epoll event for invalid fd");
+
+	bool rm_client = false;
+
+	/* Send data */
+	if (events & EPOLLOUT)
+	{
+		bool disable_sender = false;
+		if (client->send_queue.size() > 0)
+		{
+			auto& qmsg = client->send_queue.front();
+
+			size_t to_write = min(
+					1024UL * 1024,
+					qmsg.msg_len - client->send_msg_pos);
+
+			auto ret = write(
+					client->get_fd(),
+					qmsg.buf.ptr() + client->send_msg_pos,
+					to_write);
+
+			if (ret >= 0)
+			{
+				client->send_msg_pos += ret;
+				if (client->send_msg_pos == qmsg.msg_len)
+				{
+					client->send_queue.pop();
+					client->send_msg_pos = 0;
+					disable_sender = true;
+				}
+			}
+			else
+			{
+				rm_client = true;
+			}
+		}
+		else
+		{
+			disable_sender = true;
+		}
+
+		if (disable_sender)
+			epoll.change_events(client->get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP);
+	}
+
+	/* Read data */
+	if (events & EPOLLIN)
+	{
+		const size_t read_chunk = 100 * 1024;
+		client->rd_buf.ensure_size(client->rd_buf_pos + read_chunk);
+
+		auto ret = read(
+				client->get_fd(),
+				client->rd_buf.ptr() + client->rd_buf_pos,
+				read_chunk);
+
+		if (ret > 0)
+		{
+			client->rd_buf_pos += ret;
+
+			/* Check if the message has been completely received */
+			if (client->rd_buf_pos >= 4)
+			{
+				size_t msg_len = ser::read_u32(client->rd_buf.ptr());
+
+				if (client->rd_buf_pos >= msg_len + 4)
+				{
+					/* Move the message buffer out */
+					dynamic_buffer msg_buf(move(client->rd_buf));
+
+					client->rd_buf_pos -= msg_len + 4;
+					client->rd_buf.ensure_size(client->rd_buf_pos);
+					memcpy(
+							client->rd_buf.ptr(),
+							msg_buf.ptr() + (msg_len + 4),
+							client->rd_buf_pos);
+
+					/* Process the message */
+					if (process_client_message(client, move(msg_buf), msg_len))
+						rm_client = true;
+				}
+			}
+		}
+		else
+		{
+			rm_client = true;
+		}
+	}
+
+	if (events & (EPOLLHUP | EPOLLRDHUP))
+		rm_client = true;
+
+	if (rm_client)
+		remove_client(client);
+}
+
+bool ctrl_ctx::process_client_message(
+		ctrl_client* client, dynamic_buffer&& buf, size_t msg_len)
+{
+	unique_ptr<prot::msg> msg;
+
+	try
+	{
+		msg = prot::client::req::parse(buf.ptr() + 4, msg_len);
+	}
+	catch (const prot::exception& e)
+	{
+		fprintf(stderr, "Invalid message from client: %s\n", e.what());
+		return true;
+	}
+
+	switch (msg->num)
+	{
+		case prot::client::req::GETATTR:
+			return process_client_message(
+					client,
+					static_cast<prot::client::req::getattr&>(*msg));
+
+		default:
+			fprintf(stderr, "protocol violation\n");
+			return true;
+	}
+}
+
+bool ctrl_ctx::process_client_message(
+		ctrl_client* client, prot::client::req::getattr& msg)
+{
+	prot::client::reply::getattr reply;
+
+	return send_message_to_client(client, reply);
+}
+
+bool ctrl_ctx::send_message_to_client(ctrl_client* client, const prot::msg& msg)
+{
+	dynamic_buffer buf;
+	buf.ensure_size(msg.serialize(nullptr));
+	auto msg_len = msg.serialize(buf.ptr());
+	return send_message_to_client(client, move(buf), msg_len);
+}
+
+bool ctrl_ctx::send_message_to_client(ctrl_client* client, dynamic_buffer&& buf, size_t msg_len)
+{
+	auto was_empty = client->send_queue.empty();
+	client->send_queue.emplace(move(buf), msg_len);
+
+	if (was_empty)
+		epoll.change_events(client->get_fd(), EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP);
+
+	return false;
 }
 
 

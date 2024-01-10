@@ -4,14 +4,29 @@
 #include <string>
 #include <optional>
 #include <list>
+#include <map>
+#include <queue>
 #include "common/utils.h"
 #include "common/epoll.h"
 #include "common/signalfd.h"
 #include "common/file_config.h"
+#include "common/dynamic_buffer.h"
+#include "common/prot_client.h"
 
 extern "C" {
 #include <netinet/in.h>
 }
+
+struct ctrl_queued_msg
+{
+	dynamic_buffer buf;
+	const size_t msg_len;
+
+	inline ctrl_queued_msg(dynamic_buffer&& buf, size_t msg_len)
+		: buf(std::move(buf)), msg_len(msg_len)
+	{
+	}
+};
 
 struct ctrl_dd final
 {
@@ -25,6 +40,26 @@ struct ctrl_dd final
 	size_t usable_size;
 
 	bool connected = false;
+
+	inline int get_fd()
+	{
+		return wfd.get_fd();
+	}
+};
+
+struct ctrl_client final
+{
+	WrappedFD wfd;
+
+	/* Receive messages */
+	dynamic_buffer rd_buf;
+	size_t rd_buf_pos = 0;
+
+	/* Send messages */
+	std::queue<ctrl_queued_msg> send_queue;
+	size_t send_msg_pos = 0;
+
+	/* IO requests */
 
 	inline int get_fd()
 	{
@@ -54,6 +89,12 @@ protected:
 	/* dds */
 	std::list<ctrl_dd> dds;
 
+	/* clients */
+	std::list<ctrl_client> clients;
+
+	void remove_client(decltype(clients)::iterator i);
+	void remove_client(ctrl_client* client);
+
 	void print_cfg();
 
 	void initialize_dd_host(const std::string& addr_str);
@@ -61,7 +102,8 @@ protected:
 
 	void initialize_cfg();
 	void initialize_connect_dds();
-	void initialize_listeners();
+	void initialize_sync_listener();
+	void initialize_client_listener();
 
 	void on_signal(int s);
 
@@ -69,6 +111,13 @@ protected:
 	void on_client_lfd(int fd, uint32_t events);
 
 	void on_dd_fd(int fd, uint32_t events);
+	void on_client_fd(ctrl_client* client, int fd, uint32_t events);
+
+	bool process_client_message(ctrl_client* client, dynamic_buffer&& buf, size_t msg_len);
+	bool process_client_message(ctrl_client* client, prot::client::req::getattr& msg);
+
+	bool send_message_to_client(ctrl_client* client, const prot::msg& msg);
+	bool send_message_to_client(ctrl_client* client, dynamic_buffer&& buf, size_t msg_len);
 
 public:
 	ctrl_ctx(unsigned id, const std::optional<const std::string>& bind_addr);

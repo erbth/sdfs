@@ -13,9 +13,9 @@ Epoll::Epoll()
 
 Epoll::~Epoll()
 {
-	for (auto& fi : fdinfos)
+	for (auto& [fd,cb] : cbs)
 	{
-		if (epoll_ctl(wfd.get_fd(), EPOLL_CTL_DEL, fi.fd, nullptr) < 0)
+		if (epoll_ctl(wfd.get_fd(), EPOLL_CTL_DEL, fd, nullptr) < 0)
 		{
 			fprintf(stderr, "Failed to remove fd frome epoll instance "
 					"during destructor\n");
@@ -26,64 +26,45 @@ Epoll::~Epoll()
 
 void Epoll::add_fd(int fd, uint32_t events, fd_ready_cb_t cb)
 {
-	for (auto& fi : fdinfos)
-	{
-		if (fi.fd == fd)
+	auto [i,inserted] = cbs.insert({fd, cb});
+	if (!inserted)
 			throw invalid_argument("fd already added to epoll instance");
-	}
-
-	fdinfo fi;
-	fi.fd = fd;
-	fi.cb = cb;
-
-	struct epoll_event evt{};
-	evt.events = events;
-	evt.data.fd = fd;
-
-	fdinfos.push_back(fi);
 
 	try
 	{
+		struct epoll_event evt{};
+		evt.events = events;
+		evt.data.fd = fd;
+
 		check_syscall(
 				epoll_ctl(wfd.get_fd(), EPOLL_CTL_ADD, fd, &evt),
 				"epoll_ctl(add)");
 	}
 	catch (...)
 	{
-		fdinfos.pop_back();
+		cbs.erase(i);
 		throw;
 	}
 }
 
 void Epoll::change_events(int fd, uint32_t events)
 {
-	for (auto& fi : fdinfos)
-	{
-		if (fi.fd == fd)
-		{
-			struct epoll_event evt;
-			evt.events = events;
-			evt.data.fd = fd;
+	if (cbs.find(fd) == cbs.end())
+		throw invalid_argument("No such fd");
 
-			check_syscall(
-					epoll_ctl(wfd.get_fd(), EPOLL_CTL_MOD, fd, &evt),
-					"epoll_ctl(mod)");
-		}
-	}
+	struct epoll_event evt;
+	evt.events = events;
+	evt.data.fd = fd;
 
-	throw invalid_argument("No such fd");
+	check_syscall(
+			epoll_ctl(wfd.get_fd(), EPOLL_CTL_MOD, fd, &evt),
+			"epoll_ctl(mod)");
 }
 
 void Epoll::_remove_fd(int fd, bool ignore_unknown)
 {
-	auto i = fdinfos.begin();
-	for (; i != fdinfos.end(); i++)
-	{
-		if (i->fd == fd)
-			break;
-	}
-
-	if (i == fdinfos.end())
+	auto i = cbs.find(fd);
+	if (i == cbs.end())
 	{
 		if (ignore_unknown)
 			return;
@@ -95,7 +76,7 @@ void Epoll::_remove_fd(int fd, bool ignore_unknown)
 			epoll_ctl(wfd.get_fd(), EPOLL_CTL_DEL, fd, nullptr),
 			"epoll_ctl(del)");
 
-	fdinfos.erase(i);
+	cbs.erase(i);
 }
 
 void Epoll::remove_fd(int fd)
@@ -116,21 +97,20 @@ void Epoll::process_events(int timeout)
 			epoll_wait(wfd.get_fd(), evts, sizeof(evts) / sizeof(evts[0]), timeout),
 			"epoll_wait");
 
+	/* Ensure fdinfos can be changed during cb (i.e. when adding or removing
+	 * fds) */
 	for (int i = 0; i < ret; i++)
 	{
 		int fd = evts[i].data.fd;
 
-		/* Ensure fdinfos can be changed during cb (i.e. when adding or removing
-		 * fds) */
-		fd_ready_cb_t cb;
-		for (auto& fi : fdinfos)
-		{
-			if (fi.fd == fd)
-			{
-				cb = fi.cb;
-				break;
-			}
-		}
+		/* This is fatal because we cannot remove the fd and a newly opened fd
+		 * might get the same number */
+		auto ic = cbs.find(fd);
+		if (ic == cbs.end())
+			throw runtime_error("Got event for unmonitored fd");
+
+		/* Ensure that the fd can be deleted in the callback */
+		auto cb = ic->second;
 
 		if (cb)
 			cb(fd, evts[i].events);
