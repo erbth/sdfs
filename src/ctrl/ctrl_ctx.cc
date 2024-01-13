@@ -367,6 +367,7 @@ void ctrl_ctx::initialize()
 	initialize_connect_dds();
 
 	/* Build data map */
+	build_data_map();
 
 	/* Create listening socket for other controllers */
 	initialize_sync_listener();
@@ -375,6 +376,35 @@ void ctrl_ctx::initialize()
 
 	/* Create listening sockets */
 	initialize_client_listener();
+}
+
+
+void ctrl_ctx::build_data_map()
+{
+	auto& dmap = data_map;
+
+	dmap.n_dd = dds.size();
+	dmap.stripe_size = dmap.block_size * dmap.n_dd;
+
+	size_t min_dd_usable_size = dds.front().usable_size;
+	for (auto& dd : dds)
+	{
+		min_dd_usable_size = min(min_dd_usable_size, dd.usable_size);
+
+		dmap.dd_rr_order.push_back(&dd);
+	}
+
+	sort(dmap.dd_rr_order.begin(), dmap.dd_rr_order.end(), [](auto a, auto b) {
+			return a->id < b->id;
+	});
+
+	/* Align to 1 MiB */
+	min_dd_usable_size &= ~(1024ULL * 1024 - 1);
+
+	dmap.total_size = min_dd_usable_size * dmap.n_dd;
+
+	/* 100 MiB inode space / 4k inode size */
+	dmap.total_inodes = (100 * (1024ULL * 1024)) / 4096;
 }
 
 
@@ -551,6 +581,15 @@ bool ctrl_ctx::process_client_message(
 		ctrl_client* client, prot::client::req::getattr& msg)
 {
 	prot::client::reply::getattr reply;
+
+	reply.req_id = msg.req_id;
+
+	/* TODO */
+	reply.size_total = data_map.total_size;
+	reply.size_used = 0;
+
+	reply.inodes_total = data_map.total_inodes;
+	reply.inodes_used = 0;
 
 	return send_message_to_client(client, reply);
 }

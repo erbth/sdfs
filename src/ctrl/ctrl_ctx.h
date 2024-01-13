@@ -4,6 +4,7 @@
 #include <string>
 #include <optional>
 #include <list>
+#include <vector>
 #include <map>
 #include <queue>
 #include "common/utils.h"
@@ -16,6 +17,7 @@
 extern "C" {
 #include <netinet/in.h>
 }
+
 
 struct ctrl_queued_msg
 {
@@ -46,6 +48,23 @@ struct ctrl_dd final
 		return wfd.get_fd();
 	}
 };
+
+
+struct data_map_t
+{
+	/* 1 MiB */
+	const size_t block_size = 1024 * 1024;
+
+	unsigned n_dd;
+	std::vector<ctrl_dd*> dd_rr_order;
+
+	/* n_dd * block_size */
+	size_t stripe_size;
+
+	size_t total_size;
+	size_t total_inodes;
+};
+
 
 struct ctrl_client final
 {
@@ -92,6 +111,9 @@ protected:
 	/* clients */
 	std::list<ctrl_client> clients;
 
+	/* data map */
+	data_map_t data_map;
+
 	void remove_client(decltype(clients)::iterator i);
 	void remove_client(ctrl_client* client);
 
@@ -104,6 +126,8 @@ protected:
 	void initialize_connect_dds();
 	void initialize_sync_listener();
 	void initialize_client_listener();
+
+	void build_data_map();
 
 	void on_signal(int s);
 

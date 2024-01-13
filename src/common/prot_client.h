@@ -9,6 +9,13 @@ namespace prot
 namespace client
 {
 
+struct msg : public prot::msg
+{
+	uint64_t req_id;
+
+	msg(int num);
+};
+
 namespace req
 {
 	enum msg_nums : unsigned {
@@ -52,7 +59,7 @@ namespace reply
 		void parse(const char* buf, size_t size);
 
 	protected:
-		static constexpr size_t msg_size = 4*8;
+		static constexpr size_t msg_size = 8 + 4*8;
 	};
 
 	std::unique_ptr<msg> parse(const char* buf, size_t size);

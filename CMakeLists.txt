@@ -9,7 +9,7 @@ set(SDFS_VERSION_MINOR 0)
 set(SDFS_VERSION_PATCH 0)
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(FUSE REQUIRED fuse3)
+pkg_check_modules(LIBFUSE REQUIRED fuse3)
 
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/config.h.in" "${CMAKE_CURRENT_BINARY_DIR}/config.h" @ONLY)
 include_directories(PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
