@@ -3,6 +3,9 @@
 
 #include <memory>
 #include "common/prot_common.h"
+#include "common/error_codes.h"
+
+static_assert(sizeof(unsigned long) >= 8);
 
 namespace prot
 {
@@ -33,6 +36,18 @@ namespace req
 		void parse(const char* buf, size_t size);
 	};
 
+	struct getfattr : public msg
+	{
+		unsigned long node_id;
+
+		getfattr();
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size = 8;
+	};
+
 	std::unique_ptr<msg> parse(const char* buf, size_t size);
 };
 
@@ -59,7 +74,31 @@ namespace reply
 		void parse(const char* buf, size_t size);
 
 	protected:
-		static constexpr size_t msg_size = 8 + 4*8;
+		static constexpr size_t msg_size = 4*8;
+	};
+
+	struct getfattr : public msg
+	{
+		int res{};
+
+		enum type_t : unsigned char
+		{
+			FT_FILE = 1,
+			FT_DIRECTORY
+		};
+
+		unsigned char type{};
+
+		size_t nlink{};
+		unsigned long mtime{};
+		size_t size{};
+
+		getfattr();
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size = 4 + 1 + 3*8;
 	};
 
 	std::unique_ptr<msg> parse(const char* buf, size_t size);

@@ -49,12 +49,22 @@ com_ctx::com_ctx()
 
 com_ctx::~com_ctx()
 {
+	bool have_t;
 	{
 		unique_lock lk(m);
-		evfd.signal();
+		have_t = thread_started;
 	}
 
-	worker_thread.join();
+	if (have_t)
+	{
+		{
+			unique_lock lk(m);
+			evfd.signal();
+		}
+
+		worker_thread.join();
+	}
+
 	unique_lock lk(m);
 
 	while (ctrls.size() > 0)
@@ -187,7 +197,11 @@ void com_ctx::initialize()
 
 void com_ctx::start_threads()
 {
+	if (thread_started)
+		return;
+
 	worker_thread = thread(bind_front(&com_ctx::worker_thread_func, this));
+	thread_started = true;
 }
 
 
@@ -353,6 +367,11 @@ bool com_ctx::process_message(
 					ctrl,
 					static_cast<prot::client::reply::getattr&>(*msg));
 
+		case prot::client::reply::GETFATTR:
+			return process_message(
+					ctrl,
+					static_cast<prot::client::reply::getfattr&>(*msg));
+
 		default:
 			fprintf(stderr, "protocol violation\n");
 			return true;
@@ -375,6 +394,15 @@ bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::getattr& msg)
 
 	finish_req(ctrl, req);
 
+	return false;
+}
+
+bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::getfattr& msg)
+{
+	/* Find corresponding request */
+	auto& req = find_req_for_reply(ctrl, msg);
+	req.cb_getfattr(msg);
+	finish_req(ctrl, req);
 	return false;
 }
 
@@ -427,6 +455,24 @@ void com_ctx::request_getattr(req_cb_getattr_t cb)
 	msg.req_id = req.id;
 
 	auto ctrl = choose_ctrl();
+	add_req(ctrl, req);
+	send_message(ctrl, msg);
+}
+
+void com_ctx::request_getfattr(unsigned long node_id, req_cb_getfattr_t cb)
+{
+	unique_lock lk(m);
+	request_t req{};
+
+	auto ctrl = choose_ctrl();
+	ctrl->set_req_id(req);
+
+	req.cb_getfattr = cb;
+
+	prot::client::req::getfattr msg;
+	msg.req_id = req.id;
+	msg.node_id = node_id;
+
 	add_req(ctrl, req);
 	send_message(ctrl, msg);
 }

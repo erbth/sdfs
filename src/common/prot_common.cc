@@ -26,14 +26,14 @@ const char* exception::what() const noexcept
 }
 
 
-invalid_msg_num::invalid_msg_num(int num)
+invalid_msg_num::invalid_msg_num(unsigned num)
 	:
 		exception("Invalid message number: " + to_string(num)),
 		num(num)
 {
 }
 
-invalid_msg_size::invalid_msg_size(int num, size_t size)
+invalid_msg_size::invalid_msg_size(unsigned num, size_t size)
 	:
 		exception("Invalid message size: " + to_string(size) +
 				" (msg number: " + to_string(num) + ")"),

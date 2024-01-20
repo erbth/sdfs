@@ -31,18 +31,18 @@ public:
 class invalid_msg_num : public exception
 {
 public:
-	const int num;
+	const unsigned num;
 
-	invalid_msg_num(int num);
+	invalid_msg_num(unsigned num);
 };
 
 class invalid_msg_size : public exception
 {
 public:
-	const int num;
+	const unsigned num;
 	const size_t size;
 
-	invalid_msg_size(int num, size_t size);
+	invalid_msg_size(unsigned num, size_t size);
 };
 
 class invalid_msg : public exception

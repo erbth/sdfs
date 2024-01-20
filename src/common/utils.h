@@ -124,4 +124,8 @@ void ensure_sdfs_run_dir(const std::string& subdir);
 
 void parse_gid(char* gid, const std::string& s);
 
+
+/* Get current wallclock time in microseconds */
+unsigned long get_wt_now();
+
 #endif /* __COMMON_UTILS_H */

@@ -52,7 +52,7 @@ void Epoll::change_events(int fd, uint32_t events)
 	if (cbs.find(fd) == cbs.end())
 		throw invalid_argument("No such fd");
 
-	struct epoll_event evt;
+	struct epoll_event evt{};
 	evt.events = events;
 	evt.data.fd = fd;
 

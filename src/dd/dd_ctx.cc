@@ -46,6 +46,12 @@ void dd_ctx::initialize_sock()
 	{
 		sock.set_errno(socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0), "socket");
 
+		int reuseaddr = 1;
+		check_syscall(
+				setsockopt(sock.get_fd(), SOL_SOCKET, SO_REUSEADDR,
+					&reuseaddr, sizeof(reuseaddr)),
+				"setsockopt");
+
 		addr.sin6_port = htons(port);
 
 		if (bind(sock.get_fd(), (const sockaddr*) &addr, sizeof(addr)) < 0)

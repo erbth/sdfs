@@ -20,16 +20,30 @@ protected:
 
 	/* Operations */
 
+	void op_lookup(fuse_req_t req, fuse_ino_t parent, const char* name);
+	void op_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi);
+	void op_readdir(fuse_req_t req, fuse_ino_t ino,
+			size_t size, off_t off, struct fuse_file_info* fi);
+
 	void op_statfs(fuse_req_t req, fuse_ino_t ino);
+
+	static void _op_lookup(fuse_req_t req, fuse_ino_t parent, const char* name);
+	static void _op_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi);
+	static void _op_readdir(fuse_req_t req, fuse_ino_t ino,
+			size_t size, off_t off, struct fuse_file_info* fi);
 
 	static void _op_statfs(fuse_req_t req, fuse_ino_t ino);
 
 	static constexpr struct fuse_lowlevel_ops f_ops = {
-		.statfs = _op_statfs,
+		.lookup = _op_lookup,
+		.getattr = _op_getattr,
+		.readdir = _op_readdir,
+		.statfs = _op_statfs
 	};
 
 	/* Callbacks */
 	void cb_getattr(fuse_req_t req, req_getattr_result res);
+	void cb_getfattr(fuse_req_t req, fuse_ino_t ino, prot::client::reply::getfattr& msg);
 
 public:
 	sdfs_fuse_ctx(int argc, char** argv);

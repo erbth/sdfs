@@ -203,3 +203,12 @@ void parse_gid(char* gid, const string& s)
 		gid[i] = c1 * 16 + c2;
 	}
 }
+
+
+unsigned long get_wt_now()
+{
+	timespec ts;
+	check_syscall(clock_gettime(CLOCK_REALTIME, &ts), "clock_gettime");
+
+	return (ts.tv_sec * 1000000UL) + (ts.tv_nsec / 1000);
+}

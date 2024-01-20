@@ -37,12 +37,14 @@ struct req_getattr_result
 };
 
 typedef std::function<void(req_getattr_result)> req_cb_getattr_t;
+typedef std::function<void(prot::client::reply::getfattr&)> req_cb_getfattr_t;
 
 struct request_t final
 {
 	uint64_t id;
 
 	req_cb_getattr_t cb_getattr;
+	req_cb_getfattr_t cb_getfattr;
 };
 
 struct com_ctrl final
@@ -65,6 +67,11 @@ struct com_ctrl final
 	{
 		return wfd.get_fd();
 	}
+
+	inline void set_req_id(request_t& r)
+	{
+		r.id = next_req_id++;
+	}
 };
 
 class com_ctx final
@@ -74,6 +81,7 @@ protected:
 
 	std::list<com_ctrl> ctrls;
 	std::thread worker_thread;
+	bool thread_started = false;
 
 	FileConfig cfg;
 	Epoll epoll;
@@ -101,6 +109,7 @@ protected:
 
 	bool process_message(com_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::getattr& msg);
+	bool process_message(com_ctrl* ctrl, prot::client::reply::getfattr& msg);
 
 	bool send_message(com_ctrl* ctrl, const prot::msg& msg);
 	bool send_message(com_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len);
@@ -116,6 +125,7 @@ public:
 	void start_threads();
 
 	void request_getattr(req_cb_getattr_t cb);
+	void request_getfattr(unsigned long node_id, req_cb_getfattr_t cb);
 };
 
 #endif /* __COM_CTX_H */

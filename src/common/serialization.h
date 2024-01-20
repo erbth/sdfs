@@ -11,6 +11,12 @@ extern "C" {
 namespace ser
 {
 
+inline void swrite_u8(char*& ptr, uint8_t v)
+{
+	*((uint8_t*) ptr) = v;
+	ptr += sizeof(v);
+}
+
 inline void swrite_u16(char*& ptr, uint16_t v)
 {
 	v = htole16(v);
@@ -33,6 +39,19 @@ inline void swrite_u64(char*& ptr, uint64_t v)
 }
 
 
+inline void swrite_i32(char*& ptr, int32_t v)
+{
+	swrite_u32(ptr, (uint32_t) v);
+}
+
+
+inline uint8_t sread_u8(const char*& ptr)
+{
+	uint8_t v = *((const uint8_t*) ptr);
+	ptr += sizeof(v);
+	return v;
+}
+
 inline uint16_t sread_u16(const char*& ptr)
 {
 	uint16_t v = le16toh(*((const uint16_t*) ptr));
@@ -54,6 +73,17 @@ inline uint64_t sread_u64(const char*& ptr)
 	return v;
 }
 
+
+inline int32_t sread_i32(const char*& ptr)
+{
+	return (int32_t) sread_u32(ptr);
+}
+
+
+inline uint8_t read_u8(const char* ptr)
+{
+	return *((const uint16_t*) ptr);
+}
 
 inline uint16_t read_u16(const char* ptr)
 {
