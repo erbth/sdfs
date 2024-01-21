@@ -1,7 +1,9 @@
 #ifndef __COMMON_PROT_CLIENT_H
 #define __COMMON_PROT_CLIENT_H
 
+#include <string>
 #include <memory>
+#include <vector>
 #include "common/prot_common.h"
 #include "common/error_codes.h"
 
@@ -24,7 +26,7 @@ namespace req
 	enum msg_nums : unsigned {
 		GETATTR = 1,
 		GETFATTR,
-		LISTDIR,
+		READDIR,
 		READ,
 		WRITE
 	};
@@ -48,6 +50,18 @@ namespace req
 		static constexpr size_t msg_size = 8;
 	};
 
+	struct readdir : public msg
+	{
+		unsigned long node_id;
+
+		readdir();
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size = 8;
+	};
+
 	std::unique_ptr<msg> parse(const char* buf, size_t size);
 };
 
@@ -56,9 +70,15 @@ namespace reply
 	enum msg_nums : unsigned {
 		GETATTR = 1,
 		GETFATTR,
-		LISTDIR,
+		READDIR,
 		READ,
 		WRITE
+	};
+
+	enum file_type_t : unsigned char
+	{
+		FT_FILE = 1,
+		FT_DIRECTORY
 	};
 
 	struct getattr : public msg
@@ -81,12 +101,6 @@ namespace reply
 	{
 		int res{};
 
-		enum type_t : unsigned char
-		{
-			FT_FILE = 1,
-			FT_DIRECTORY
-		};
-
 		unsigned char type{};
 
 		size_t nlink{};
@@ -99,6 +113,28 @@ namespace reply
 
 	protected:
 		static constexpr size_t msg_size = 4 + 1 + 3*8;
+	};
+
+	struct readdir : public msg
+	{
+		int res{};
+
+		struct entry
+		{
+			unsigned long node_id{};
+			unsigned char type{};
+			std::string name;
+		};
+
+		std::vector<entry> entries;
+
+		readdir();
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_base_size = 4 + 8;
+		static constexpr size_t entry_base_size = 10;
 	};
 
 	std::unique_ptr<msg> parse(const char* buf, size_t size);

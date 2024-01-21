@@ -372,6 +372,11 @@ bool com_ctx::process_message(
 					ctrl,
 					static_cast<prot::client::reply::getfattr&>(*msg));
 
+		case prot::client::reply::READDIR:
+			return process_message(
+					ctrl,
+					static_cast<prot::client::reply::readdir&>(*msg));
+
 		default:
 			fprintf(stderr, "protocol violation\n");
 			return true;
@@ -402,6 +407,15 @@ bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::getfattr& msg
 	/* Find corresponding request */
 	auto& req = find_req_for_reply(ctrl, msg);
 	req.cb_getfattr(msg);
+	finish_req(ctrl, req);
+	return false;
+}
+
+bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::readdir& msg)
+{
+	/* Find corresponding request */
+	auto& req = find_req_for_reply(ctrl, msg);
+	req.cb_readdir(msg);
 	finish_req(ctrl, req);
 	return false;
 }
@@ -470,6 +484,24 @@ void com_ctx::request_getfattr(unsigned long node_id, req_cb_getfattr_t cb)
 	req.cb_getfattr = cb;
 
 	prot::client::req::getfattr msg;
+	msg.req_id = req.id;
+	msg.node_id = node_id;
+
+	add_req(ctrl, req);
+	send_message(ctrl, msg);
+}
+
+void com_ctx::request_readdir(unsigned long node_id, req_cb_readdir_t cb)
+{
+	unique_lock lk(m);
+	request_t req{};
+
+	auto ctrl = choose_ctrl();
+	ctrl->set_req_id(req);
+
+	req.cb_readdir = cb;
+
+	prot::client::req::readdir msg;
 	msg.req_id = req.id;
 	msg.node_id = node_id;
 

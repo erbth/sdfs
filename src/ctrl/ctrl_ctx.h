@@ -160,16 +160,24 @@ struct inode_directory_t
 /* File/directory information */
 struct dir_entry
 {
-	unsigned long inode_id = 0;
-	std::string name;
+	unsigned long node_id = 0;
 
 	enum dir_entry_type : unsigned {
 		TYPE_INVALID = 0,
 		TYPE_FILE = 1,
-		/* TYPE_DIRECTORY = 2 */
+		TYPE_DIRECTORY = 2
 	} type = TYPE_INVALID;
 
-	size_t size = 0;
+	std::string name;
+
+	inline dir_entry()
+	{
+	}
+
+	inline dir_entry(unsigned long node_id, dir_entry_type type, const std::string& name)
+		: node_id(node_id), type(type), name(name)
+	{
+	}
 };
 
 
@@ -348,12 +356,12 @@ protected:
 	void lock_inode_directory(cb_lock_inode_directory_t cb);
 	void lock_inode(unsigned long id, cb_lock_inode_t cb);
 
-	void get_inode(unsigned long id, cb_get_inode_t&& cb);
+	void get_inode(unsigned long node_id, cb_get_inode_t&& cb);
 	void write_inode(inode* n, cb_write_inode_t cb);
 	void get_unused_inode(cb_get_unused_inode_t cb);
 
 	/* fs (file/directory handling) */
-	void listdir(unsigned long inode_id, cb_listdir_t cb);
+	void listdir(unsigned long node_id, cb_listdir_t cb);
 	void unlink(unsigned long parent_inode_id, unsigned long inode_id, cb_unlink_t cb);
 	void add_link(unsigned long parent_inode_id, unsigned long inode_id, cb_add_link_t cb);
 
@@ -416,6 +424,7 @@ protected:
 	bool process_client_message(std::shared_ptr<ctrl_client> client, dynamic_buffer&& buf, size_t msg_len);
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::getattr& msg);
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::getfattr& msg);
+	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::readdir& msg);
 
 	bool send_message_to_client(std::shared_ptr<ctrl_client> client, const prot::msg& msg);
 	bool send_message_to_client(std::shared_ptr<ctrl_client> client, dynamic_buffer&& buf, size_t msg_len);

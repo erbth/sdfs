@@ -81,7 +81,7 @@ void inode::serialize(char* buf) const
 void inode::parse(const char* buf)
 {
 	auto ptr = buf;
-	auto type = ser::sread_u8(ptr);
+	type = (inode::inode_type) ser::sread_u8(ptr);
 
 	/* For extension-inodes in the future */
 	ser::sread_u64(ptr);
@@ -961,6 +961,11 @@ bool ctrl_ctx::process_client_message(
 					client,
 					static_cast<prot::client::req::getfattr&>(*msg));
 
+		case prot::client::req::READDIR:
+			return process_client_message(
+					client,
+					static_cast<prot::client::req::readdir&>(*msg));
+
 		default:
 			fprintf(stderr, "protocol violation\n");
 			return true;
@@ -992,8 +997,7 @@ bool ctrl_ctx::process_client_message(
 		prot::client::reply::getfattr reply;
 		reply.req_id = msg.req_id;
 		reply.res = err::INVAL;
-		send_message_to_client(client, reply);
-		return false;
+		return send_message_to_client(client, reply);
 	}
 
 	lock_inode(msg.node_id, [this, client, msg](int result, inode_lock_witness&& w) {
@@ -1003,6 +1007,7 @@ bool ctrl_ctx::process_client_message(
 			reply.req_id = msg.req_id;
 			reply.res = result;
 			send_message_to_client(client, reply);
+			return;
 		}
 
 		/* Get inode */
@@ -1016,8 +1021,8 @@ bool ctrl_ctx::process_client_message(
 				if (result == err::SUCCESS)
 				{
 					reply.type = node->type == inode::TYPE_FILE ?
-							decltype(reply)::FT_FILE :
-							decltype(reply)::FT_DIRECTORY;
+							prot::client::reply::FT_FILE :
+							prot::client::reply::FT_DIRECTORY;
 
 					reply.nlink = node->nlink;
 					reply.mtime = node->mtime;
@@ -1026,6 +1031,43 @@ bool ctrl_ctx::process_client_message(
 
 				send_message_to_client(client, reply);
 			}));
+	});
+
+	return false;
+}
+
+bool ctrl_ctx::process_client_message(
+		shared_ptr<ctrl_client> client, prot::client::req::readdir& msg)
+{
+	if (msg.node_id == 0)
+	{
+		prot::client::reply::readdir reply;
+		reply.req_id = msg.req_id;
+		reply.res = err::INVAL;
+		return send_message_to_client(client, reply);
+	}
+
+	listdir(msg.node_id, [this, client, msg](int result, vector<dir_entry>&& entries) {
+		prot::client::reply::readdir reply;
+		reply.req_id = msg.req_id;
+		reply.res = result;
+
+		if (result == err::SUCCESS)
+		{
+			for (auto& e : entries)
+			{
+				prot::client::reply::readdir::entry re;
+				re.node_id = e.node_id;
+				re.type = e.type == dir_entry::TYPE_DIRECTORY ?
+					prot::client::reply::FT_DIRECTORY : prot::client::reply::FT_FILE;
+
+				re.name = e.name;
+
+				reply.entries.push_back(re);
+			}
+		}
+
+		send_message_to_client(client, reply);
 	});
 
 	return false;
@@ -1428,6 +1470,43 @@ void ctrl_ctx::get_inode(unsigned long node_id, cb_get_inode_t&& cb)
 			/* Return inode or NOENT */
 			cb(err::NOENT, nullptr);
 		}));
+}
+
+/* Looks are acquired automatically, hence a write lock must not be present */
+void ctrl_ctx::listdir(unsigned long node_id, cb_listdir_t cb)
+{
+	lock_inode(node_id, [this, node_id, cb](int result, inode_lock_witness&& w) {
+		if (result != err::SUCCESS)
+		{
+			cb(result, vector<dir_entry>());
+			return;
+		}
+
+		/* Get inode */
+		get_inode(node_id, cb_get_inode_t(move(w), [this, node_id, cb](int result, shared_ptr<inode> node)
+			{
+				if (result == err::SUCCESS && node->type != inode::TYPE_DIRECTORY)
+					result = err::NOTDIR;
+
+				if (result != err::SUCCESS)
+				{
+					cb(result, vector<dir_entry>());
+					return;
+				}
+
+				/* Read directory information from inode */
+				vector<dir_entry> entries;
+
+				entries.emplace_back(node_id, dir_entry::TYPE_DIRECTORY, ".");
+
+				/* Will need to be adjusted to support subdirectories */
+				entries.emplace_back(node_id, dir_entry::TYPE_DIRECTORY, "..");
+
+				cb(err::SUCCESS, move(entries));
+
+				/* Get inodes of entries */
+			}));
+	});
 }
 
 /* Must be called with at least a read lock on the inode number; if the inode

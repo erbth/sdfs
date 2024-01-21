@@ -42,8 +42,16 @@ protected:
 	};
 
 	/* Callbacks */
+	void cb_lookup(fuse_req_t req, fuse_ino_t parent, const char* name,
+			prot::client::reply::readdir& msg);
+
+	void cb_lookup2(fuse_req_t req, fuse_ino_t parent, fuse_ino_t ino,
+			prot::client::reply::getfattr& msg);
+
 	void cb_getattr(fuse_req_t req, req_getattr_result res);
 	void cb_getfattr(fuse_req_t req, fuse_ino_t ino, prot::client::reply::getfattr& msg);
+	void cb_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
+			prot::client::reply::readdir& msg);
 
 public:
 	sdfs_fuse_ctx(int argc, char** argv);

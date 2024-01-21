@@ -8,7 +8,8 @@ enum error_code : int
 	SUCCESS = 0,
 	IO,
 	NOENT,
-	INVAL
+	INVAL,
+	NOTDIR
 };
 };
 

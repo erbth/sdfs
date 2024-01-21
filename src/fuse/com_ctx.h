@@ -38,6 +38,7 @@ struct req_getattr_result
 
 typedef std::function<void(req_getattr_result)> req_cb_getattr_t;
 typedef std::function<void(prot::client::reply::getfattr&)> req_cb_getfattr_t;
+typedef std::function<void(prot::client::reply::readdir&)> req_cb_readdir_t;
 
 struct request_t final
 {
@@ -45,6 +46,7 @@ struct request_t final
 
 	req_cb_getattr_t cb_getattr;
 	req_cb_getfattr_t cb_getfattr;
+	req_cb_readdir_t cb_readdir;
 };
 
 struct com_ctrl final
@@ -110,6 +112,7 @@ protected:
 	bool process_message(com_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::getattr& msg);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::getfattr& msg);
+	bool process_message(com_ctrl* ctrl, prot::client::reply::readdir& msg);
 
 	bool send_message(com_ctrl* ctrl, const prot::msg& msg);
 	bool send_message(com_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len);
@@ -126,6 +129,7 @@ public:
 
 	void request_getattr(req_cb_getattr_t cb);
 	void request_getfattr(unsigned long node_id, req_cb_getfattr_t cb);
+	void request_readdir(unsigned long node_id, req_cb_readdir_t cb);
 };
 
 #endif /* __COM_CTX_H */

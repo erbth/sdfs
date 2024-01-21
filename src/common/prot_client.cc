@@ -1,3 +1,4 @@
+#include <cstring>
 #include "prot_client.h"
 #include "serialization.h"
 
@@ -78,6 +79,38 @@ namespace req
 	}
 
 
+	readdir::readdir()
+		: msg(READDIR)
+	{
+	}
+
+	size_t readdir::serialize(char* buf) const
+	{
+		size_t size = 16 + msg_size;
+
+		if (buf)
+		{
+			swrite_u32(buf, size - 4);
+			swrite_u32(buf, num);
+			swrite_u64(buf, req_id);
+
+			swrite_u64(buf, node_id);
+		}
+
+		return size;
+	}
+
+	void readdir::parse(const char* buf, size_t size)
+	{
+		if (size != 12 + msg_size)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(buf);
+
+		node_id = sread_u64(buf);
+	}
+
+
 	unique_ptr<msg> parse(const char* buf, size_t size)
 	{
 		if (size < 4)
@@ -96,6 +129,13 @@ namespace req
 			case GETFATTR:
 			{
 				auto msg = make_unique<getfattr>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			case READDIR:
+			{
+				auto msg = make_unique<readdir>();
 				msg->parse(buf, size);
 				return msg;
 			}
@@ -187,6 +227,85 @@ namespace reply
 	}
 
 
+	readdir::readdir()
+		: msg(READDIR)
+	{
+	}
+
+	size_t readdir::serialize(char* buf) const
+	{
+		size_t size = 16 + msg_base_size;
+
+		for (const auto& e : entries)
+		{
+			if (e.name.size() > 255)
+				throw invalid_argument("file name must be at most 255 chars long");
+
+			size += entry_base_size + e.name.size();
+		}
+
+		if (buf)
+		{
+			swrite_u32(buf, size - 4);
+			swrite_u32(buf, num);
+			swrite_u64(buf, req_id);
+
+			swrite_i32(buf, res);
+			swrite_u64(buf, entries.size());
+
+			for (const auto& e : entries)
+			{
+				swrite_u64(buf, e.node_id);
+				swrite_u8(buf, e.type);
+				swrite_u8(buf, e.name.size());
+
+				memcpy(buf, e.name.c_str(), e.name.size());
+				buf += e.name.size();
+			}
+		}
+
+		return size;
+	}
+
+	void readdir::parse(const char* buf, size_t size)
+	{
+		auto ptr = buf;
+
+		if (size < 12 + msg_base_size)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(ptr);
+		res = sread_i32(ptr);
+		size_t cnt_entries = sread_u64(ptr);
+
+		auto max_ptr = buf + (size - 4);
+		for (size_t i = 0; i < cnt_entries; i++)
+		{
+			if (ptr + entry_base_size > max_ptr)
+				throw invalid_msg_size(num, size);
+
+			entry e;
+			e.node_id = sread_u64(ptr);
+			if (e.node_id == 0)
+				throw runtime_error("received directory entry with inode id 0");
+
+			e.type = sread_u8(ptr);
+
+			auto namesz = sread_u8(ptr);
+			if (ptr + namesz > max_ptr)
+				throw invalid_msg_size(num, size);
+
+			e.name = string(ptr, namesz);
+			ptr += namesz;
+
+			entries.push_back(move(e));
+		}
+
+		if (ptr != max_ptr)
+			throw invalid_msg_size(num, size);
+	}
+
+
 	unique_ptr<msg> parse(const char* buf, size_t size)
 	{
 		if (size < 4)
@@ -205,6 +324,13 @@ namespace reply
 			case GETFATTR:
 			{
 				auto msg = make_unique<getfattr>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			case READDIR:
+			{
+				auto msg = make_unique<readdir>();
 				msg->parse(buf, size);
 				return msg;
 			}
