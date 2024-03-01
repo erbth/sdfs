@@ -377,6 +377,11 @@ bool com_ctx::process_message(
 					ctrl,
 					static_cast<prot::client::reply::readdir&>(*msg));
 
+		case prot::client::reply::CREATE:
+			return process_message(
+					ctrl,
+					static_cast<prot::client::reply::create&>(*msg));
+
 		default:
 			fprintf(stderr, "protocol violation\n");
 			return true;
@@ -416,6 +421,15 @@ bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::readdir& msg)
 	/* Find corresponding request */
 	auto& req = find_req_for_reply(ctrl, msg);
 	req.cb_readdir(msg);
+	finish_req(ctrl, req);
+	return false;
+}
+
+bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::create& msg)
+{
+	/* Find corresponding request */
+	auto& req = find_req_for_reply(ctrl, msg);
+	req.cb_create(msg);
 	finish_req(ctrl, req);
 	return false;
 }
@@ -504,6 +518,26 @@ void com_ctx::request_readdir(unsigned long node_id, req_cb_readdir_t cb)
 	prot::client::req::readdir msg;
 	msg.req_id = req.id;
 	msg.node_id = node_id;
+
+	add_req(ctrl, req);
+	send_message(ctrl, msg);
+}
+
+void com_ctx::request_create(unsigned long parent_node_id, const char* name,
+		req_cb_create_t cb)
+{
+	unique_lock lk(m);
+	request_t req{};
+
+	auto ctrl = choose_ctrl();
+	ctrl->set_req_id(req);
+
+	req.cb_create = cb;
+
+	prot::client::req::create msg;
+	msg.req_id = req.id;
+	msg.parent_node_id = parent_node_id;
+	msg.name = name;
 
 	add_req(ctrl, req);
 	send_message(ctrl, msg);

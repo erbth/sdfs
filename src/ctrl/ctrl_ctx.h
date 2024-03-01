@@ -24,6 +24,10 @@ extern "C" {
 static_assert(sizeof(unsigned long) >= 8);
 static_assert(sizeof(long) >= 8);
 
+/* Prototypes */
+class ctrl_ctx;
+struct ctrl_ctrl;
+
 
 /* Used when callbacks need a lock witness to be present while being called,
  * e.g. when handling requests */
@@ -84,7 +88,21 @@ public:
 
 
 /* Locks */
-class ctrl_ctx;
+using cb_lock_inode_directory_t = std::function<void(int result, inode_directory_lock_witness&&)>;
+
+struct inode_directory_local_lock_request_t
+{
+	uint64_t req_id;
+	std::vector<std::pair<ctrl_ctrl&, bool>> received_grants;
+
+	cb_lock_inode_directory_t cb;
+}
+
+struct inode_directory_remote_lock_request_t
+{
+	ctrl_ctrl* remote_controller = nullptr;
+	uint64_t req_id;
+}
 
 class inode_lock_witness final
 {
@@ -102,6 +120,26 @@ public:
 	inode_lock_witness& operator=(inode_lock_witness&&);
 
 	~inode_lock_witness();
+
+	bool lock_held() const;
+};
+
+class inode_directory_lock_witness final
+{
+protected:
+	ctrl_ctx* ctrl;
+	bool have_lock;
+
+	void clean();
+
+public:
+	inode_directory_lock_witness();
+	inode_directory_lock_witness(ctrl_ctx& ctrl);
+
+	inode_directory_lock_witness(inode_directory_lock_witness&&);
+	inode_directory_lock_witness& operator=(inode_directory_lock_witness&&);
+
+	~inode_directory_lock_witness();
 
 	bool lock_held() const;
 };
@@ -152,6 +190,13 @@ struct inode_directory_t
 {
 	/* Inode locks (negative means write lock) */
 	std::map<unsigned long, long> node_locks;
+
+	/* Inode directory lock */
+	bool locked = false;
+	bool local_lock_request_in_flight = false;
+	ctrl_ctrl* remote_locker = nullptr;
+	std::list<inode_directory_local_lock_request_t> local_lock_requests;
+	std::list<inode_directory_remote_lock_request_t> remote_lock_requests;
 
 	/* Cached inodes */
 	std::map<unsigned long, std::shared_ptr<inode>> cached_inodes;
@@ -341,17 +386,17 @@ protected:
 	/* inode directory */
 	inode_directory_t inode_directory;
 
-	/* TODO: add witness objects */
-	using cb_lock_inode_directory_t = std::function<void(int result)>;
 	using cb_lock_inode_t = std::function<void(int result, inode_lock_witness&&)>;
 
 	using cb_get_inode_t = req_cb_def<inode_lock_witness, void(int result, std::shared_ptr<inode>)>;
 	using cb_write_inode_t = std::function<void(int result)>;
-	using cb_get_unused_inode_t = std::function<void(int result, unsigned long inode_id)>;
+	using cb_get_unused_inode_t = std::function<void(int result, unsigned long node_id)>;
 
 	using cb_listdir_t = std::function<void(int result, std::vector<dir_entry>&&)>;
 	using cb_unlink_t = std::function<void(int result)>;
 	using cb_add_link_t = std::function<void(int result)>;
+	using cb_create_file_t = std::function<void(int result,
+			unsigned long node_id, std::shared_ptr<inode>, inode_lock_witness&&)>;
 
 	void lock_inode_directory(cb_lock_inode_directory_t cb);
 	void lock_inode(unsigned long id, cb_lock_inode_t cb);
@@ -364,6 +409,9 @@ protected:
 	void listdir(unsigned long node_id, cb_listdir_t cb);
 	void unlink(unsigned long parent_inode_id, unsigned long inode_id, cb_unlink_t cb);
 	void add_link(unsigned long parent_inode_id, unsigned long inode_id, cb_add_link_t cb);
+
+	/* Creates a new inode for a file and adds a link */
+	void create_file(unsigned long parent_node_id, const std::string& name, cb_create_file_t cb);
 
 
 	/* Synchronization with other controllers */
@@ -425,6 +473,7 @@ protected:
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::getattr& msg);
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::getfattr& msg);
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::readdir& msg);
+	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::create& msg);
 
 	bool send_message_to_client(std::shared_ptr<ctrl_client> client, const prot::msg& msg);
 	bool send_message_to_client(std::shared_ptr<ctrl_client> client, dynamic_buffer&& buf, size_t msg_len);
@@ -434,13 +483,16 @@ protected:
 	bool process_ctrl_message(ctrl_ctrl* ctrl, prot::ctrl::req::ctrlinfo& msg);
 	bool process_ctrl_message(ctrl_ctrl* ctrl, prot::ctrl::req::fetch_inode& msg);
 	bool process_ctrl_message(ctrl_ctrl* ctrl, prot::ctrl::reply::fetch_inode& msg);
+	bool process_ctrl_message(ctrl_ctrl* ctrl, prot::ctrl::req::lock_inode_directory& msg);
+	bool process_ctrl_message(ctrl_ctrl* ctrl, prot::ctrl::reply::lock_inode_directory& msg);
 
-	bool send_message_to_ctrl(ctrl_ctrl* ctrl, const prot::msg& msg);
-	bool send_message_to_ctrl(ctrl_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len);
+	void send_message_to_ctrl(ctrl_ctrl* ctrl, const prot::msg& msg);
+	void send_message_to_ctrl(ctrl_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len);
 
 
 	/* Lock witnesses are friends */
 	friend inode_lock_witness;
+	friend inode_directory_lock_witness;
 
 public:
 	ctrl_ctx(unsigned id, const std::optional<const std::string>& bind_addr);

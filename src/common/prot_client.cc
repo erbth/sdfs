@@ -16,6 +16,11 @@ msg::msg(int num)
 {
 }
 
+msg::msg(int num, uint64_t req_id)
+	: prot::msg(num), req_id(req_id)
+{
+}
+
 namespace req
 {
 	getattr::getattr()
@@ -111,6 +116,50 @@ namespace req
 	}
 
 
+	create::create()
+		: msg(CREATE)
+	{
+	}
+
+	size_t create::serialize(char* buf) const
+	{
+		if (name.size() > 255)
+			throw invalid_argument("name may be at most 255 characters long");
+
+		size_t size = 16 + msg_size_base + name.size();
+
+		if (buf)
+		{
+			swrite_u32(buf, size - 4);
+			swrite_u32(buf, num);
+			swrite_u64(buf, req_id);
+
+			swrite_u64(buf, parent_node_id);
+			swrite_u8(buf, name.size());
+
+			memcpy(buf, name.c_str(), name.size());
+		}
+
+		return size;
+	}
+
+	void create::parse(const char* buf, size_t size)
+	{
+		if (size < 12 + msg_size_base)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(buf);
+
+		parent_node_id = sread_u64(buf);
+		auto namesz = sread_u8(buf);
+
+		if (size != 12 + msg_size_base + namesz)
+			throw invalid_msg_size(num, size);
+
+		name = string(buf, namesz);
+	}
+
+
 	unique_ptr<msg> parse(const char* buf, size_t size)
 	{
 		if (size < 4)
@@ -136,6 +185,13 @@ namespace req
 			case READDIR:
 			{
 				auto msg = make_unique<readdir>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			case CREATE:
+			{
+				auto msg = make_unique<create>();
 				msg->parse(buf, size);
 				return msg;
 			}
@@ -234,7 +290,7 @@ namespace reply
 
 	size_t readdir::serialize(char* buf) const
 	{
-		size_t size = 16 + msg_base_size;
+		size_t size = 16 + msg_size_base;
 
 		for (const auto& e : entries)
 		{
@@ -271,7 +327,7 @@ namespace reply
 	{
 		auto ptr = buf;
 
-		if (size < 12 + msg_base_size)
+		if (size < 12 + msg_size_base)
 			throw invalid_msg_size(num, size);
 
 		req_id = sread_u64(ptr);
@@ -306,6 +362,47 @@ namespace reply
 	}
 
 
+	create::create()
+		: msg(CREATE)
+	{
+	}
+
+	create::create(uint64_t req_id, int res)
+		: msg(CREATE, req_id), res(res)
+	{
+	}
+
+	size_t create::serialize(char* buf) const
+	{
+		size_t size = 16 + msg_size;
+
+		if (buf)
+		{
+			swrite_u32(buf, size - 4);
+			swrite_u32(buf, num);
+			swrite_u64(buf, req_id);
+
+			swrite_i32(buf, res);
+			swrite_u64(buf, node_id);
+			swrite_u64(buf, mtime);
+		}
+
+		return size;
+	}
+
+	void create::parse(const char* buf, size_t size)
+	{
+		if (size < 12 + msg_size)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(buf);
+
+		res = sread_i32(buf);
+		node_id = sread_u64(buf);
+		mtime = sread_u64(buf);
+	}
+
+
 	unique_ptr<msg> parse(const char* buf, size_t size)
 	{
 		if (size < 4)
@@ -331,6 +428,13 @@ namespace reply
 			case READDIR:
 			{
 				auto msg = make_unique<readdir>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			case CREATE:
+			{
+				auto msg = make_unique<create>();
 				msg->parse(buf, size);
 				return msg;
 			}

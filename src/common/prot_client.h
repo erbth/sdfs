@@ -19,6 +19,7 @@ struct msg : public prot::msg
 	uint64_t req_id;
 
 	msg(int num);
+	msg(int num, uint64_t req_id);
 };
 
 namespace req
@@ -28,7 +29,8 @@ namespace req
 		GETFATTR,
 		READDIR,
 		READ,
-		WRITE
+		WRITE,
+		CREATE
 	};
 
 	struct getattr : public msg
@@ -62,6 +64,19 @@ namespace req
 		static constexpr size_t msg_size = 8;
 	};
 
+	struct create : public msg
+	{
+		unsigned long parent_node_id;
+		std::string name;
+
+		create();
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size_base = 9;
+	};
+
 	std::unique_ptr<msg> parse(const char* buf, size_t size);
 };
 
@@ -72,7 +87,8 @@ namespace reply
 		GETFATTR,
 		READDIR,
 		READ,
-		WRITE
+		WRITE,
+		CREATE
 	};
 
 	enum file_type_t : unsigned char
@@ -133,8 +149,25 @@ namespace reply
 		void parse(const char* buf, size_t size);
 
 	protected:
-		static constexpr size_t msg_base_size = 4 + 8;
+		static constexpr size_t msg_size_base = 4 + 8;
 		static constexpr size_t entry_base_size = 10;
+	};
+
+	struct create : public msg
+	{
+		int res{};
+
+		unsigned long node_id{};
+		unsigned long mtime{};
+
+		create();
+		create(uint64_t req_id, int res);
+
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size = 4 + 2*8;
 	};
 
 	std::unique_ptr<msg> parse(const char* buf, size_t size);

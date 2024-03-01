@@ -71,6 +71,43 @@ struct stat generate_st_buf_from_getfattr(
 	return s;
 }
 
+struct stat generate_st_buf_from_create(
+		fuse_req_t req, const prot::client::reply::create& msg)
+{
+	struct stat s{};
+
+	s.st_mode = S_IFREG | 0644;
+	s.st_nlink = 1;
+
+	auto fctx = fuse_req_ctx(req);
+	s.st_uid = fctx->uid;
+	s.st_gid = fctx->gid;
+
+	s.st_size = 0;
+	s.st_mtim.tv_sec = msg.mtime / 1000000;
+	s.st_mtim.tv_nsec = (msg.mtime % 1000000) * 1000;
+
+	return s;
+}
+
+inline open_list<file_ctx>::node* get_file_ctx_node(
+		struct fuse_file_info* fi, fuse_ino_t ino)
+{
+	auto fn = reinterpret_cast<open_list<file_ctx>::node*>(fi->fh);
+	if (!fn)
+		throw invalid_argument("fh of fuse_file_info is nullptr");
+
+	if (fn->elem.ino != ino)
+		throw invalid_argument("Inode of open file changed");
+
+	return fn;
+}
+
+inline file_ctx& get_file_ctx(struct fuse_file_info* fi, fuse_ino_t ino)
+{
+	return get_file_ctx_node(fi, ino)->elem;
+}
+
 
 sdfs_fuse_ctx::sdfs_fuse_ctx(int argc, char** argv)
 	: args(FUSE_ARGS_INIT(argc, argv))
@@ -79,6 +116,14 @@ sdfs_fuse_ctx::sdfs_fuse_ctx(int argc, char** argv)
 
 sdfs_fuse_ctx::~sdfs_fuse_ctx()
 {
+	/* Clear open file list */
+	while (auto fn = open_files.get_head())
+	{
+		fprintf(stderr, "WARNING: open_files list not empty! (force umount?)\n");
+		open_files.remove(fn);
+		delete fn;
+	}
+
 	if (fse)
 	{
 		if (session_mounted)
@@ -180,6 +225,62 @@ void sdfs_fuse_ctx::op_statfs(fuse_req_t req, fuse_ino_t ino)
 }
 
 
+void sdfs_fuse_ctx::op_open(fuse_req_t req, fuse_ino_t ino,
+		struct fuse_file_info* fi)
+{
+	/* Check flags */
+	if ((fi->flags & O_ACCMODE) == 0)
+	{
+		check_call(fuse_reply_err(req, EINVAL), "fuse_reply_err");
+		return;
+	}
+
+	/* Check if file exists */
+	cctx.request_getfattr(ino, bind_front(&sdfs_fuse_ctx::cb_open,
+				this, req, ino, fi));
+}
+
+void sdfs_fuse_ctx::op_create(fuse_req_t req, fuse_ino_t parent,
+		const char* name, mode_t mode, struct fuse_file_info* fi)
+{
+	/* Check flags and maximum filename length */
+	if ((fi->flags & O_ACCMODE) == 0 || strlen(name) > 255)
+	{
+		check_call(fuse_reply_err(req, EINVAL), "fuse_reply_err");
+		return;
+	}
+
+	cctx.request_create(parent, name, bind_front(&sdfs_fuse_ctx::cb_create,
+				this, req, fi));
+}
+
+void sdfs_fuse_ctx::op_read(fuse_req_t req, fuse_ino_t ino, size_t size,
+		off_t off, struct fuse_file_info* fi)
+{
+	check_call(fuse_reply_err(req, EIO), "fuse_reply_err");
+}
+
+void sdfs_fuse_ctx::op_write(fuse_req_t req, fuse_ino_t ino, const char* buf,
+		size_t size, off_t off, struct fuse_file_info* fi)
+{
+	check_call(fuse_reply_err(req, EIO), "fuse_reply_err");
+}
+
+void sdfs_fuse_ctx::op_release(fuse_req_t req, fuse_ino_t ino,
+		struct fuse_file_info* fi)
+{
+	auto fn = get_file_ctx_node(fi, ino);
+
+	/* Remove file ctx */
+	open_files.remove(fn);
+	delete fn;
+
+	printf("close(%u)\n", (unsigned) ino);
+
+	check_call(fuse_reply_err(req, 0), "fuse_reply_err");
+}
+
+
 void sdfs_fuse_ctx::_op_lookup(fuse_req_t req, fuse_ino_t parent,
 		const char* name)
 {
@@ -201,6 +302,36 @@ void sdfs_fuse_ctx::_op_readdir(fuse_req_t req, fuse_ino_t ino,
 void sdfs_fuse_ctx::_op_statfs(fuse_req_t req, fuse_ino_t ino)
 {
 	global_sdfs_fuse_ctx->op_statfs(req, ino);
+}
+
+void sdfs_fuse_ctx::_op_open(fuse_req_t req, fuse_ino_t ino,
+		struct fuse_file_info* fi)
+{
+	global_sdfs_fuse_ctx->op_open(req, ino, fi);
+}
+
+void sdfs_fuse_ctx::_op_read(fuse_req_t req, fuse_ino_t ino, size_t size,
+		off_t off, struct fuse_file_info* fi)
+{
+	global_sdfs_fuse_ctx->op_read(req, ino, size, off, fi);
+}
+
+void sdfs_fuse_ctx::_op_write(fuse_req_t req, fuse_ino_t ino, const char* buf,
+		size_t size, off_t off, struct fuse_file_info* fi)
+{
+	global_sdfs_fuse_ctx->op_write(req, ino, buf, size, off, fi);
+}
+
+void sdfs_fuse_ctx::_op_release(fuse_req_t req, fuse_ino_t ino,
+		struct fuse_file_info* fi)
+{
+	global_sdfs_fuse_ctx->op_release(req, ino, fi);
+}
+
+void sdfs_fuse_ctx::_op_create(fuse_req_t req, fuse_ino_t parent,
+		const char* name, mode_t mode, struct fuse_file_info* fi)
+{
+	global_sdfs_fuse_ctx->op_create(req, parent, name, mode, fi);
 }
 
 
@@ -350,4 +481,109 @@ void sdfs_fuse_ctx::cb_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 		check_call(fuse_reply_buf(req, buf.ptr(), bufsz), "fuse_reply_buf");
 	else
 		check_call(fuse_reply_buf(req, nullptr, 0), "fuse_reply_buf");
+}
+
+
+open_list<file_ctx>::node* sdfs_fuse_ctx::setup_file_struct(
+		struct fuse_file_info* fi, fuse_ino_t ino)
+{
+	auto fn = new open_list<file_ctx>::node();
+	auto& f = fn->elem;
+	try
+	{
+		/* Setup file info */
+		f.append = fi->flags & O_APPEND;
+		f.ino = ino;
+
+		/* Setup fuse_file_info */
+		fi->direct_io = 1;
+		fi->keep_cache = 0;
+
+		open_files.add(fn);
+
+		try
+		{
+			fi->fh = reinterpret_cast<uintptr_t>(fn);
+			return fn;
+		}
+		catch (...)
+		{
+			open_files.remove(fn);
+			throw;
+		}
+	}
+	catch (...)
+	{
+		delete fn;
+		throw;
+	}
+}
+
+void sdfs_fuse_ctx::cb_open(fuse_req_t req, fuse_ino_t ino,
+		struct fuse_file_info* fi, prot::client::reply::getfattr& msg)
+{
+	if (msg.res != err::SUCCESS)
+	{
+		check_call(
+				fuse_reply_err(req, convert_error_code(msg.res)),
+				"fuse_reply_err");
+		return;
+	}
+
+	/* File exists */
+	if (msg.type != prot::client::reply::FT_FILE)
+	{
+		/* Not sure if opening a directory needs to be supported at the FS
+		 * layer, open of a directory with O_RDONLY is supported by open (2). */
+		check_call(fuse_reply_err(req, EISDIR), "fuse_reply_err");
+		return;
+	}
+
+	auto fn = setup_file_struct(fi, ino);
+	try
+	{
+		check_call(fuse_reply_open(req, fi), "fuse_reply_open");
+	}
+	catch (...)
+	{
+		open_files.remove(fn);
+		delete fn;
+		throw;
+	}
+
+	printf("open(%u)\n", (unsigned) ino);
+}
+
+void sdfs_fuse_ctx::cb_create(fuse_req_t req, fuse_file_info* fi,
+		prot::client::reply::create& msg)
+{
+	if (msg.res != err::SUCCESS)
+	{
+		check_call(
+				fuse_reply_err(req, convert_error_code(msg.res)),
+				"fuse_reply_err");
+		return;
+	}
+
+	fuse_ino_t ino = msg.node_id;
+	struct fuse_entry_param ep = {
+		.ino = ino,
+		.attr = generate_st_buf_from_create(req, msg),
+		.attr_timeout = 0,
+		.entry_timeout = 0,
+	};
+
+	auto fn = setup_file_struct(fi, ino);
+	try
+	{
+		check_call(fuse_reply_create(req, &ep, fi), "fuse_reply_create");
+	}
+	catch (...)
+	{
+		open_files.remove(fn);
+		delete fn;
+		throw;
+	}
+
+	printf("create(%u)\n", (unsigned) ino);
 }

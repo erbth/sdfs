@@ -966,6 +966,11 @@ bool ctrl_ctx::process_client_message(
 					client,
 					static_cast<prot::client::req::readdir&>(*msg));
 
+		case prot::client::req::CREATE:
+			return process_client_message(
+					client,
+					static_cast<prot::client::req::create&>(*msg));
+
 		default:
 			fprintf(stderr, "protocol violation\n");
 			return true;
@@ -1069,6 +1074,34 @@ bool ctrl_ctx::process_client_message(
 
 		send_message_to_client(client, reply);
 	});
+
+	return false;
+}
+
+bool ctrl_ctx::process_client_message(
+		shared_ptr<ctrl_client> client, prot::client::req::create& msg)
+{
+	if (msg.parent_node_id == 0)
+	{
+		return send_message_to_client(
+				client,
+				prot::client::reply::create(msg.req_id, err::INVAL));
+	}
+
+	create_file(msg.parent_node_id, msg.name,
+		[this, client, msg](int result, unsigned long node_id, shared_ptr<inode> n,
+				inode_lock_witness&& lkw)
+		{
+			prot::client::reply::create reply(msg.req_id, result);
+
+			if (result == err::SUCCESS)
+			{
+				reply.node_id = node_id;
+				reply.mtime = n->mtime;
+			}
+
+			send_message_to_client(client, reply);
+		});
 
 	return false;
 }
@@ -1304,6 +1337,16 @@ bool ctrl_ctx::process_ctrl_message(
 					ctrl,
 					static_cast<prot::ctrl::reply::fetch_inode&>(*msg));
 
+		case prot::ctrl::req::LOCK_INODE_DIRECTORY:
+			return process_ctrl_message(
+					ctrl,
+					static_cast<prot::ctrl::req::lock_inode_directory&>(*msg));
+
+		case prot::ctrl::reply::LOCK_INODE_DIRECTORY:
+			return process_ctrl_message(
+					ctrl,
+					static_cast<prot::ctrl::reply::lock_inode_directory&>(*msg));
+
 		default:
 			fprintf(stderr, "protocol violation\n");
 			return true;
@@ -1315,7 +1358,8 @@ bool ctrl_ctx::process_ctrl_message(
 {
 	prot::ctrl::req::ctrlinfo reply;
 	reply.id = id;
-	return send_message_to_ctrl(ctrl, reply);
+	send_message_to_ctrl(ctrl, reply);
+	return false;
 }
 
 bool ctrl_ctx::process_ctrl_message(
@@ -1339,10 +1383,12 @@ bool ctrl_ctx::process_ctrl_message(
 		in->serialize(ib.ptr());
 
 		reply.inode = ib.ptr();
-		return send_message_to_ctrl(ctrl, reply);
+		send_message_to_ctrl(ctrl, reply);
+		return false;
 	}
 
-	return send_message_to_ctrl(ctrl, reply);
+	send_message_to_ctrl(ctrl, reply);
+	return false;
 }
 
 bool ctrl_ctx::process_ctrl_message(
@@ -1372,23 +1418,61 @@ bool ctrl_ctx::process_ctrl_message(
 	return false;
 }
 
-bool ctrl_ctx::send_message_to_ctrl(ctrl_ctrl* ctrl, const prot::msg& msg)
+bool ctrl_ctx::process_ctrl_message(
+		ctrl_ctrl* ctrl, prot::ctrl::req::lock_inode_directory& msg)
+{
+	/* NOTE: This deadlock-avoidance protocol does only work up to two
+	 * controllers. */
+	if (!inode_directory.locked && ctrl->id < id)
+	{
+		/* Inode directory not locked and local lock requests have lower
+		 * priority if present, hence grant lock */
+		prot::ctrl::reply::lock_inode_directory reply;
+		reply.req_id = msg.req_id;
+
+		send_message_to_ctrl(reply);
+	}
+	else
+	{
+		inode_directory_remote_lock_request_t lk_req;
+		lk_req.ctrl_ctrl = ctrl;
+		lk_req.req_id = msg.req_id;
+
+		inode_directory.remote_lock_requests.push_back(move(lk_req));
+
+		/* Sort lock requests by decreasing priority */
+		sort(
+				inode_directory.remote_lock_requests.begin(),
+				inode_directory.remote_lock_requests.end(),
+				[](auto& a, auto& b) {
+					return a.ctrl->id < b.ctrl->id;
+				});
+	}
+
+	return false;
+}
+
+bool ctrl_ctx::process_ctrl_message(
+		ctrl_ctrl* ctrl, prot::ctrl::reply::lock_inode_directory& msg)
+{
+	TODO
+}
+
+void ctrl_ctx::send_message_to_ctrl(ctrl_ctrl* ctrl, const prot::msg& msg)
 {
 	dynamic_buffer buf;
 	buf.ensure_size(msg.serialize(nullptr));
 	auto msg_len = msg.serialize(buf.ptr());
-	return send_message_to_ctrl(ctrl, move(buf), msg_len);
+	send_message_to_ctrl(ctrl, move(buf), msg_len);
 }
 
-bool ctrl_ctx::send_message_to_ctrl(ctrl_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len)
+void ctrl_ctx::send_message_to_ctrl(ctrl_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len)
 {
 	auto was_empty = ctrl->send_queue.empty();
 	ctrl->send_queue.emplace(move(buf), msg_len);
 
 	if (was_empty)
 		epoll.change_events(ctrl->get_fd(), EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP);
-
-	return false;
 }
 
 void ctrl_ctx::close_ctrl_conn(ctrl_ctrl* ctrl)
@@ -1424,8 +1508,6 @@ void ctrl_ctx::lock_inode(unsigned long node_id, cb_lock_inode_t cb)
 
 	if (grant)
 	{
-		printf("LOCK INODE %lu r\n", node_id);
-
 		cb(err::SUCCESS, inode_lock_witness(*this, node_id));
 		return;
 	}
@@ -1434,6 +1516,45 @@ void ctrl_ctx::lock_inode(unsigned long node_id, cb_lock_inode_t cb)
 
 	/* Send the lock request to the other controllers */
 }
+
+
+void ctrl_ctx::lock_inode_directory(cb_lock_inode_directory_t cb)
+{
+	/* Create lock request */
+	auto req_id = get_request_id();
+
+	{
+		inode_directory_local_lock_request_t lk_req;
+		lk_req.req_id = req_id;
+		lk_req.cb = cb;
+
+		/* Only the first waiting local lock requests needs grants from other
+		 * controllers */
+		if (local_lock_requests.empty())
+		{
+			for (auto& c : ctrls)
+				lk_req.received_grants.emplace_back(c, false);
+		}
+
+		local_lock_requests.push_back(move(cb));
+	}
+
+	if (!inode_directory.locked)
+	{
+		/* Inode directory not locked; send lock request to other controllers */
+		if (!local_lock_request_in_flight)
+		{
+			local_lock_request_in_flight = true;
+
+			prot::ctrl::req::lock_inode_directory msg;
+			msg.req_id = req_id;
+
+			for (auto& c : ctrls)
+				send_message_to_ctrl(c, msg);
+		}
+	}
+}
+
 
 /* Must be called with at least lock on the inode (a witness is required in cb) */
 void ctrl_ctx::get_inode(unsigned long node_id, cb_get_inode_t&& cb)
@@ -1543,6 +1664,27 @@ void ctrl_ctx::fetch_inode_from_ctrls(unsigned long node_id, cb_fetch_inode_from
 }
 
 
+void ctrl_ctx::create_file(unsigned long parent_node_id, const string& name,
+		cb_create_file_t cb)
+{
+	/* Get an unused inode */
+	lock_inode_directory([this](int result, inode_directory_lock_witness&&) {
+		if (result != err::SUCCESS)
+		{
+			cb(result, 0, nullptr, inode_lock_wintess());
+			return;
+		}
+
+		/* Populate inode for new file */
+
+		/* Add link to file in directory */
+
+		/* Respond to callback */
+		cb(err::IO, 0, nullptr, inode_lock_witness());
+	});
+}
+
+
 void ctrl_ctx::main()
 {
 	while (!quit_requested)
@@ -1587,8 +1729,6 @@ void inode_lock_witness::clean()
 {
 	if (node_id > 0)
 	{
-		printf("UNLOCK INODE %lu\n", node_id);
-
 		/* Remove lock */
 		auto i = ctrl->inode_directory.node_locks.find(node_id);
 		if (i->second > 1)
@@ -1601,7 +1741,6 @@ void inode_lock_witness::clean()
 			 * read lock after a write lock) */
 			if (false)
 			{
-				printf("LOCK INODE %lu r\n", node_id);
 			}
 			else
 			{

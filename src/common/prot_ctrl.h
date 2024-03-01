@@ -16,7 +16,8 @@ namespace req
 	/* The last message id must be smaller than 0x7fffffff */
 	enum msg_nums : unsigned {
 		CTRLINFO = 1,
-		FETCH_INODE
+		FETCH_INODE,
+		LOCK_INODE_DIRECTORY
 	};
 
 	struct ctrlinfo : public msg
@@ -43,12 +44,25 @@ namespace req
 	protected:
 		static constexpr size_t msg_size = 16;
 	};
+
+	struct lock_inode_directory : public msg
+	{
+		uint64_t req_id;
+
+		lock_inode_directory();
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size = 8;
+	};
 };
 
 namespace reply
 {
 	enum msg_nums : unsigned {
-		FETCH_INODE = 0x80000000
+		FETCH_INODE = 0x80000000,
+		LOCK_INODE_DIRECTORY
 	};
 
 	struct fetch_inode : public msg
@@ -63,6 +77,18 @@ namespace reply
 	protected:
 		static constexpr size_t msg_size_base = 8;
 		static constexpr size_t msg_size_inode = 4096;
+	};
+
+	struct lock_inode_directory : public msg
+	{
+		uint64_t req_id;
+
+		lock_inode_directory();
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size = 8;
 	};
 };
 

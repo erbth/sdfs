@@ -70,6 +70,35 @@ namespace req
 		req_id = sread_u64(buf);
 		node_id = sread_u64(buf);
 	}
+
+
+	lock_inode_directory::lock_inode_directory()
+		: msg(LOCK_INODE_DIRECTORY)
+	{
+	}
+
+	size_t lock_inode_directory::serialize(char* buf) const
+	{
+		size_t size = 8 + msg_size;
+
+		if (buf)
+		{
+			swrite_u32(buf, size - 4);
+			swrite_u32(buf, num);
+
+			swrite_u64(buf, req_id);
+		}
+
+		return size;
+	}
+
+	void lock_inode_directory::parse(const char* buf, size_t size)
+	{
+		if (size != 4 + msg_size)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(buf);
+	}
 };
 
 namespace reply
@@ -118,6 +147,35 @@ namespace reply
 		else
 			inode = nullptr;
 	}
+
+
+	lock_inode_directory::lock_inode_directory()
+		: msg(LOCK_INODE_DIRECTORY)
+	{
+	}
+
+	size_t lock_inode_directory::serialize(char* buf) const
+	{
+		size_t size = 8 + msg_size;
+
+		if (buf)
+		{
+			swrite_u32(buf, size - 4);
+			swrite_u32(buf, num);
+
+			swrite_u64(buf, req_id);
+		}
+
+		return size;
+	}
+
+	void lock_inode_directory::parse(const char* buf, size_t size)
+	{
+		if (size != 4 + msg_size)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(buf);
+	}
 };
 
 
@@ -146,6 +204,20 @@ unique_ptr<msg> parse(const char* buf, size_t size)
 		case reply::FETCH_INODE:
 		{
 			auto msg = make_unique<reply::fetch_inode>();
+			msg->parse(buf, size);
+			return msg;
+		}
+
+		case req::LOCK_INODE_DIRECTORY:
+		{
+			auto msg = make_unique<req::lock_inode_directory>();
+			msg->parse(buf, size);
+			return msg;
+		}
+
+		case reply::LOCK_INODE_DIRECTORY:
+		{
+			auto msg = make_unique<reply::lock_inode_directory>();
 			msg->parse(buf, size);
 			return msg;
 		}
