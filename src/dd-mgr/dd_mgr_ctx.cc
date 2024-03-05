@@ -330,7 +330,7 @@ void dd_mgr_ctx::on_client_fd(int fd, uint32_t events)
 				c.read_buf_pos += ret;
 
 				/* Check if the message has been completely received */
-				if (c.read_buf_pos >= 4)
+				while (c.read_buf_pos >= 4)
 				{
 					size_t msg_len = ser::read_u32(c.read_buf);
 
@@ -338,11 +338,18 @@ void dd_mgr_ctx::on_client_fd(int fd, uint32_t events)
 					{
 						/* Process the message */
 						if (process_client_message(c, c.read_buf + 4, msg_len))
+						{
 							remove_client = true;
+							break;
+						}
 
 						c.read_buf_pos -= msg_len + 4;
 						memmove(c.read_buf, c.read_buf + msg_len + 4,
 								c.read_buf_pos);
+					}
+					else
+					{
+						break;
 					}
 				}
 			}

@@ -79,112 +79,112 @@ void com_ctx::initialize_cfg()
 
 void com_ctx::initialize_connect()
 {
-	/* Connect to controllers */
-	for (auto& desc : cfg.controllers)
+	if (!cfg.controller)
+		throw runtime_error("No controller specified in config file");
+
+	/* Connect to controller */
+	auto& desc = *cfg.controller;
+
+	com_ctrl c;
+
+	/* Resolve address */
+	if (regex_match(desc.addr_str, regex("^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$")))
 	{
-		com_ctrl c;
-		c.id = desc.id;
+		struct sockaddr_in6 addr = {
+			.sin6_family = AF_INET6,
+			.sin6_port = htons(SDFS_CTRL_PORT)
+		};
 
-		/* Resolve address */
-		if (regex_match(desc.addr_str, regex("^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$")))
+		if (inet_pton(AF_INET6, ("::FFFF:" + desc.addr_str).c_str(),
+					&addr.sin6_addr) != 1)
 		{
-			struct sockaddr_in6 addr = {
-				.sin6_family = AF_INET6,
-				.sin6_port = htons(SDFS_CTRL_PORT)
-			};
-
-			if (inet_pton(AF_INET6, ("::FFFF:" + desc.addr_str).c_str(),
-						&addr.sin6_addr) != 1)
-			{
-				throw runtime_error("Failed to resolve controller address `" +
-						desc.addr_str + "'");
-			}
-
-			c.wfd.set_errno(
-					socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0),
-					"socket");
-
-			check_syscall(
-					connect(c.get_fd(), (const struct sockaddr*) &addr, sizeof(addr)),
-					("connect to controller `" + desc.addr_str + "'").c_str());
-		}
-		else
-		{
-			struct addrinfo hints = {
-				.ai_flags = AI_V4MAPPED | AI_ADDRCONFIG,
-				.ai_family = AF_INET6,
-				.ai_socktype = SOCK_STREAM,
-				.ai_protocol = 0
-			};
-
-			struct addrinfo* addrs = nullptr;
-
-			auto gai_ret = getaddrinfo(desc.addr_str.c_str(),
-					nullptr, &hints, &addrs);
-
-			if (gai_ret != 0)
-			{
-				throw gai_exception(gai_ret,
-						"Failed to resolve controller address `" +
-						desc.addr_str + "': ");
-			}
-
-			struct sockaddr_in6 addr = {
-				.sin6_family = AF_INET6,
-				.sin6_port = htons(SDFS_CTRL_PORT)
-			};
-
-			bool connected = false;
-
-			try
-			{
-				for (struct addrinfo* ai = addrs; ai; ai = ai->ai_next)
-				{
-					c.wfd.set_errno(
-							socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0),
-							"socket");
-
-					addr.sin6_addr = ((const struct sockaddr_in6&) ai->ai_addr).sin6_addr;
-
-					auto ret = connect(c.get_fd(), (const struct sockaddr*) &addr, sizeof(addr));
-					if (ret == 0)
-					{
-						connected = true;
-						break;
-					}
-				}
-
-				freeaddrinfo(addrs);
-			}
-			catch (...)
-			{
-				freeaddrinfo(addrs);
-				throw;
-			}
-
-			if (!connected)
-			{
-				throw runtime_error("Failed to connect to controller `" +
-						desc.addr_str + "'");
-			}
+			throw runtime_error("Failed to resolve controller address `" +
+					desc.addr_str + "'");
 		}
 
-		ctrls.push_back(move(c));
+		c.wfd.set_errno(
+				socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0),
+				"socket");
+
+		check_syscall(
+				connect(c.get_fd(), (const struct sockaddr*) &addr, sizeof(addr)),
+				("connect to controller `" + desc.addr_str + "'").c_str());
+	}
+	else
+	{
+		struct addrinfo hints = {
+			.ai_flags = AI_V4MAPPED | AI_ADDRCONFIG,
+			.ai_family = AF_INET6,
+			.ai_socktype = SOCK_STREAM,
+			.ai_protocol = 0
+		};
+
+		struct addrinfo* addrs = nullptr;
+
+		auto gai_ret = getaddrinfo(desc.addr_str.c_str(),
+				nullptr, &hints, &addrs);
+
+		if (gai_ret != 0)
+		{
+			throw gai_exception(gai_ret,
+					"Failed to resolve controller address `" +
+					desc.addr_str + "': ");
+		}
+
+		struct sockaddr_in6 addr = {
+			.sin6_family = AF_INET6,
+			.sin6_port = htons(SDFS_CTRL_PORT)
+		};
+
+		bool connected = false;
 
 		try
 		{
-			epoll.add_fd(ctrls.back().get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP,
-					bind_front(&com_ctx::on_ctrl_fd, this, &ctrls.back()));
+			for (struct addrinfo* ai = addrs; ai; ai = ai->ai_next)
+			{
+				c.wfd.set_errno(
+						socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0),
+						"socket");
+
+				addr.sin6_addr = ((const struct sockaddr_in6&) ai->ai_addr).sin6_addr;
+
+				auto ret = connect(c.get_fd(), (const struct sockaddr*) &addr, sizeof(addr));
+				if (ret == 0)
+				{
+					connected = true;
+					break;
+				}
+			}
+
+			freeaddrinfo(addrs);
 		}
 		catch (...)
 		{
-			ctrls.pop_back();
+			freeaddrinfo(addrs);
 			throw;
 		}
 
-		printf("Connected to controller %u (%s)\n",
-				ctrls.back().id, desc.addr_str.c_str());
+		if (!connected)
+		{
+			throw runtime_error("Failed to connect to controller `" +
+					desc.addr_str + "'");
+		}
 	}
+
+	ctrls.push_back(move(c));
+
+	try
+	{
+		epoll.add_fd(ctrls.back().get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP,
+				bind_front(&com_ctx::on_ctrl_fd, this, &ctrls.back()));
+	}
+	catch (...)
+	{
+		ctrls.pop_back();
+		throw;
+	}
+
+	printf("Connected to controller %s\n", desc.addr_str.c_str());
 }
 
 void com_ctx::initialize()
@@ -214,7 +214,7 @@ void com_ctx::worker_thread_func()
 
 void com_ctx::remove_controller(decltype(ctrls)::iterator i)
 {
-	printf("Disconnected from controller %u\n", i->id);
+	printf("Disconnected from controller\n");
 
 	auto& c = *i;
 
@@ -247,6 +247,8 @@ void com_ctx::on_evfd()
 
 void com_ctx::on_ctrl_fd(com_ctrl* ctrl, int fd, uint32_t events)
 {
+	unique_lock lk(m);
+
 	if (fd != ctrl->get_fd())
 		throw runtime_error("Got epoll event for invalid fd");
 
@@ -276,7 +278,9 @@ void com_ctx::on_ctrl_fd(com_ctrl* ctrl, int fd, uint32_t events)
 				{
 					ctrl->send_queue.pop();
 					ctrl->send_msg_pos = 0;
-					disable_sender = true;
+
+					if (ctrl->send_queue.empty())
+						disable_sender = true;
 				}
 			}
 			else
@@ -309,7 +313,7 @@ void com_ctx::on_ctrl_fd(com_ctrl* ctrl, int fd, uint32_t events)
 			ctrl->rd_buf_pos += ret;
 
 			/* Check if the message has been completely received */
-			if (ctrl->rd_buf_pos >= 4)
+			while (ctrl->rd_buf_pos >= 4)
 			{
 				size_t msg_len = ser::read_u32(ctrl->rd_buf.ptr());
 
@@ -326,8 +330,21 @@ void com_ctx::on_ctrl_fd(com_ctrl* ctrl, int fd, uint32_t events)
 							ctrl->rd_buf_pos);
 
 					/* Process the message */
-					if (process_message(ctrl, move(msg_buf), msg_len))
+					bool proc_msg_ret;
+					{
+						unlocked ulk(lk);
+						proc_msg_ret = process_message(ctrl, move(msg_buf), msg_len);
+					}
+
+					if (proc_msg_ret)
+					{
 						rm_ctrl = true;
+						break;
+					}
+				}
+				else
+				{
+					break;
 				}
 			}
 		}
@@ -460,15 +477,7 @@ com_ctrl* com_ctx::choose_ctrl()
 	if (ctrls.size() == 0)
 		throw runtime_error("No controllers available");
 
-	/* There should be less-enough controller s.t. walking the list is not
-	 * harmful. */
-	auto t = next_ctrl++ % ctrls.size();
-	unsigned i = 0;
-	for (auto ic = ctrls.begin();; i++, ic++)
-	{
-		if (i == t)
-			return &(*ic);
-	}
+	return &ctrls.front();
 }
 
 

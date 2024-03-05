@@ -1,6 +1,7 @@
 add_executable(sdfs-ctrl
 	ctrl.cc
 	ctrl_ctx.cc
+	../common/strformat.cc
 	../common/utils.cc
 	../common/exceptions.cc
 	../common/signalfd.cc
@@ -10,5 +11,4 @@ add_executable(sdfs-ctrl
 	../common/prot_dd_mgr.cc
 	../common/prot_dd.cc
 	../common/prot_client.cc
-	../common/prot_ctrl.cc
 )

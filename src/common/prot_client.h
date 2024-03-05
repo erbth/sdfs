@@ -30,7 +30,9 @@ namespace req
 		READDIR,
 		READ,
 		WRITE,
-		CREATE
+		CREATE,
+		UNLINK,
+		MKDIR
 	};
 
 	struct getattr : public msg
@@ -88,7 +90,9 @@ namespace reply
 		READDIR,
 		READ,
 		WRITE,
-		CREATE
+		CREATE,
+		UNLINK,
+		MKDIR
 	};
 
 	enum file_type_t : unsigned char
@@ -158,7 +162,10 @@ namespace reply
 		int res{};
 
 		unsigned long node_id{};
+
+		size_t nlink{};
 		unsigned long mtime{};
+		size_t size{};
 
 		create();
 		create(uint64_t req_id, int res);
@@ -167,7 +174,7 @@ namespace reply
 		void parse(const char* buf, size_t size);
 
 	protected:
-		static constexpr size_t msg_size = 4 + 2*8;
+		static constexpr size_t msg_size = 4 + 4*8;
 	};
 
 	std::unique_ptr<msg> parse(const char* buf, size_t size);

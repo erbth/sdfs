@@ -9,7 +9,9 @@ enum error_code : int
 	IO,
 	NOENT,
 	INVAL,
-	NOTDIR
+	NOTDIR,
+	NOSPC,
+	NAMETOOLONG
 };
 };
 

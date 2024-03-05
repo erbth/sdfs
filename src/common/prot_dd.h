@@ -58,8 +58,11 @@ namespace reply
 		unsigned id;
 		char gid[16];
 
+		/* Size usable by ctrl (without dd header) */
 		size_t size;
-		size_t usable_size;
+
+		/* Size of underlying storage device */
+		size_t raw_size;
 
 		getattr();
 		size_t serialize(char* buf) const override;

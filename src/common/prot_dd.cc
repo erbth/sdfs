@@ -78,8 +78,8 @@ namespace reply
 			memcpy(buf, gid, sizeof(gid));
 			buf += sizeof(gid);
 
-			swrite_u64(buf, size);
-			swrite_u64(buf, usable_size);
+			swrite_u64(buf, this->size);
+			swrite_u64(buf, raw_size);
 		}
 
 		return size;
@@ -94,8 +94,8 @@ namespace reply
 		memcpy(gid, buf, sizeof(gid));
 		buf += sizeof(gid);
 
-		size = sread_u64(buf);
-		usable_size = sread_u64(buf);
+		this->size = sread_u64(buf);
+		raw_size = sread_u64(buf);
 	}
 
 

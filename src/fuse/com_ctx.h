@@ -53,7 +53,6 @@ struct request_t final
 
 struct com_ctrl final
 {
-	unsigned id;
 	WrappedFD wfd;
 
 	/* Requests */
@@ -96,7 +95,6 @@ protected:
 
 	std::atomic<bool> quit_requested{false};
 
-	unsigned next_ctrl = 0;
 	com_ctrl* choose_ctrl();
 
 	void initialize_cfg();
@@ -104,6 +102,8 @@ protected:
 
 	void worker_thread_func();
 
+	/* Do never call directly except in destructor and ctrl fd handler
+	 * (otherwise it might be called from the ctrl fd handler...) */
 	void remove_controller(decltype(ctrls)::iterator i);
 	void remove_controller(com_ctrl* cptr);
 

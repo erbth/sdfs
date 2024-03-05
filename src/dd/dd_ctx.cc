@@ -183,7 +183,7 @@ void dd_ctx::on_client_fd(shared_ptr<dd_client> client, int fd, uint32_t events)
 			client->rd_buf_pos += ret;
 
 			/* Check if the message has been completely received */
-			if (client->rd_buf_pos >= 4)
+			while (client->rd_buf_pos >= 4)
 			{
 				size_t msg_len = ser::read_u32(client->rd_buf.ptr());
 
@@ -201,7 +201,14 @@ void dd_ctx::on_client_fd(shared_ptr<dd_client> client, int fd, uint32_t events)
 
 					/* Process the message */
 					if (process_client_message(client, move(msg_buf), msg_len))
+					{
 						remove_client = true;
+						break;
+					}
+				}
+				else
+				{
+					break;
 				}
 			}
 		}
@@ -262,8 +269,8 @@ bool dd_ctx::process_client_message(shared_ptr<dd_client> client,
 
 	reply->id = di.id;
 	memcpy(reply->gid, di.gid, sizeof(di.gid));
-	reply->size = di.size;
-	reply->usable_size = di.usable_size();
+	reply->size = di.usable_size();
+	reply->raw_size = di.size;
 
 	return send_to_client(client, reply, nullopt);
 }

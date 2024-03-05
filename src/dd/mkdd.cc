@@ -125,12 +125,12 @@ void main_exc(const Args& args)
 	WrappedFD wfd;
 	wfd.set_errno(open(args.device.c_str(), O_CLOEXEC | O_RDWR), "open");
 
-	/* dd header + configuration + directory */
-	constexpr size_t total_header_size = 4096 + (1 + 100) * 1024 * 1024;
+	/* dd header */
+	constexpr size_t header_size = 4096;
 
 	/* Check device size (and type) */
 	auto dev_size = get_device_size(wfd.get_fd());
-	if (dev_size < total_header_size)
+	if (dev_size < header_size)
 		throw runtime_error("This device/file is too small");
 
 	/* Check if device is not a scts-dd already */
@@ -150,11 +150,6 @@ void main_exc(const Args& args)
 
 	di.serialize_header(buf);
 	simple_pwrite(wfd.get_fd(), buf, 4096, dev_size - 4096);
-
-	/* Zero configuration section + directory */
-	memset(buf, 0, 4096);
-	for (int i = 0; i < ((1 + 100) * 1024 * 1024) / 4096; i++)
-		simple_pwrite(wfd.get_fd(), buf, 4096, dev_size - total_header_size + i * 4096);
 
 	/* fsync */
 	check_syscall(fsync(wfd.get_fd()), "fsync");

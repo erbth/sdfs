@@ -48,7 +48,7 @@ FileConfig read_sdfs_config_file()
 
 		if (state == 0)
 		{
-			if (line == "ctrls:")
+			if (line == "ctrl:")
 			{
 				state = 1;
 			}
@@ -70,23 +70,19 @@ FileConfig read_sdfs_config_file()
 			line = strip_string(line);
 
 			smatch m2;
-			if (!regex_match(line, m2, regex("^([0-9]+)\\s+(\\S+)$")))
+			if (!regex_match(line, m2, regex("^(\\S+)$")))
 			{
 				throw invalid_cfg_file_line(line_no,
 						"invalid controller specification");
 			}
 
-			auto id = strtoul(m2[1].str().c_str(), nullptr, 10);
-			if (id < 1)
-			{
-				throw invalid_cfg_file_line(line_no,
-						"controller ids must be >= 1");
-			}
-
 			FileConfig::Controller desc;
-			desc.id = id;
-			desc.addr_str = m2[2];
-			cfg.controllers.push_back(desc);
+			desc.addr_str = m2[1];
+
+			if (cfg.controller)
+				throw invalid_cfg_file_line(line_no,
+						"only one controller may be specified");
+			cfg.controller = desc;
 		}
 		else if (state == 2)
 		{
@@ -130,11 +126,6 @@ FileConfig read_sdfs_config_file()
 	}
 
 	/* Sort lists */
-	sort(cfg.controllers.begin(), cfg.controllers.end(),
-			[](const auto& a, const auto& b) {
-				return a.id < b.id;
-			});
-
 	sort(cfg.dds.begin(), cfg.dds.end(),
 			[](const auto& a, const auto& b) {
 				return a.id < b.id;

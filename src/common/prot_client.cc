@@ -262,7 +262,7 @@ namespace reply
 			swrite_u8(buf, type);
 			swrite_u64(buf, nlink);
 			swrite_u64(buf, mtime);
-			swrite_u64(buf, size);
+			swrite_u64(buf, this->size);
 		}
 
 		return size;
@@ -279,7 +279,7 @@ namespace reply
 		type = sread_u8(buf);
 		nlink = sread_u64(buf);
 		mtime = sread_u64(buf);
-		size = sread_u64(buf);
+		this->size = sread_u64(buf);
 	}
 
 
@@ -384,7 +384,9 @@ namespace reply
 
 			swrite_i32(buf, res);
 			swrite_u64(buf, node_id);
+			swrite_u64(buf, nlink);
 			swrite_u64(buf, mtime);
+			swrite_u64(buf, this->size);
 		}
 
 		return size;
@@ -399,7 +401,9 @@ namespace reply
 
 		res = sread_i32(buf);
 		node_id = sread_u64(buf);
+		nlink = sread_u64(buf);
 		mtime = sread_u64(buf);
+		this->size = sread_u64(buf);
 	}
 
 

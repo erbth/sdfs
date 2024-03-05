@@ -26,6 +26,8 @@ Epoll::~Epoll()
 
 void Epoll::add_fd(int fd, uint32_t events, fd_ready_cb_t cb)
 {
+	unique_lock lk(m);
+
 	auto [i,inserted] = cbs.insert({fd, cb});
 	if (!inserted)
 			throw invalid_argument("fd already added to epoll instance");
@@ -49,6 +51,8 @@ void Epoll::add_fd(int fd, uint32_t events, fd_ready_cb_t cb)
 
 void Epoll::change_events(int fd, uint32_t events)
 {
+	unique_lock lk(m);
+
 	if (cbs.find(fd) == cbs.end())
 		throw invalid_argument("No such fd");
 
@@ -63,6 +67,8 @@ void Epoll::change_events(int fd, uint32_t events)
 
 void Epoll::_remove_fd(int fd, bool ignore_unknown)
 {
+	unique_lock lk(m);
+
 	auto i = cbs.find(fd);
 	if (i == cbs.end())
 	{
@@ -93,24 +99,37 @@ void Epoll::process_events(int timeout)
 {
 	struct epoll_event evts[128];
 
-	auto ret = check_syscall(
-			epoll_wait(wfd.get_fd(), evts, sizeof(evts) / sizeof(evts[0]), timeout),
-			"epoll_wait");
+	int _local_fd;
+	{
+		unique_lock lk(m);
+		_local_fd = wfd.get_fd();
+	}
+
+	auto ret = epoll_wait(_local_fd, evts, sizeof(evts) / sizeof(evts[0]), timeout);
+	if (ret < 0 && errno == EINTR)
+		return;
+
+	check_syscall(ret, "epoll_wait");
 
 	/* Ensure fdinfos can be changed during cb (i.e. when adding or removing
 	 * fds) */
 	for (int i = 0; i < ret; i++)
 	{
 		int fd = evts[i].data.fd;
+		fd_ready_cb_t cb;
 
-		/* This is fatal because we cannot remove the fd and a newly opened fd
-		 * might get the same number */
-		auto ic = cbs.find(fd);
-		if (ic == cbs.end())
-			throw runtime_error("Got event for unmonitored fd");
+		{
+			unique_lock lk(m);
 
-		/* Ensure that the fd can be deleted in the callback */
-		auto cb = ic->second;
+			/* This is fatal because we cannot remove the fd and a newly opened fd
+			 * might get the same number */
+			auto ic = cbs.find(fd);
+			if (ic == cbs.end())
+				throw runtime_error("Got event for unmonitored fd");
+
+			/* Ensure that the fd can be deleted in the callback */
+			cb = ic->second;
+		}
 
 		if (cb)
 			cb(fd, evts[i].events);
@@ -119,5 +138,7 @@ void Epoll::process_events(int timeout)
 
 int Epoll::get_fd()
 {
+	unique_lock lk(m);
+
 	return wfd.get_fd();
 }

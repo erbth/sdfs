@@ -3,6 +3,7 @@
 
 #include <cerrno>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <stdexcept>
 #include <system_error>
@@ -10,6 +11,10 @@
 extern "C" {
 #include <unistd.h>
 }
+
+/* Primitive types */
+typedef uint64_t req_id_t;
+
 
 class WrappedFD final
 {
@@ -127,5 +132,27 @@ void parse_gid(char* gid, const std::string& s);
 
 /* Get current wallclock time in microseconds */
 unsigned long get_wt_now();
+
+
+/* Temporary unlock a unique_lock, regaining the lock when the unlocked-instance
+ * goes out of scope (is destroyed) */
+template <class T>
+class unlocked final
+{
+protected:
+	std::unique_lock<T>& lk;
+
+public:
+	unlocked(std::unique_lock<T>& lk)
+		: lk(lk)
+	{
+		lk.unlock();
+	}
+
+	~unlocked()
+	{
+		lk.lock();
+	}
+};
 
 #endif /* __COMMON_UTILS_H */

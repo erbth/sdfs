@@ -25,11 +25,10 @@ void main_exc(const string& dev)
 	auto di = read_and_validate_device_header(wfd.get_fd());
 
 	printf("id:          %u (gid: %s)\n", di.id, format_gid(di.gid).c_str());
-	printf("size:        %s (%s)\n",
+	printf("size:        %s\n", format_size_bin(di.usable_size()).c_str());
+	printf("raw size:    %s (%s)\n",
 			format_size_si(di.size).c_str(),
 			format_size_bin(di.size).c_str());
-
-	printf("usable size: %s\n", format_size_bin(di.usable_size()).c_str());
 }
 
 int main(int argc, char** argv)

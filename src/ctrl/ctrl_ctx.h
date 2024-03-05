@@ -1,20 +1,22 @@
 #ifndef __CTRL_CTX_H
 #define __CTRL_CTX_H
 
-#include <string>
-#include <optional>
 #include <list>
-#include <vector>
 #include <map>
+#include <optional>
 #include <queue>
+#include <string>
+#include <tuple>
 #include <utility>
+#include <vector>
+#include "common/fixed_buffer.h"
 #include "common/utils.h"
 #include "common/epoll.h"
 #include "common/signalfd.h"
 #include "common/file_config.h"
 #include "common/dynamic_buffer.h"
 #include "common/prot_client.h"
-#include "common/prot_ctrl.h"
+#include "common/open_list.h"
 
 extern "C" {
 #include <netinet/in.h>
@@ -25,123 +27,81 @@ static_assert(sizeof(unsigned long) >= 8);
 static_assert(sizeof(long) >= 8);
 
 /* Prototypes */
-class ctrl_ctx;
-struct ctrl_ctrl;
+class ctrl_dd;
+class ctrl_client;
 
 
-/* Used when callbacks need a lock witness to be present while being called,
- * e.g. when handling requests */
-template<class W, typename _Signature>
-class req_cb_def;
-
-template<class W, class R, class... Args>
-class req_cb_def<W, R(Args...)> final
+template<class T>
+class lock_witness final
 {
-protected:
-	W w;
+public:
+	using unlock_fn_t = std::function<void(T&)>;
 
-	using F = std::function<R(Args...)>;
-	F fn;
+protected:
+	unlock_fn_t f;
+	T t;
+	bool locked;
 
 public:
-	req_cb_def(W&& w, F fn)
-		: w(std::move(w)), fn(fn)
+	lock_witness()
+		: locked(false)
 	{
 	}
 
-	R operator()(Args... args)
-	{
-		return fn(args...);
-	}
-
-	void assert_lock()
-	{
-		if (!w.lock_held())
-			throw std::runtime_error("lock not held");
-	}
-};
-
-/* Same as above but with more general payload */
-template <class P, typename _Signature>
-class cb_def_p;
-
-template<class P, class R, class... Args>
-class cb_def_p<P, R(P&&, Args...)> final
-{
-protected:
-	P payload;
-
-	using F = std::function<R(P&&, Args...)>;
-	F fn;
-
-public:
-	cb_def_p(P&& payload, F fn)
-		: payload(std::move(payload)), fn(fn)
+	lock_witness(unlock_fn_t f, T t)
+		: f(f), t(t), locked(true)
 	{
 	}
 
-	R operator()(Args... args)
+	lock_witness(lock_witness&& o)
+		: f(o.f), t(std::move(o.t)), locked(o.locked)
 	{
-		return fn(std::move(payload), args...);
+		o.locked = false;
+	}
+
+	lock_witness& operator=(lock_witness&& o)
+	{
+		if (locked)
+			f(t);
+
+		f = o.f;
+		t = std::move(o.t);
+		locked = o.locked;
+
+		o.locked = false;
+		return *this;
+	}
+
+	~lock_witness()
+	{
+		if (locked)
+			f(t);
 	}
 };
 
 
-/* Locks */
-using cb_lock_inode_directory_t = std::function<void(int result, inode_directory_lock_witness&&)>;
-
-struct inode_directory_local_lock_request_t
+/* Defines the placement of data blocks and metadata on the dds */
+struct data_map_t
 {
-	uint64_t req_id;
-	std::vector<std::pair<ctrl_ctrl&, bool>> received_grants;
+	/* Data */
+	/* 1 MiB */
+	const size_t block_size = 1024 * 1024;
 
-	cb_lock_inode_directory_t cb;
-}
+	/* Data placement order */
+	unsigned n_dd;
+	std::vector<ctrl_dd*> dd_rr_order;
 
-struct inode_directory_remote_lock_request_t
-{
-	ctrl_ctrl* remote_controller = nullptr;
-	uint64_t req_id;
-}
+	/* n_dd * block_size */
+	size_t stripe_size;
+	size_t total_data_size;
 
-class inode_lock_witness final
-{
-protected:
-	ctrl_ctx* ctrl;
-	unsigned long node_id;
+	/* Inode directory; replicated on all dds */
+	size_t inode_directory_size;
+	size_t total_inode_count;
 
-	void clean();
-
-public:
-	inode_lock_witness();
-	inode_lock_witness(ctrl_ctx& ctrl, unsigned long node_id);
-
-	inode_lock_witness(inode_lock_witness&&);
-	inode_lock_witness& operator=(inode_lock_witness&&);
-
-	~inode_lock_witness();
-
-	bool lock_held() const;
-};
-
-class inode_directory_lock_witness final
-{
-protected:
-	ctrl_ctx* ctrl;
-	bool have_lock;
-
-	void clean();
-
-public:
-	inode_directory_lock_witness();
-	inode_directory_lock_witness(ctrl_ctx& ctrl);
-
-	inode_directory_lock_witness(inode_directory_lock_witness&&);
-	inode_directory_lock_witness& operator=(inode_directory_lock_witness&&);
-
-	~inode_directory_lock_witness();
-
-	bool lock_held() const;
+	/* Data allocation bitmap */
+	const size_t allocation_granularity = 1024 * 1024;
+	size_t allocation_bitmap_size = 0;
 };
 
 /* Cached inode */
@@ -156,17 +116,15 @@ struct inode
 		TYPE_FREE = 0,
 		TYPE_FILE = 1,
 		TYPE_DIRECTORY = 2,
-		/* TYPE_EXTENSION_FILE = 3, */
-		/* TYPE_EXTENSION_DIRECTORY = 4 */
+		TYPE_EXTENSION = 3
 	} type = TYPE_FREE;
-
-	std::string name;
 
 	size_t nlink = 0;
 	size_t size = 0;
 
 	/* In microseconds */
 	unsigned long mtime;
+
 
 	/* For files */
 	struct allocation {
@@ -175,89 +133,114 @@ struct inode
 	};
 	std::vector<allocation> allocations;
 
-	/* For directories */
-	std::vector<unsigned long> files;
-
-
 	size_t get_allocated_size() const;
+
+
+	/* For directories (name, inode, type) */
+	std::vector<std::tuple<std::string, unsigned long, unsigned>> files;
+
+	bool enough_space_for_file(const std::string& name) const;
+
 
 	/* The buffer needs to be 4096 bytes long */
 	void serialize(char* buf) const;
 	void parse(const char* buf);
 };
 
+
+struct inode_lock_request_t
+{
+	using cb_acquired_t = std::function<void(inode_lock_request_t&)>;
+
+	unsigned long node_id = 0;
+	bool write = false;
+	cb_acquired_t cb_acquired;
+};
+typedef lock_witness<inode_lock_request_t> inode_lock_witness;
+
+struct inode_allocator_lock_request_t
+{
+	using cb_acquired_t = std::function<void(inode_allocator_lock_request_t&)>;
+
+	cb_acquired_t cb_acquired;
+};
+typedef lock_witness<inode_allocator_lock_request_t> inode_allocator_lock_witness;
+
+
+struct get_inode_request_t final
+{
+	using cb_finished_t = std::function<void(get_inode_request_t&&)>;
+
+	get_inode_request_t() = default;
+	get_inode_request_t(get_inode_request_t&&) = default;
+	get_inode_request_t& operator=(get_inode_request_t&&) = default;
+
+	/* Input */
+	unsigned long node_id = 0;
+	cb_finished_t cb_finished;
+
+	/* Will be filled by get_inode */
+	int result = -1;
+	std::shared_ptr<inode> node;
+
+	/* Data for use by caller of get_inode */
+	std::vector<inode_lock_witness> ilocks;
+	inode_allocator_lock_witness ialloc_lock;
+};
+
+
 struct inode_directory_t
 {
-	/* Inode locks (negative means write lock) */
-	std::map<unsigned long, long> node_locks;
-
-	/* Inode directory lock */
-	bool locked = false;
-	bool local_lock_request_in_flight = false;
-	ctrl_ctrl* remote_locker = nullptr;
-	std::list<inode_directory_local_lock_request_t> local_lock_requests;
-	std::list<inode_directory_remote_lock_request_t> remote_lock_requests;
+	/* Inode locks */
+	struct node_lock_t {
+		/* Negative means write lock, positive number of current read locker */
+		long lockers = 0;
+		std::list<inode_lock_request_t> reqs;
+	};
+	std::map<unsigned long, node_lock_t> node_locks;
 
 	/* Cached inodes */
 	std::map<unsigned long, std::shared_ptr<inode>> cached_inodes;
-};
 
-/* File/directory information */
-struct dir_entry
-{
-	unsigned long node_id = 0;
 
-	enum dir_entry_type : unsigned {
-		TYPE_INVALID = 0,
-		TYPE_FILE = 1,
-		TYPE_DIRECTORY = 2
-	} type = TYPE_INVALID;
+	/* Inode allocator lock */
+	bool allocator_locked = false;
+	std::list<inode_allocator_lock_request_t> allocator_lock_reqs;
 
-	std::string name;
+	/* Inode allocator */
+	fixed_aligned_buffer _allocator_buffer;
+	uint8_t* allocator_bitmap = nullptr;
 
-	inline dir_entry()
-	{
-	}
+	/* true if the cached inode allocator differs from the version stored on dd
+	 * */
+	bool allocator_dirty = false;
 
-	inline dir_entry(unsigned long node_id, dir_entry_type type, const std::string& name)
-		: node_id(node_id), type(type), name(name)
-	{
-	}
+	size_t allocated_count = 0;
 };
 
 
-/* Request queue structures */
-struct request_t
+/* Contexts for client requests */
+struct ctx_c_r_create
 {
-	const uint64_t req_id;
+	std::shared_ptr<ctrl_client> client;
+	prot::client::req::create msg;
 
-	inline request_t(uint64_t req_id)
-		: req_id(req_id)
-	{
-	}
-};
-
-struct inode_lock_request_t : public request_t
-{
 	unsigned long node_id;
+	std::shared_ptr<inode> node;
+	std::shared_ptr<inode> parent_node;
 
-	inline inode_lock_request_t(uint64_t req_id, unsigned long node_id)
-		: request_t(req_id), node_id(node_id)
+	inode_allocator_lock_witness ialloc_lck;
+	inode_lock_witness n_ilck;
+	inode_lock_witness p_ilck;
+
+	/* msg cannot be copy-assigned; and move-assignment difficult because of
+	 * unique_ptr-to-parent-class source */
+	inline ctx_c_r_create(const prot::client::req::create& msg)
+		: msg(msg)
 	{
 	}
 };
 
-
-struct ctrl_queued_msg
-{
-	dynamic_buffer buf;
-	const size_t msg_len;
-
-	inline ctrl_queued_msg(dynamic_buffer&& buf, size_t msg_len)
-		: buf(std::move(buf)), msg_len(msg_len)
-	{
-	}
-};
 
 struct ctrl_dd final
 {
@@ -268,30 +251,14 @@ struct ctrl_dd final
 	int port;
 
 	size_t size;
-	size_t usable_size;
 
+	/* Only true after the DD's connection has been fully initialized */
 	bool connected = false;
 
-	inline int get_fd()
-	{
-		return wfd.get_fd();
-	}
-};
-
-struct ctrl_ctrl final
-{
-	WrappedFD wfd;
-
-	unsigned id;
-	std::string addr_str;
-
-	/* Reveive messages */
-	dynamic_buffer rd_buf;
-	size_t rd_buf_pos = 0;
-
-	/* Send messages */
-	std::queue<ctrl_queued_msg> send_queue;
-	size_t send_msg_pos = 0;
+	/* Metadata offsets */
+	size_t allocation_bitmap_offset = 0;
+	size_t inode_directory_offset = 0;
+	size_t inode_bitmap_offset = 0;
 
 	inline int get_fd()
 	{
@@ -300,21 +267,16 @@ struct ctrl_ctrl final
 };
 
 
-struct data_map_t
+struct ctrl_queued_msg final
 {
-	/* 1 MiB */
-	const size_t block_size = 1024 * 1024;
+       dynamic_buffer buf;
+       const size_t msg_len;
 
-	unsigned n_dd;
-	std::vector<ctrl_dd*> dd_rr_order;
-
-	/* n_dd * block_size */
-	size_t stripe_size;
-
-	size_t total_size;
-	size_t total_inodes;
+       inline ctrl_queued_msg(dynamic_buffer&& buf, size_t msg_len)
+               : buf(std::move(buf)), msg_len(msg_len)
+       {
+       }
 };
-
 
 struct ctrl_client final
 {
@@ -332,22 +294,17 @@ struct ctrl_client final
 	std::queue<ctrl_queued_msg> send_queue;
 	size_t send_msg_pos = 0;
 
-	/* IO requests */
-
 	inline int get_fd()
 	{
 		return wfd.get_fd();
 	}
 };
 
+
 class ctrl_ctx final
 {
 protected:
-	const unsigned id;
-	const std::optional<const std::string> bind_addr_str;
-
 	FileConfig cfg;
-	unsigned min_ctrl_id = 0;
 
 	bool quit_requested = false;
 
@@ -357,91 +314,46 @@ protected:
 		epoll,
 		std::bind_front(&ctrl_ctx::on_signal, this)};
 
-	WrappedFD sync_lfd;
-	WrappedFD client_lfd;
-
 	/* dds */
 	std::list<ctrl_dd> dds;
 
-	/* Other controllers */
-	std::list<ctrl_ctrl> ctrls;
-	std::list<WrappedFD> new_ctrl_conns;
-
 	/* clients */
+	WrappedFD client_lfd;
 	std::vector<std::shared_ptr<ctrl_client>> clients;
 
 	/* data map */
 	data_map_t data_map;
+
+	/* inode directory */
+	inode_directory_t inode_directory;
 
 	/* Request id generator */
 	uint64_t next_request_id = 0;
 	uint64_t get_request_id();
 
 
-	/* TODO: add witness objects */
-	using cb_lock_data_range_t = std::function<void(int result)>;
+	/* Internal operations */
+	/* Locks */
+	void lock_inode(inode_lock_request_t&);
+	void unlock_inode(inode_lock_request_t&);
 
-	void lock_data_range(size_t offset, size_t length, bool write, cb_lock_data_range_t cb);
+	void lock_inode_allocator(inode_allocator_lock_request_t&);
+	void unlock_inode_allocator(inode_allocator_lock_request_t&);
 
-	/* inode directory */
-	inode_directory_t inode_directory;
+	/* Inodes */
+	void get_inode(get_inode_request_t&&);
 
-	using cb_lock_inode_t = std::function<void(int result, inode_lock_witness&&)>;
+	/* Inode directory */
+	void mark_inode_allocated(unsigned long);
+	void mark_inode_unallocated(unsigned long);
 
-	using cb_get_inode_t = req_cb_def<inode_lock_witness, void(int result, std::shared_ptr<inode>)>;
-	using cb_write_inode_t = std::function<void(int result)>;
-	using cb_get_unused_inode_t = std::function<void(int result, unsigned long node_id)>;
-
-	using cb_listdir_t = std::function<void(int result, std::vector<dir_entry>&&)>;
-	using cb_unlink_t = std::function<void(int result)>;
-	using cb_add_link_t = std::function<void(int result)>;
-	using cb_create_file_t = std::function<void(int result,
-			unsigned long node_id, std::shared_ptr<inode>, inode_lock_witness&&)>;
-
-	void lock_inode_directory(cb_lock_inode_directory_t cb);
-	void lock_inode(unsigned long id, cb_lock_inode_t cb);
-
-	void get_inode(unsigned long node_id, cb_get_inode_t&& cb);
-	void write_inode(inode* n, cb_write_inode_t cb);
-	void get_unused_inode(cb_get_unused_inode_t cb);
-
-	/* fs (file/directory handling) */
-	void listdir(unsigned long node_id, cb_listdir_t cb);
-	void unlink(unsigned long parent_inode_id, unsigned long inode_id, cb_unlink_t cb);
-	void add_link(unsigned long parent_inode_id, unsigned long inode_id, cb_add_link_t cb);
-
-	/* Creates a new inode for a file and adds a link */
-	void create_file(unsigned long parent_node_id, const std::string& name, cb_create_file_t cb);
-
-
-	/* Synchronization with other controllers */
-	using cb_fetch_inode_from_ctrls_t = cb_def_p<cb_get_inode_t,
-		  void(cb_get_inode_t&&, std::shared_ptr<inode>)>;
-
-	struct inode_request_t : public request_t
-	{
-		unsigned long node_id;
-
-		/* The passed inode is not in the inode directory */
-		cb_fetch_inode_from_ctrls_t cb;
-
-		inline inode_request_t(uint64_t req_id, unsigned long node_id, cb_fetch_inode_from_ctrls_t&& cb)
-			: request_t(req_id), node_id(node_id), cb(std::move(cb))
-		{
-		}
-	};
-
-	std::map<uint64_t, inode_lock_request_t> inode_lock_requests;
-	std::map<uint64_t, inode_request_t> inode_requests;
-
-	void fetch_inode_from_ctrls(unsigned long node_id, cb_fetch_inode_from_ctrls_t&& cb);
+	/* Returns < 0 if no free inode is available */
+	long get_free_inode();
 
 
 	/* Be careful when calling these functions */
 	void remove_client(decltype(clients)::iterator i);
 	void remove_client(std::shared_ptr<ctrl_client> client);
-
-	void close_ctrl_conn(ctrl_ctrl* ctrl);
 
 	void print_cfg();
 
@@ -450,9 +362,7 @@ protected:
 
 	void initialize_cfg();
 	void initialize_connect_dds();
-	void initialize_sync_listener();
 	void initialize_client_listener();
-	void initialize_connect_ctrls();
 
 	void build_data_map();
 	void initialize_inode_directory();
@@ -460,13 +370,10 @@ protected:
 
 	void on_signal(int s);
 
-	void on_sync_lfd(int fd, uint32_t events);
 	void on_client_lfd(int fd, uint32_t events);
 
 	void on_dd_fd(int fd, uint32_t events);
 	void on_client_fd(std::shared_ptr<ctrl_client> client, int fd, uint32_t events);
-	void on_new_ctrl_conn_fd(int fd, uint32_t events);
-	void on_ctrl_fd(ctrl_ctrl* ctrl, int fd, uint32_t events);
 
 
 	bool process_client_message(std::shared_ptr<ctrl_client> client, dynamic_buffer&& buf, size_t msg_len);
@@ -479,23 +386,24 @@ protected:
 	bool send_message_to_client(std::shared_ptr<ctrl_client> client, dynamic_buffer&& buf, size_t msg_len);
 
 
-	bool process_ctrl_message(ctrl_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len);
-	bool process_ctrl_message(ctrl_ctrl* ctrl, prot::ctrl::req::ctrlinfo& msg);
-	bool process_ctrl_message(ctrl_ctrl* ctrl, prot::ctrl::req::fetch_inode& msg);
-	bool process_ctrl_message(ctrl_ctrl* ctrl, prot::ctrl::reply::fetch_inode& msg);
-	bool process_ctrl_message(ctrl_ctrl* ctrl, prot::ctrl::req::lock_inode_directory& msg);
-	bool process_ctrl_message(ctrl_ctrl* ctrl, prot::ctrl::reply::lock_inode_directory& msg);
+	/* Callbacks for client request processing */
+	void cb_c_r_getfattr_ilock(std::shared_ptr<ctrl_client>, req_id_t, inode_lock_request_t&);
+	void cb_c_r_getfattr_inode(std::shared_ptr<ctrl_client>, req_id_t, get_inode_request_t&&);
 
-	void send_message_to_ctrl(ctrl_ctrl* ctrl, const prot::msg& msg);
-	void send_message_to_ctrl(ctrl_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len);
+	void cb_c_r_readdir_ilock(std::shared_ptr<ctrl_client> client, req_id_t req_id,
+			inode_lock_request_t& lck_req);
+	void cb_c_r_readdir_inode(std::shared_ptr<ctrl_client> client, req_id_t req_id,
+			get_inode_request_t&& req);
 
+	void cb_c_r_create_iallock(std::shared_ptr<ctx_c_r_create>, inode_allocator_lock_request_t&);
+	void cb_c_r_create_ilock(std::shared_ptr<ctx_c_r_create>, inode_lock_request_t&);
+	void cb_c_r_create_ilockp(std::shared_ptr<ctx_c_r_create>, inode_lock_request_t&);
+	void cb_c_r_create_ialloc(std::shared_ptr<ctx_c_r_create>, inode_allocator_lock_request_t&);
+	void cb_c_r_create_getp(std::shared_ptr<ctx_c_r_create>, get_inode_request_t&&);
 
-	/* Lock witnesses are friends */
-	friend inode_lock_witness;
-	friend inode_directory_lock_witness;
 
 public:
-	ctrl_ctx(unsigned id, const std::optional<const std::string>& bind_addr);
+	ctrl_ctx();
 	~ctrl_ctx();
 
 	void initialize();

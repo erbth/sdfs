@@ -88,8 +88,8 @@ void generate_dd_gid(char* buf)
 
 size_t DeviceInfo::usable_size()
 {
-	/* dd header + configuration + directory */
-	return size - (4096 + (1 + 100) * 1024 * 1024);
+	/* dd header */
+	return size - 4096;
 }
 
 void DeviceInfo::serialize_header(char* buffer)

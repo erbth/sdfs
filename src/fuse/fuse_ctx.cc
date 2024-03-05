@@ -43,6 +43,12 @@ int convert_error_code(int c)
 	case err::NOTDIR:
 		return ENOTDIR;
 
+	case err::NOSPC:
+		return ENOSPC;
+
+	case err::NAMETOOLONG:
+		return ENAMETOOLONG;
+
 	default:
 		return EIO;
 	};
@@ -77,13 +83,13 @@ struct stat generate_st_buf_from_create(
 	struct stat s{};
 
 	s.st_mode = S_IFREG | 0644;
-	s.st_nlink = 1;
+	s.st_nlink = msg.nlink;
 
 	auto fctx = fuse_req_ctx(req);
 	s.st_uid = fctx->uid;
 	s.st_gid = fctx->gid;
 
-	s.st_size = 0;
+	s.st_size = msg.size;
 	s.st_mtim.tv_sec = msg.mtime / 1000000;
 	s.st_mtim.tv_nsec = (msg.mtime % 1000000) * 1000;
 
@@ -422,6 +428,8 @@ void sdfs_fuse_ctx::cb_getfattr(fuse_req_t req, fuse_ino_t ino,
 	}
 
 	auto s = generate_st_buf_from_getfattr(req, msg);
+	s.st_ino = ino;
+
 	check_call(fuse_reply_attr(req, &s, 0), "fuse_reply_attr");
 }
 

@@ -3,6 +3,7 @@
 
 #include <map>
 #include <functional>
+#include <mutex>
 #include "common/utils.h"
 
 extern "C" {
@@ -17,6 +18,7 @@ public:
 	using fd_ready_cb_t = std::function<void(int, uint32_t)>;
 
 protected:
+	std::mutex m;
 	WrappedFD wfd;
 
 	std::map<int, fd_ready_cb_t> cbs;

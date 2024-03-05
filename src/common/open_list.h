@@ -9,7 +9,18 @@
 /* Ownership of a node goes to the list on add_node. Each node may only be added
  * once (obviously because of the pointers / open architecture). On destruction,
  * no nodes are removed - hence the user MUST remove and free all nodes
- * manually. */
+ * manually.
+ *
+ * Usage example:
+ *
+ *   open_list<int> l;
+ *
+ *   open_list<int>::node n;
+ *   n.elem = 10;
+ *   l.add(n);     // Appends to end
+ *   l.remove(n);
+ *   l.remove(l.get_head());
+ * */
 template <typename T>
 class open_list final
 {
