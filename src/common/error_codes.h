@@ -11,7 +11,8 @@ enum error_code : int
 	INVAL,
 	NOTDIR,
 	NOSPC,
-	NAMETOOLONG
+	NAMETOOLONG,
+	ISDIR
 };
 };
 

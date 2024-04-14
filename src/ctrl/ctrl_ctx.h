@@ -130,6 +130,15 @@ struct inode
 	struct allocation {
 		size_t offset;
 		size_t size;
+
+		inline allocation()
+		{
+		}
+
+		inline allocation(size_t offset, size_t size)
+			: offset(offset), size(size)
+		{
+		}
 	};
 	std::vector<allocation> allocations;
 
@@ -219,6 +228,25 @@ struct inode_directory_t
 };
 
 
+/* Contexts for dd IO */
+struct dd_read_request_t
+{
+	using cb_completed_t = std::function<void(dd_read_request_t&&)>;
+
+	ctrl_dd* dd;
+	size_t offset;
+	size_t size;
+	cb_completed_t cb_completed;
+
+	/* Will be filled by dd_read */
+	int result = -1;
+	const char* data = nullptr;
+
+	/* The data is stored somewhere in this buffer */
+	dynamic_buffer _buf;
+};
+
+
 /* Contexts for client requests */
 struct ctx_c_r_create
 {
@@ -236,6 +264,44 @@ struct ctx_c_r_create
 	/* msg cannot be copy-assigned; and move-assignment difficult because of
 	 * unique_ptr-to-parent-class source */
 	inline ctx_c_r_create(const prot::client::req::create& msg)
+		: msg(msg)
+	{
+	}
+};
+
+struct ctx_c_r_read
+{
+	std::shared_ptr<ctrl_client> client;
+	prot::client::req::read msg;
+
+	unsigned long long t_start;
+
+	inode_lock_witness ilck;
+	std::shared_ptr<inode> node;
+
+	size_t read_size_total{};
+
+	struct block_t
+	{
+		size_t offset;
+		size_t size;
+
+		ctrl_dd* dd;
+		size_t dd_offset;
+
+		bool completed = false;
+		int result = -1;
+		const char* data = nullptr;
+		dynamic_buffer _buf;
+
+		inline block_t(size_t offset, size_t size, ctrl_dd* dd, size_t dd_offset)
+			: offset(offset), size(size), dd(dd), dd_offset(dd_offset)
+		{
+		}
+	};
+	std::vector<block_t> blocks;
+
+	inline ctx_c_r_read(const prot::client::req::read& msg)
 		: msg(msg)
 	{
 	}
@@ -351,6 +417,15 @@ protected:
 	long get_free_inode();
 
 
+	/* Returns [(offset, size, file_offset)] */
+	std::vector<std::tuple<size_t, size_t, size_t>> map_file_region(
+			const inode& node, size_t offset, size_t size);
+
+
+	/* dd IO interface */
+	void dd_read(dd_read_request_t&& req);
+
+
 	/* Be careful when calling these functions */
 	void remove_client(decltype(clients)::iterator i);
 	void remove_client(std::shared_ptr<ctrl_client> client);
@@ -381,6 +456,7 @@ protected:
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::getfattr& msg);
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::readdir& msg);
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::create& msg);
+	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::read& msg);
 
 	bool send_message_to_client(std::shared_ptr<ctrl_client> client, const prot::msg& msg);
 	bool send_message_to_client(std::shared_ptr<ctrl_client> client, dynamic_buffer&& buf, size_t msg_len);
@@ -400,6 +476,10 @@ protected:
 	void cb_c_r_create_ilockp(std::shared_ptr<ctx_c_r_create>, inode_lock_request_t&);
 	void cb_c_r_create_ialloc(std::shared_ptr<ctx_c_r_create>, inode_allocator_lock_request_t&);
 	void cb_c_r_create_getp(std::shared_ptr<ctx_c_r_create>, get_inode_request_t&&);
+
+	void cb_c_r_read_ilock(std::shared_ptr<ctx_c_r_read> rctx, inode_lock_request_t& ilck);
+	void cb_c_r_read_getnode(std::shared_ptr<ctx_c_r_read> rctx, get_inode_request_t&& ireq);
+	void cb_c_r_read_dd(std::shared_ptr<ctx_c_r_read> rctx, size_t bi, dd_read_request_t&& req);
 
 
 public:

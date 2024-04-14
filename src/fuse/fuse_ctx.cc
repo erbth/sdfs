@@ -49,6 +49,9 @@ int convert_error_code(int c)
 	case err::NAMETOOLONG:
 		return ENAMETOOLONG;
 
+	case err::ISDIR:
+		return EISDIR;
+
 	default:
 		return EIO;
 	};
@@ -235,7 +238,8 @@ void sdfs_fuse_ctx::op_open(fuse_req_t req, fuse_ino_t ino,
 		struct fuse_file_info* fi)
 {
 	/* Check flags */
-	if ((fi->flags & O_ACCMODE) == 0)
+	auto acc_mode = fi->flags & O_ACCMODE;
+	if (acc_mode != O_RDONLY && acc_mode != O_WRONLY && acc_mode != O_RDWR)
 	{
 		check_call(fuse_reply_err(req, EINVAL), "fuse_reply_err");
 		return;
@@ -243,7 +247,7 @@ void sdfs_fuse_ctx::op_open(fuse_req_t req, fuse_ino_t ino,
 
 	/* Check if file exists */
 	cctx.request_getfattr(ino, bind_front(&sdfs_fuse_ctx::cb_open,
-				this, req, ino, fi));
+				this, req, ino, fi->flags));
 }
 
 void sdfs_fuse_ctx::op_create(fuse_req_t req, fuse_ino_t parent,
@@ -257,13 +261,15 @@ void sdfs_fuse_ctx::op_create(fuse_req_t req, fuse_ino_t parent,
 	}
 
 	cctx.request_create(parent, name, bind_front(&sdfs_fuse_ctx::cb_create,
-				this, req, fi));
+				this, req, fi->flags));
 }
 
 void sdfs_fuse_ctx::op_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 		off_t off, struct fuse_file_info* fi)
 {
-	check_call(fuse_reply_err(req, EIO), "fuse_reply_err");
+	cctx.request_read(ino, off, size,
+			bind_front(&sdfs_fuse_ctx::cb_read, this, req, ino,
+				reinterpret_cast<open_list<file_ctx>::node*>(fi->fh)));
 }
 
 void sdfs_fuse_ctx::op_write(fuse_req_t req, fuse_ino_t ino, const char* buf,
@@ -493,25 +499,25 @@ void sdfs_fuse_ctx::cb_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 
 
 open_list<file_ctx>::node* sdfs_fuse_ctx::setup_file_struct(
-		struct fuse_file_info* fi, fuse_ino_t ino)
+		int flags, struct fuse_file_info& fi, fuse_ino_t ino)
 {
 	auto fn = new open_list<file_ctx>::node();
 	auto& f = fn->elem;
 	try
 	{
 		/* Setup file info */
-		f.append = fi->flags & O_APPEND;
+		f.append = flags & O_APPEND;
 		f.ino = ino;
 
 		/* Setup fuse_file_info */
-		fi->direct_io = 1;
-		fi->keep_cache = 0;
+		fi.direct_io = 1;
+		fi.keep_cache = 0;
 
 		open_files.add(fn);
 
 		try
 		{
-			fi->fh = reinterpret_cast<uintptr_t>(fn);
+			fi.fh = reinterpret_cast<uintptr_t>(fn);
 			return fn;
 		}
 		catch (...)
@@ -527,9 +533,12 @@ open_list<file_ctx>::node* sdfs_fuse_ctx::setup_file_struct(
 	}
 }
 
-void sdfs_fuse_ctx::cb_open(fuse_req_t req, fuse_ino_t ino,
-		struct fuse_file_info* fi, prot::client::reply::getfattr& msg)
+void sdfs_fuse_ctx::cb_open(fuse_req_t req, fuse_ino_t ino, int flags,
+		prot::client::reply::getfattr& msg)
 {
+	struct fuse_file_info fi;
+	memset(&fi, 0, sizeof(fi));
+
 	if (msg.res != err::SUCCESS)
 	{
 		check_call(
@@ -547,24 +556,23 @@ void sdfs_fuse_ctx::cb_open(fuse_req_t req, fuse_ino_t ino,
 		return;
 	}
 
-	auto fn = setup_file_struct(fi, ino);
-	try
-	{
-		check_call(fuse_reply_open(req, fi), "fuse_reply_open");
-	}
-	catch (...)
+	auto fn = setup_file_struct(flags, fi, ino);
+	if (check_call(fuse_reply_open(req, &fi), "fuse_reply_open") < 0)
 	{
 		open_files.remove(fn);
 		delete fn;
-		throw;
+		return;
 	}
 
 	printf("open(%u)\n", (unsigned) ino);
 }
 
-void sdfs_fuse_ctx::cb_create(fuse_req_t req, fuse_file_info* fi,
+void sdfs_fuse_ctx::cb_create(fuse_req_t req, int flags,
 		prot::client::reply::create& msg)
 {
+	struct fuse_file_info fi;
+	memset(&fi, 0, sizeof(fi));
+
 	if (msg.res != err::SUCCESS)
 	{
 		check_call(
@@ -581,17 +589,29 @@ void sdfs_fuse_ctx::cb_create(fuse_req_t req, fuse_file_info* fi,
 		.entry_timeout = 0,
 	};
 
-	auto fn = setup_file_struct(fi, ino);
-	try
-	{
-		check_call(fuse_reply_create(req, &ep, fi), "fuse_reply_create");
-	}
-	catch (...)
+	auto fn = setup_file_struct(flags, fi, ino);
+	if (check_call(fuse_reply_create(req, &ep, &fi), "fuse_reply_create") < 0)
 	{
 		open_files.remove(fn);
 		delete fn;
-		throw;
+		return;
 	}
 
 	printf("create(%u)\n", (unsigned) ino);
+}
+
+
+void sdfs_fuse_ctx::cb_read(fuse_req_t req, fuse_ino_t ino, open_list<file_ctx>::node* fn,
+		prot::client::reply::read& msg, dynamic_buffer&& buf)
+{
+	if (msg.res != err::SUCCESS)
+	{
+		check_call(
+				fuse_reply_err(req, convert_error_code(msg.res)),
+				"fuse_reply_err");
+		return;
+	}
+
+	check_call(fuse_reply_buf(req, msg.data, msg.size), "fuse_reply_data");
+	printf("read(%u)\n", (unsigned) ino);
 }

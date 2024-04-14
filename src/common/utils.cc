@@ -212,3 +212,12 @@ unsigned long get_wt_now()
 
 	return (ts.tv_sec * 1000000UL) + (ts.tv_nsec / 1000);
 }
+
+
+unsigned long long get_monotonic_time()
+{
+	timespec ts;
+	check_syscall(clock_gettime(CLOCK_MONOTONIC, &ts), "clock_gettime");
+
+	return (ts.tv_sec * 1000000000ULL) + ts.tv_nsec;
+}

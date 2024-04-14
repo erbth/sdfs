@@ -133,6 +133,9 @@ void parse_gid(char* gid, const std::string& s);
 /* Get current wallclock time in microseconds */
 unsigned long get_wt_now();
 
+/* Get current monotonic time in nanoseconds */
+unsigned long long get_monotonic_time();
+
 
 /* Temporary unlock a unique_lock, regaining the lock when the unlocked-instance
  * goes out of scope (is destroyed) */

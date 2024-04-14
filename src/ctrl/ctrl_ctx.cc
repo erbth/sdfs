@@ -770,6 +770,11 @@ bool ctrl_ctx::process_client_message(
 					client,
 					static_cast<prot::client::req::create&>(*msg));
 
+		case prot::client::req::READ:
+			return process_client_message(
+					client,
+					static_cast<prot::client::req::read&>(*msg));
+
 		default:
 			fprintf(stderr, "protocol violation\n");
 			return true;
@@ -1049,6 +1054,8 @@ void ctrl_ctx::cb_c_r_create_ilock(shared_ptr<ctx_c_r_create> rctx, inode_lock_r
 	rctx->node->type = inode::TYPE_FILE;
 	rctx->node->nlink = 1;
 	rctx->node->mtime = get_wt_now();
+	rctx->node->size = 100 * 1024 * 1024;
+	rctx->node->allocations.emplace_back(0, 100 * 1024 * 1024);
 
 	/* Lock parent inode w */
 	inode_lock_request_t req;
@@ -1135,13 +1142,177 @@ void ctrl_ctx::cb_c_r_create_getp(shared_ptr<ctx_c_r_create> rctx, get_inode_req
 /* MKDIR */
 /* like CREATE */
 
-/* READ */
-/* b Lock inode */
-/* b Retrieve data map(s) */
-/*   Unlock inode */
-/* b Read data */
-/*   Assemble data */
-/*   Return data */
+
+bool ctrl_ctx::process_client_message(
+		shared_ptr<ctrl_client> client, prot::client::req::read& msg)
+{
+	/* READ */
+	/* b Lock inode */
+	/* b Retrieve data map(s) */
+	/* b Read data */
+	/*   Unlock inode */
+	/*   Assemble data */
+	/*   Return data */
+
+	if (msg.node_id == 0)
+	{
+		return send_message_to_client(
+				client,
+				prot::client::reply::read(msg.req_id, err::INVAL));
+	}
+
+	auto rctx = make_shared<ctx_c_r_read>(msg);
+	rctx->client = client;
+	rctx->t_start = get_monotonic_time();
+
+	/* Lock inode */
+	inode_lock_request_t req;
+
+	req.node_id = rctx->msg.node_id;
+	req.cb_acquired = bind_front(&ctrl_ctx::cb_c_r_read_ilock, this, rctx);
+
+	lock_inode(req);
+
+	return false;
+}
+
+void ctrl_ctx::cb_c_r_read_ilock(shared_ptr<ctx_c_r_read> rctx, inode_lock_request_t& ilck)
+{
+	rctx->ilck = inode_lock_witness(bind_front(&ctrl_ctx::unlock_inode, this), ilck);
+
+	/* Retrieve data map(s) */
+	get_inode_request_t req;
+
+	req.node_id = rctx->msg.node_id;
+	req.cb_finished = bind_front(&ctrl_ctx::cb_c_r_read_getnode, this, rctx);
+	get_inode(move(req));
+}
+
+void ctrl_ctx::cb_c_r_read_getnode(shared_ptr<ctx_c_r_read> rctx, get_inode_request_t&& ireq)
+{
+	if (ireq.result != err::SUCCESS)
+	{
+		send_message_to_client(
+				rctx->client,
+				prot::client::reply::create(rctx->msg.req_id, ireq.result));
+		return;
+	}
+
+	if (ireq.node->type != inode::TYPE_FILE)
+	{
+		send_message_to_client(
+				rctx->client,
+				prot::client::reply::create(rctx->msg.req_id, err::ISDIR));
+		return;
+	}
+
+	rctx->node = ireq.node;
+
+
+	/* Determine which data must be read and from which dds */
+	if (rctx->msg.offset >= rctx->node->size || rctx->msg.size == 0)
+	{
+		/* EOF or read size 0 */
+		send_message_to_client(
+				rctx->client,
+				prot::client::reply::read(rctx->msg.req_id, err::SUCCESS));
+		return;
+	}
+
+	rctx->read_size_total = min(rctx->msg.size, rctx->node->size - rctx->msg.offset);
+
+	/* Map data to dds */
+	for (auto [b_o, b_s, b_file_o] : map_file_region(*(rctx->node), rctx->msg.offset, rctx->read_size_total))
+	{
+		auto b_num = b_o / data_map.block_size;
+		auto dd = data_map.dd_rr_order[b_num % data_map.n_dd];
+		auto dd_offset = b_o - b_num * data_map.block_size;
+		rctx->blocks.emplace_back(b_file_o - rctx->msg.offset, b_s, dd, dd_offset);
+	}
+
+
+	/* Read data from dds */
+	for (size_t i = 0; i < rctx->blocks.size(); i++)
+	{
+		auto& b = rctx->blocks[i];
+
+		dd_read_request_t req;
+
+		req.dd = b.dd;
+		req.offset = b.dd_offset;
+		req.size = b.size;
+		req.cb_completed = bind_front(&ctrl_ctx::cb_c_r_read_dd, this, rctx, i);
+
+		dd_read(move(req));
+	}
+}
+
+void ctrl_ctx::cb_c_r_read_dd(shared_ptr<ctx_c_r_read> rctx, size_t bi,
+		dd_read_request_t&& req)
+{
+	/* Store result of read request */
+	{
+		auto& b = rctx->blocks[bi];
+		b.result = req.result;
+		if (req.data)
+		{
+			b.data = req.data;
+			b._buf = move(req._buf);
+		}
+
+		b.completed = true;
+	}
+
+	/* Test if all read requests have completed */
+	for (auto& b : rctx->blocks)
+	{
+		if (!b.completed)
+			return;
+	}
+
+	/* Check return codes of individual block read requests */
+	for (auto& b : rctx->blocks)
+	{
+		if (b.result != err::SUCCESS)
+		{
+			send_message_to_client(
+					rctx->client,
+					prot::client::reply::read(rctx->msg.req_id, b.result));
+			return;
+		}
+	}
+
+	/* Unlock inode */
+	rctx->ilck = inode_lock_witness();
+
+	if (rctx->client->invalid)
+		return;
+
+	/* Assemble data */
+	prot::client::reply::read reply(rctx->msg.req_id, err::SUCCESS);
+	reply.size = rctx->read_size_total;
+	dynamic_buffer buf;
+	buf.ensure_size(reply.serialize(nullptr) + reply.size);
+	auto reply_size = reply.serialize(buf.ptr());
+	auto data_ptr = buf.ptr() + reply_size;
+	auto data_end = buf.ptr() + buf.size();
+	reply_size += reply.size;
+
+	for (const auto& b : rctx->blocks)
+	{
+		if (data_ptr + b.offset + b.size >= data_end)
+			throw runtime_error("Internal buffer overflow");
+
+		memcpy(data_ptr + b.offset, b.data, b.size);
+	}
+
+	/* Return data to client */
+	send_message_to_client(rctx->client, move(buf), reply_size);
+
+	double diff = (get_monotonic_time() - rctx->t_start) / 1e9;
+	printf("read processing took %fms\n", diff * 1e3);
+}
+
 
 /* Write */
 /* Lock inode w */
@@ -1313,7 +1484,7 @@ void ctrl_ctx::lock_inode_allocator(inode_allocator_lock_request_t& req)
 		inode_directory.allocator_locked = true;
 
 		/* NOTE: It is very important that unlock_inode_allocator can be called
-		 * fromt his callback.
+		 * from this callback.
 		 *
 		 * NOTE: cb_aquired might reference a shared_ptr (partially evaluated
 		 * function) to an object, which might contain a copy of req. This would
@@ -1429,4 +1600,72 @@ long ctrl_ctx::get_free_inode()
 	}
 
 	return -1;
+}
+
+
+vector<tuple<size_t, size_t, size_t>> ctrl_ctx::map_file_region(
+		const inode& node, size_t offset, size_t size)
+{
+	vector<tuple<size_t, size_t, size_t>> blocks;
+
+	/* Find first chunk mapping; note that this is actually O(n) but could be
+	 * implemented in O(log(n)) by storing the in-file offsets in the (cached)
+	 * allocation table. However the allocation table should be small enough
+	 * s.t. this is can be considered expected-constant-time. */
+	size_t pos = 0;
+	auto i_alloc = node.allocations.begin();
+	for (; i_alloc != node.allocations.end(); i_alloc++)
+	{
+		if (pos <= offset && offset < pos + i_alloc->size)
+			break;
+
+		pos += i_alloc->size;
+	}
+
+	/* Iterate through all chunk mappings */
+	for (; i_alloc != node.allocations.end(); i_alloc++)
+	{
+		if (pos >= offset + size)
+			break;
+
+		auto chunk_file_offset = max(pos, offset);
+		auto chunk_file_start_diff = max((size_t) 0, offset - pos);
+		auto chunk_offset = i_alloc->offset + chunk_file_start_diff;
+		auto chunk_size = min(i_alloc->size - chunk_file_start_diff, offset + size - chunk_offset);
+
+		/* Map chunk to blocks */
+		auto current_block = chunk_offset / data_map.block_size;
+		while (current_block * data_map.block_size < chunk_offset + chunk_size)
+		{
+			auto block_start = current_block * data_map.block_size;
+			auto block_file_offset = max(block_start, chunk_file_offset);
+			auto block_file_start_diff = max((size_t) 0, chunk_offset - block_start);
+			auto block_offset = block_start + block_file_start_diff;
+			auto block_size = min(
+					data_map.block_size - block_file_start_diff,
+					chunk_offset + chunk_size - block_offset);
+
+			blocks.emplace_back(block_offset, block_size, block_file_offset);
+
+			current_block++;
+		}
+
+		pos += i_alloc->size;
+	}
+
+	return blocks;
+}
+
+
+void ctrl_ctx::dd_read(dd_read_request_t&& req)
+{
+	char c = 'a' + req.dd->id % 0x10;
+
+	req.result = err::SUCCESS;
+	req._buf.ensure_size(req.size);
+	memset(req._buf.ptr(), c, req.size);
+	req.data = req._buf.ptr();
+
+	auto cb = req.cb_completed;
+	cb(move(req));
 }

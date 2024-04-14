@@ -41,6 +41,11 @@ typedef std::function<void(prot::client::reply::getfattr&)> req_cb_getfattr_t;
 typedef std::function<void(prot::client::reply::readdir&)> req_cb_readdir_t;
 typedef std::function<void(prot::client::reply::create&)> req_cb_create_t;
 
+/* If the message contains data, it has a pointer to a memory region. This
+ * memory region lives inside the dynamic_buffer. Hence the dynamic_buffer must
+ * be kept allocated as long as the data is processed. */
+typedef std::function<void(prot::client::reply::read&, dynamic_buffer&&)> req_cb_read_t;
+
 struct request_t final
 {
 	uint64_t id;
@@ -49,6 +54,7 @@ struct request_t final
 	req_cb_getfattr_t cb_getfattr;
 	req_cb_readdir_t cb_readdir;
 	req_cb_create_t cb_create;
+	req_cb_read_t cb_read;
 };
 
 struct com_ctrl final
@@ -80,7 +86,7 @@ struct com_ctrl final
 class com_ctx final
 {
 protected:
-	std::mutex m;
+	std::recursive_mutex m;
 
 	std::list<com_ctrl> ctrls;
 	std::thread worker_thread;
@@ -116,6 +122,8 @@ protected:
 	bool process_message(com_ctrl* ctrl, prot::client::reply::getfattr& msg);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::readdir& msg);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::create& msg);
+	bool process_message(com_ctrl* ctrl, prot::client::reply::read& msg,
+			dynamic_buffer&& buf);
 
 	bool send_message(com_ctrl* ctrl, const prot::msg& msg);
 	bool send_message(com_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len);
@@ -135,6 +143,9 @@ public:
 	void request_readdir(unsigned long node_id, req_cb_readdir_t cb);
 	void request_create(unsigned long parent_node_id, const char* name,
 			req_cb_create_t cb);
+
+	void request_read(unsigned long node_id, size_t offset, size_t size,
+			req_cb_read_t cb);
 };
 
 #endif /* __COM_CTX_H */

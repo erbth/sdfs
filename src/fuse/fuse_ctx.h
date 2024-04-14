@@ -65,7 +65,7 @@ protected:
 		.lookup = _op_lookup,
 		.getattr = _op_getattr,
 		.open = _op_open,
-		//.read = _op_read,
+		.read = _op_read,
 		//.write = _op_write,
 		.release = _op_release,
 		.readdir = _op_readdir,
@@ -85,17 +85,18 @@ protected:
 	void cb_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 			prot::client::reply::readdir& msg);
 
-	void cb_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi,
-			prot::client::reply::getfattr& msg);
+	void cb_open(fuse_req_t req, fuse_ino_t ino, int flags, prot::client::reply::getfattr& msg);
+	void cb_create(fuse_req_t req, int flags, prot::client::reply::create& msg);
 
-	void cb_create(fuse_req_t req, struct fuse_file_info* fi,
-			prot::client::reply::create& msg);
+
+	void cb_read(fuse_req_t req, fuse_ino_t ino, open_list<file_ctx>::node* fn,
+			prot::client::reply::read& msg, dynamic_buffer&& buf);
 
 	/* File handling */
 	open_list<file_ctx> open_files;
 
 	open_list<file_ctx>::node* setup_file_struct(
-		struct fuse_file_info* fi, fuse_ino_t ino);
+		int flags, struct fuse_file_info& fi, fuse_ino_t ino);
 
 public:
 	sdfs_fuse_ctx(int argc, char** argv);

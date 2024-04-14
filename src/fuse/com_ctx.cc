@@ -330,13 +330,7 @@ void com_ctx::on_ctrl_fd(com_ctrl* ctrl, int fd, uint32_t events)
 							ctrl->rd_buf_pos);
 
 					/* Process the message */
-					bool proc_msg_ret;
-					{
-						unlocked ulk(lk);
-						proc_msg_ret = process_message(ctrl, move(msg_buf), msg_len);
-					}
-
-					if (proc_msg_ret)
+					if (process_message(ctrl, move(msg_buf), msg_len))
 					{
 						rm_ctrl = true;
 						break;
@@ -399,6 +393,11 @@ bool com_ctx::process_message(
 					ctrl,
 					static_cast<prot::client::reply::create&>(*msg));
 
+		case prot::client::reply::READ:
+			return process_message(
+					ctrl,
+					static_cast<prot::client::reply::read&>(*msg), move(buf));
+
 		default:
 			fprintf(stderr, "protocol violation\n");
 			return true;
@@ -447,6 +446,16 @@ bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::create& msg)
 	/* Find corresponding request */
 	auto& req = find_req_for_reply(ctrl, msg);
 	req.cb_create(msg);
+	finish_req(ctrl, req);
+	return false;
+}
+
+bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::read& msg,
+		dynamic_buffer&& buf)
+{
+	/* Find corresponding request */
+	auto& req = find_req_for_reply(ctrl, msg);
+	req.cb_read(msg, move(buf));
 	finish_req(ctrl, req);
 	return false;
 }
@@ -547,6 +556,27 @@ void com_ctx::request_create(unsigned long parent_node_id, const char* name,
 	msg.req_id = req.id;
 	msg.parent_node_id = parent_node_id;
 	msg.name = name;
+
+	add_req(ctrl, req);
+	send_message(ctrl, msg);
+}
+
+void com_ctx::request_read(unsigned long node_id, size_t offset, size_t size,
+		req_cb_read_t cb)
+{
+	unique_lock lk(m);
+	request_t req{};
+
+	auto ctrl = choose_ctrl();
+	ctrl->set_req_id(req);
+
+	req.cb_read = cb;
+
+	prot::client::req::read msg;
+	msg.req_id = req.id;
+	msg.node_id = node_id;
+	msg.offset = offset;
+	msg.size = size;
 
 	add_req(ctrl, req);
 	send_message(ctrl, msg);

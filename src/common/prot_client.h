@@ -28,11 +28,11 @@ namespace req
 		GETATTR = 1,
 		GETFATTR,
 		READDIR,
-		READ,
-		WRITE,
 		CREATE,
 		UNLINK,
-		MKDIR
+		MKDIR,
+		READ,
+		WRITE
 	};
 
 	struct getattr : public msg
@@ -79,6 +79,21 @@ namespace req
 		static constexpr size_t msg_size_base = 9;
 	};
 
+
+	struct read : public msg
+	{
+		unsigned long node_id;
+		size_t offset;
+		size_t size;
+
+		read();
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size = 3*8;
+	};
+
 	std::unique_ptr<msg> parse(const char* buf, size_t size);
 };
 
@@ -88,11 +103,11 @@ namespace reply
 		GETATTR = 1,
 		GETFATTR,
 		READDIR,
-		READ,
-		WRITE,
 		CREATE,
 		UNLINK,
-		MKDIR
+		MKDIR,
+		READ,
+		WRITE
 	};
 
 	enum file_type_t : unsigned char
@@ -175,6 +190,30 @@ namespace reply
 
 	protected:
 		static constexpr size_t msg_size = 4 + 4*8;
+	};
+
+	struct read : public msg
+	{
+		int res{};
+
+		size_t size = 0;
+
+		/* Will only be used by parse */
+		const char* data = nullptr;
+
+		read();
+		read(uint64_t req_id, int res);
+
+		/* The data will NOT be serialized, and the return value will NOT
+		 * include the data size. */
+		size_t serialize(char* buf) const override;
+
+		/* Size MUST include the data size - so size is simply the received
+		 * message payload size, like for the other messages. */
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size_base = 4 + 8;
 	};
 
 	std::unique_ptr<msg> parse(const char* buf, size_t size);

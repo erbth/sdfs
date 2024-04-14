@@ -160,6 +160,42 @@ namespace req
 	}
 
 
+	read::read()
+		: msg(READ)
+	{
+	}
+
+	size_t read::serialize(char* buf) const
+	{
+		size_t size = 16 + msg_size;
+
+		if (buf)
+		{
+			swrite_u32(buf, size - 4);
+			swrite_u32(buf, num);
+			swrite_u64(buf, req_id);
+
+			swrite_u64(buf, node_id);
+			swrite_u64(buf, offset);
+			swrite_u64(buf, this->size);
+		}
+
+		return size;
+	}
+
+	void read::parse(const char* buf, size_t size)
+	{
+		if (size != 12 + msg_size)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(buf);
+
+		node_id = sread_u64(buf);
+		offset = sread_u64(buf);
+		this->size = sread_u64(buf);
+	}
+
+
 	unique_ptr<msg> parse(const char* buf, size_t size)
 	{
 		if (size < 4)
@@ -192,6 +228,13 @@ namespace req
 			case CREATE:
 			{
 				auto msg = make_unique<create>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			case READ:
+			{
+				auto msg = make_unique<read>();
 				msg->parse(buf, size);
 				return msg;
 			}
@@ -394,7 +437,7 @@ namespace reply
 
 	void create::parse(const char* buf, size_t size)
 	{
-		if (size < 12 + msg_size)
+		if (size != 12 + msg_size)
 			throw invalid_msg_size(num, size);
 
 		req_id = sread_u64(buf);
@@ -404,6 +447,50 @@ namespace reply
 		nlink = sread_u64(buf);
 		mtime = sread_u64(buf);
 		this->size = sread_u64(buf);
+	}
+
+
+	read::read()
+		: msg(READ)
+	{
+	}
+
+	read::read(uint64_t req_id, int res)
+		: msg(READ, req_id), res(res)
+	{
+	}
+
+	size_t read::serialize(char* buf) const
+	{
+		size_t size = 16 + msg_size_base;
+
+		if (buf)
+		{
+			swrite_u32(buf, size + this->size - 4);
+			swrite_u32(buf, num);
+			swrite_u64(buf, req_id);
+
+			swrite_i32(buf, res);
+			swrite_u64(buf, this->size);
+		}
+
+		return size;
+	}
+
+	void read::parse(const char* buf, size_t size)
+	{
+		if (size < 12 + msg_size_base)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(buf);
+
+		res = sread_i32(buf);
+		this->size = sread_u64(buf);
+
+		if (size != 12 + msg_size_base + this->size)
+			throw invalid_msg_size(num, size);
+
+		data = this->size > 0 ? buf : nullptr;
 	}
 
 
@@ -439,6 +526,13 @@ namespace reply
 			case CREATE:
 			{
 				auto msg = make_unique<create>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			case READ:
+			{
+				auto msg = make_unique<read>();
 				msg->parse(buf, size);
 				return msg;
 			}
