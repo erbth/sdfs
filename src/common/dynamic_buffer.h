@@ -6,6 +6,9 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <algorithm>
+#include <list>
+#include <mutex>
 #include <new>
 
 class dynamic_buffer
@@ -80,6 +83,198 @@ public:
 	{
 		if (buf)
 			free(buf);
+	}
+};
+
+
+class dynamic_aligned_buffer
+{
+protected:
+	char* buf = nullptr;
+	size_t alignment;
+	size_t size;
+
+	size_t to_power_of_two(size_t v)
+	{
+		size_t p = 1;
+		while (p < v && p < std::numeric_limits<size_t>::max() / 2)
+			p *= 2;
+
+		if (p < v)
+			p = v;
+
+		return p;
+	}
+
+public:
+	dynamic_aligned_buffer()
+		: buf(nullptr), alignment(0), size(0)
+	{
+	}
+
+	dynamic_aligned_buffer(size_t alignment, size_t initial_size)
+		: alignment(alignment), size(to_power_of_two(initial_size))
+	{
+		buf = (char*) aligned_alloc(alignment, size);
+		if (!buf)
+			throw std::bad_alloc();
+	}
+
+	dynamic_aligned_buffer(dynamic_aligned_buffer&) = delete;
+	dynamic_aligned_buffer& operator=(dynamic_aligned_buffer&) = delete;
+
+	dynamic_aligned_buffer(dynamic_aligned_buffer&& o)
+		: buf(o.buf), alignment(o.alignment), size(o.size)
+	{
+		o.buf = nullptr;
+		o.alignment = 0;
+		o.size = 0;
+	}
+
+	dynamic_aligned_buffer& operator=(dynamic_aligned_buffer&& o)
+	{
+		if (buf)
+			free(buf);
+
+		buf = o.buf;
+		alignment = o.alignment;
+		size = o.size;
+
+		o.buf = nullptr;
+		o.alignment = 0;
+		o.size = 0;
+
+		return *this;
+	}
+
+	operator bool() const
+	{
+		return buf != nullptr;
+	}
+
+	char* ptr()
+	{
+		return buf;
+	}
+
+	size_t get_alignment()
+	{
+		return alignment;
+	}
+
+	size_t get_size()
+	{
+		return size;
+	}
+
+	void ensure_size(size_t s)
+	{
+		if (!buf)
+		{
+			throw std::runtime_error("A moved-from dynamic_aligned_buffer "
+					"cannot be reallocated");
+		}
+
+		if (size < s)
+		{
+			size_t new_size = size;
+			while (new_size < s && new_size < std::numeric_limits<size_t>::max() / 2)
+				new_size *= 2;
+
+			if (new_size < s)
+				new_size = s;
+
+			char* new_buf = (char*) aligned_alloc(alignment, new_size);
+			if (!new_buf)
+				throw std::bad_alloc();
+
+			memcpy(new_buf, buf, size);
+
+			char* old_buf = buf;
+			buf = new_buf;
+			size = new_size;
+			free(old_buf);
+		}
+	}
+
+	virtual ~dynamic_aligned_buffer()
+	{
+		if (buf)
+			free(buf);
+	}
+};
+
+class dynamic_aligned_buffer_pool
+{
+protected:
+	std::mutex m;
+	size_t alignment;
+	size_t max_size;
+
+	std::list<dynamic_aligned_buffer> free_list;
+
+public:
+	dynamic_aligned_buffer_pool(size_t alignment, size_t max_size = 8)
+		: alignment(alignment), max_size(max_size)
+	{
+	}
+
+	dynamic_aligned_buffer get_buffer(size_t size)
+	{
+		std::unique_lock lk(m);
+
+		if (size < alignment)
+			size = alignment;
+
+		/* Find smallest buffer of required size */
+		auto i = free_list.begin();
+
+		auto chosen = free_list.end();
+		ssize_t overhead = std::numeric_limits<ssize_t>::max();
+
+		for (; i != free_list.end(); i++)
+		{
+			ssize_t diff = i->get_size() - size;
+			if (diff >= 0 && diff < overhead)
+			{
+				diff = overhead;
+				chosen = i;
+			}
+		}
+
+		if (chosen != free_list.end())
+		{
+			auto buf = std::move(*chosen);
+			free_list.erase(chosen);
+			return buf;
+		}
+		else
+		{
+			return dynamic_aligned_buffer(alignment, size);
+		}
+	}
+
+	void return_buffer(dynamic_aligned_buffer&& buf)
+	{
+		std::unique_lock lk(m);
+
+		if (find(free_list.begin(), free_list.end(), buf) == free_list.end())
+			free_list.emplace_back(std::move(buf));
+
+		/* Delete smallest buffer if the pool is too big */
+		while (free_list.size() > max_size)
+		{
+			auto i = free_list.begin();
+			auto smallest = i;
+
+			for (; i != free_list.end(); i++)
+			{
+				if (i->get_size() < smallest->get_size())
+					smallest = i;
+			}
+
+			free_list.erase(smallest);
+		}
 	}
 };
 

@@ -42,6 +42,25 @@ void add_req(com_ctrl* ctrl, const request_t& req)
 		throw runtime_error("request id conflict");
 }
 
+/* Other helpers */
+class buffer_pool_returner final
+{
+protected:
+	dynamic_aligned_buffer_pool& pool;
+	dynamic_aligned_buffer buf;
+
+public:
+	buffer_pool_returner(dynamic_aligned_buffer_pool& pool, dynamic_aligned_buffer&& buf)
+		: pool(pool), buf(move(buf))
+	{
+	}
+
+	~buffer_pool_returner()
+	{
+		pool.return_buffer(move(buf));
+	}
+};
+
 /* com_ctx */
 com_ctx::com_ctx()
 {
@@ -300,8 +319,13 @@ void com_ctx::on_ctrl_fd(com_ctrl* ctrl, int fd, uint32_t events)
 	/* Read data */
 	if (events & EPOLLIN)
 	{
-		const size_t read_chunk = 100 * 1024;
-		ctrl->rd_buf.ensure_size(ctrl->rd_buf_pos + read_chunk);
+		/* Keep aligned to page size and > 0 */
+		const size_t read_chunk = (1024 + 4) * 1024;
+
+		if (ctrl->rd_buf)
+			ctrl->rd_buf.ensure_size(ctrl->rd_buf_pos + read_chunk);
+		else
+			ctrl->rd_buf = buf_pool.get_buffer(read_chunk);
 
 		auto ret = read(
 				ctrl->get_fd(),
@@ -320,10 +344,10 @@ void com_ctx::on_ctrl_fd(com_ctrl* ctrl, int fd, uint32_t events)
 				if (ctrl->rd_buf_pos >= msg_len + 4)
 				{
 					/* Move the message buffer out */
-					dynamic_buffer msg_buf(move(ctrl->rd_buf));
+					dynamic_aligned_buffer msg_buf(move(ctrl->rd_buf));
 
 					ctrl->rd_buf_pos -= msg_len + 4;
-					ctrl->rd_buf.ensure_size(ctrl->rd_buf_pos);
+					ctrl->rd_buf = buf_pool.get_buffer(max(ctrl->rd_buf_pos, (size_t) 4096));
 					memcpy(
 							ctrl->rd_buf.ptr(),
 							msg_buf.ptr() + (msg_len + 4),
@@ -357,13 +381,16 @@ void com_ctx::on_ctrl_fd(com_ctrl* ctrl, int fd, uint32_t events)
 
 
 bool com_ctx::process_message(
-		com_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len)
+		com_ctrl* ctrl, dynamic_aligned_buffer&& buf, size_t msg_len)
 {
+	auto data_ptr = buf.ptr();
+	buffer_pool_returner bp_ret(buf_pool, move(buf));
+
 	unique_ptr<prot::msg> msg;
 
 	try
 	{
-		msg = prot::client::reply::parse(buf.ptr() + 4, msg_len);
+		msg = prot::client::reply::parse(data_ptr + 4, msg_len);
 	}
 	catch (const prot::exception& e)
 	{
@@ -396,7 +423,7 @@ bool com_ctx::process_message(
 		case prot::client::reply::READ:
 			return process_message(
 					ctrl,
-					static_cast<prot::client::reply::read&>(*msg), move(buf));
+					static_cast<prot::client::reply::read&>(*msg));
 
 		default:
 			fprintf(stderr, "protocol violation\n");
@@ -450,12 +477,11 @@ bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::create& msg)
 	return false;
 }
 
-bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::read& msg,
-		dynamic_buffer&& buf)
+bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::read& msg)
 {
 	/* Find corresponding request */
 	auto& req = find_req_for_reply(ctrl, msg);
-	req.cb_read(msg, move(buf));
+	req.cb_read(msg);
 	finish_req(ctrl, req);
 	return false;
 }

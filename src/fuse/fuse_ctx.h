@@ -90,7 +90,7 @@ protected:
 
 
 	void cb_read(fuse_req_t req, fuse_ino_t ino, open_list<file_ctx>::node* fn,
-			prot::client::reply::read& msg, dynamic_buffer&& buf);
+			prot::client::reply::read& msg);
 
 	/* File handling */
 	open_list<file_ctx> open_files;

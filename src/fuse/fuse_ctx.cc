@@ -602,7 +602,7 @@ void sdfs_fuse_ctx::cb_create(fuse_req_t req, int flags,
 
 
 void sdfs_fuse_ctx::cb_read(fuse_req_t req, fuse_ino_t ino, open_list<file_ctx>::node* fn,
-		prot::client::reply::read& msg, dynamic_buffer&& buf)
+		prot::client::reply::read& msg)
 {
 	if (msg.res != err::SUCCESS)
 	{
@@ -613,5 +613,5 @@ void sdfs_fuse_ctx::cb_read(fuse_req_t req, fuse_ino_t ino, open_list<file_ctx>:
 	}
 
 	check_call(fuse_reply_buf(req, msg.data, msg.size), "fuse_reply_data");
-	printf("read(%u)\n", (unsigned) ino);
+	//printf("read(%u)\n", (unsigned) ino);
 }

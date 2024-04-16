@@ -44,7 +44,7 @@ typedef std::function<void(prot::client::reply::create&)> req_cb_create_t;
 /* If the message contains data, it has a pointer to a memory region. This
  * memory region lives inside the dynamic_buffer. Hence the dynamic_buffer must
  * be kept allocated as long as the data is processed. */
-typedef std::function<void(prot::client::reply::read&, dynamic_buffer&&)> req_cb_read_t;
+typedef std::function<void(prot::client::reply::read&)> req_cb_read_t;
 
 struct request_t final
 {
@@ -66,7 +66,7 @@ struct com_ctrl final
 	std::map<uint64_t, request_t> reqs;
 
 	/* IO */
-	dynamic_buffer rd_buf;
+	dynamic_aligned_buffer rd_buf;
 	size_t rd_buf_pos = 0;
 
 	std::queue<queued_msg> send_queue;
@@ -101,6 +101,8 @@ protected:
 
 	std::atomic<bool> quit_requested{false};
 
+	dynamic_aligned_buffer_pool buf_pool{4096, 8};
+
 	com_ctrl* choose_ctrl();
 
 	void initialize_cfg();
@@ -117,13 +119,12 @@ protected:
 
 	void on_ctrl_fd(com_ctrl* ctrl, int fd, uint32_t events);
 
-	bool process_message(com_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len);
+	bool process_message(com_ctrl* ctrl, dynamic_aligned_buffer&& buf, size_t msg_len);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::getattr& msg);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::getfattr& msg);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::readdir& msg);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::create& msg);
-	bool process_message(com_ctrl* ctrl, prot::client::reply::read& msg,
-			dynamic_buffer&& buf);
+	bool process_message(com_ctrl* ctrl, prot::client::reply::read& msg);
 
 	bool send_message(com_ctrl* ctrl, const prot::msg& msg);
 	bool send_message(com_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len);

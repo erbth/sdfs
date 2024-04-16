@@ -1154,6 +1154,8 @@ bool ctrl_ctx::process_client_message(
 	/*   Assemble data */
 	/*   Return data */
 
+	// printf("read %d bytes\n", (int) msg.size);
+
 	if (msg.node_id == 0)
 	{
 		return send_message_to_client(
@@ -1301,7 +1303,12 @@ void ctrl_ctx::cb_c_r_read_dd(shared_ptr<ctx_c_r_read> rctx, size_t bi,
 	for (const auto& b : rctx->blocks)
 	{
 		if (data_ptr + b.offset + b.size >= data_end)
+		{
+			printf("%p -> %p; off: 0x%08x, size: %d\n",
+					data_ptr, data_end, (int) b.offset, (int) b.size);
+
 			throw runtime_error("Internal buffer overflow");
+		}
 
 		memcpy(data_ptr + b.offset, b.data, b.size);
 	}
@@ -1310,7 +1317,8 @@ void ctrl_ctx::cb_c_r_read_dd(shared_ptr<ctx_c_r_read> rctx, size_t bi,
 	send_message_to_client(rctx->client, move(buf), reply_size);
 
 	double diff = (get_monotonic_time() - rctx->t_start) / 1e9;
-	printf("read processing took %fms\n", diff * 1e3);
+	printf("read processing took %fms for %d bytes\n",
+			diff * 1e3, (int) rctx->msg.size);
 }
 
 
@@ -1628,22 +1636,54 @@ vector<tuple<size_t, size_t, size_t>> ctrl_ctx::map_file_region(
 		if (pos >= offset + size)
 			break;
 
-		auto chunk_file_offset = max(pos, offset);
-		auto chunk_file_start_diff = max((size_t) 0, offset - pos);
-		auto chunk_offset = i_alloc->offset + chunk_file_start_diff;
-		auto chunk_size = min(i_alloc->size - chunk_file_start_diff, offset + size - chunk_offset);
+		size_t chunk_offset;
+		size_t chunk_size;
+		size_t chunk_file_offset;
+
+		if (pos >= offset)
+		{
+			chunk_offset = i_alloc->offset;
+			chunk_file_offset = pos;
+			chunk_size = min(i_alloc->size, offset + size - chunk_file_offset);
+		}
+		else
+		{
+			chunk_offset = i_alloc->offset + (offset - pos);
+			chunk_file_offset = offset;
+			chunk_size = min(pos + i_alloc->size - chunk_file_offset, size);
+		}
+
+		// printf("DEBUG: chunk_size: %d, chunk_offset: %d, chunk_file_offset: %d\n",
+		// 		(int) chunk_size, (int) chunk_offset, (int) chunk_file_offset);
 
 		/* Map chunk to blocks */
+		auto chunk_end = chunk_offset + chunk_size;
 		auto current_block = chunk_offset / data_map.block_size;
-		while (current_block * data_map.block_size < chunk_offset + chunk_size)
+		for (;;)
 		{
-			auto block_start = current_block * data_map.block_size;
-			auto block_file_offset = max(block_start, chunk_file_offset);
-			auto block_file_start_diff = max((size_t) 0, chunk_offset - block_start);
-			auto block_offset = block_start + block_file_start_diff;
-			auto block_size = min(
-					data_map.block_size - block_file_start_diff,
-					chunk_offset + chunk_size - block_offset);
+			auto current_block_start = current_block * data_map.block_size;
+			if (current_block_start >= chunk_end)
+				break;
+
+			size_t block_offset;
+			size_t block_size;
+			size_t block_file_offset;
+
+			if (current_block_start >= chunk_offset)
+			{
+				block_offset = current_block_start;
+				block_size = min(chunk_end - current_block_start, data_map.block_size);
+				block_file_offset = chunk_file_offset + (current_block_start - chunk_offset);
+			}
+			else
+			{
+				block_offset = chunk_offset;
+				block_size = min(chunk_size, data_map.block_size - (chunk_offset - current_block_start));
+				block_file_offset = chunk_file_offset;
+			}
+
+			// printf("DEBUG: block_size: %d, block_offset: %d, block_file_offset: %d\n",
+			// 		(int) block_size, (int) block_offset, (int) block_file_offset);
 
 			blocks.emplace_back(block_offset, block_size, block_file_offset);
 
