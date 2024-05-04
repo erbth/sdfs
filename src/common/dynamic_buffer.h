@@ -91,8 +91,8 @@ class dynamic_aligned_buffer
 {
 protected:
 	char* buf = nullptr;
-	size_t alignment;
-	size_t size;
+	size_t _alignment;
+	size_t _size;
 
 	size_t to_power_of_two(size_t v)
 	{
@@ -108,14 +108,14 @@ protected:
 
 public:
 	dynamic_aligned_buffer()
-		: buf(nullptr), alignment(0), size(0)
+		: buf(nullptr), _alignment(0), _size(0)
 	{
 	}
 
 	dynamic_aligned_buffer(size_t alignment, size_t initial_size)
-		: alignment(alignment), size(to_power_of_two(initial_size))
+		: _alignment(alignment), _size(to_power_of_two(initial_size))
 	{
-		buf = (char*) aligned_alloc(alignment, size);
+		buf = (char*) aligned_alloc(_alignment, _size);
 		if (!buf)
 			throw std::bad_alloc();
 	}
@@ -124,11 +124,11 @@ public:
 	dynamic_aligned_buffer& operator=(dynamic_aligned_buffer&) = delete;
 
 	dynamic_aligned_buffer(dynamic_aligned_buffer&& o)
-		: buf(o.buf), alignment(o.alignment), size(o.size)
+		: buf(o.buf), _alignment(o._alignment), _size(o._size)
 	{
 		o.buf = nullptr;
-		o.alignment = 0;
-		o.size = 0;
+		o._alignment = 0;
+		o._size = 0;
 	}
 
 	dynamic_aligned_buffer& operator=(dynamic_aligned_buffer&& o)
@@ -137,12 +137,12 @@ public:
 			free(buf);
 
 		buf = o.buf;
-		alignment = o.alignment;
-		size = o.size;
+		_alignment = o._alignment;
+		_size = o._size;
 
 		o.buf = nullptr;
-		o.alignment = 0;
-		o.size = 0;
+		o._alignment = 0;
+		o._size = 0;
 
 		return *this;
 	}
@@ -157,42 +157,42 @@ public:
 		return buf;
 	}
 
-	size_t get_alignment()
+	size_t alignment()
 	{
-		return alignment;
+		return _alignment;
 	}
 
-	size_t get_size()
+	size_t size()
 	{
-		return size;
+		return _size;
 	}
 
 	void ensure_size(size_t s)
 	{
 		if (!buf)
 		{
-			throw std::runtime_error("A moved-from dynamic_aligned_buffer "
-					"cannot be reallocated");
+			throw std::runtime_error("An unallocated dynamic_aligned_buffer "
+					"cannot be allocated through ensure_size.");
 		}
 
-		if (size < s)
+		if (_size < s)
 		{
-			size_t new_size = size;
+			size_t new_size = _size;
 			while (new_size < s && new_size < std::numeric_limits<size_t>::max() / 2)
 				new_size *= 2;
 
 			if (new_size < s)
 				new_size = s;
 
-			char* new_buf = (char*) aligned_alloc(alignment, new_size);
+			char* new_buf = (char*) aligned_alloc(_alignment, new_size);
 			if (!new_buf)
 				throw std::bad_alloc();
 
-			memcpy(new_buf, buf, size);
+			memcpy(new_buf, buf, _size);
 
 			char* old_buf = buf;
 			buf = new_buf;
-			size = new_size;
+			_size = new_size;
 			free(old_buf);
 		}
 	}
@@ -234,7 +234,7 @@ public:
 
 		for (; i != free_list.end(); i++)
 		{
-			ssize_t diff = i->get_size() - size;
+			ssize_t diff = i->size() - size;
 			if (diff >= 0 && diff < overhead)
 			{
 				diff = overhead;
@@ -256,6 +256,10 @@ public:
 
 	void return_buffer(dynamic_aligned_buffer&& buf)
 	{
+		/* Do not return unallocated buffers */
+		if (!buf)
+			return;
+
 		std::unique_lock lk(m);
 
 		if (find(free_list.begin(), free_list.end(), buf) == free_list.end())
@@ -269,7 +273,7 @@ public:
 
 			for (; i != free_list.end(); i++)
 			{
-				if (i->get_size() < smallest->get_size())
+				if (i->size() < smallest->size())
 					smallest = i;
 			}
 

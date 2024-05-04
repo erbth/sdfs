@@ -641,12 +641,12 @@ void ctrl_ctx::on_client_fd(shared_ptr<ctrl_client> client, int fd, uint32_t eve
 			auto& qmsg = client->send_queue.front();
 
 			size_t to_write = min(
-					1024UL * 1024,
+					2 * 1024UL * 1024,
 					qmsg.msg_len - client->send_msg_pos);
 
 			auto ret = write(
 					client->get_fd(),
-					qmsg.buf.ptr() + client->send_msg_pos,
+					qmsg.buf_ptr() + client->send_msg_pos,
 					to_write);
 
 			if (ret >= 0)
@@ -654,6 +654,7 @@ void ctrl_ctx::on_client_fd(shared_ptr<ctrl_client> client, int fd, uint32_t eve
 				client->send_msg_pos += ret;
 				if (client->send_msg_pos == qmsg.msg_len)
 				{
+					qmsg.return_buffer(buf_pool_req);
 					client->send_queue.pop();
 					client->send_msg_pos = 0;
 
@@ -1054,8 +1055,8 @@ void ctrl_ctx::cb_c_r_create_ilock(shared_ptr<ctx_c_r_create> rctx, inode_lock_r
 	rctx->node->type = inode::TYPE_FILE;
 	rctx->node->nlink = 1;
 	rctx->node->mtime = get_wt_now();
-	rctx->node->size = 100 * 1024 * 1024;
-	rctx->node->allocations.emplace_back(0, 100 * 1024 * 1024);
+	rctx->node->size = 100ULL * 1024 * 1024 * 1024;
+	rctx->node->allocations.emplace_back(0, 100ULL * 1024 * 1024 * 1024);
 
 	/* Lock parent inode w */
 	inode_lock_request_t req;
@@ -1233,6 +1234,21 @@ void ctrl_ctx::cb_c_r_read_getnode(shared_ptr<ctx_c_r_read> rctx, get_inode_requ
 	}
 
 
+	/* Allocate a buffer for the message (including data) returned to the
+	 * client. It must be large enough to hold the message header. Note that an
+	 * unaligned memory access will happen at some point, because the page
+	 * header size may not be a multiple of the alignment size (either during
+	 * sending the packet or copying, however sending may introduce an extra
+	 * copy-step anyway). However memcpy has a strategy to copy unaligned bytes
+	 * first and the remaining data aligned. Note also, that the data received
+	 * from the dds needs to be copied eventually to strip the message headers.
+	 * A more elaborate implementation could avoid this but complicates the
+	 * message reception logic. Try with an extra copy step first. */
+	rctx->reply_header_size = prot::client::reply::read(0, err::SUCCESS).serialize(nullptr);
+	rctx->buf = buf_pool_req.get_buffer(max(
+				(size_t) 4096,
+				rctx->reply_header_size + rctx->read_size_total));
+
 	/* Read data from dds */
 	for (size_t i = 0; i < rctx->blocks.size(); i++)
 	{
@@ -1252,14 +1268,21 @@ void ctrl_ctx::cb_c_r_read_getnode(shared_ptr<ctx_c_r_read> rctx, get_inode_requ
 void ctrl_ctx::cb_c_r_read_dd(shared_ptr<ctx_c_r_read> rctx, size_t bi,
 		dd_read_request_t&& req)
 {
-	/* Store result of read request */
+	/* Store result of read request and copy data if required */
 	{
 		auto& b = rctx->blocks[bi];
 		b.result = req.result;
-		if (req.data)
+		if (req.result == err::SUCCESS)
 		{
-			b.data = req.data;
-			b._buf = move(req._buf);
+			if (rctx->reply_header_size + b.offset + b.size >= rctx->buf.size())
+				throw runtime_error("Internal buffer overflow");
+
+			memcpy(
+					rctx->buf.ptr() + rctx->reply_header_size + b.offset,
+					req.data,
+					b.size);
+
+			buf_pool_dd_io.return_buffer(move(req._buf));
 		}
 
 		b.completed = true;
@@ -1290,35 +1313,16 @@ void ctrl_ctx::cb_c_r_read_dd(shared_ptr<ctx_c_r_read> rctx, size_t bi,
 	if (rctx->client->invalid)
 		return;
 
-	/* Assemble data */
+	/* Add message header */
 	prot::client::reply::read reply(rctx->msg.req_id, err::SUCCESS);
 	reply.size = rctx->read_size_total;
-	dynamic_buffer buf;
-	buf.ensure_size(reply.serialize(nullptr) + reply.size);
-	auto reply_size = reply.serialize(buf.ptr());
-	auto data_ptr = buf.ptr() + reply_size;
-	auto data_end = buf.ptr() + buf.size();
-	reply_size += reply.size;
-
-	for (const auto& b : rctx->blocks)
-	{
-		if (data_ptr + b.offset + b.size >= data_end)
-		{
-			printf("%p -> %p; off: 0x%08x, size: %d\n",
-					data_ptr, data_end, (int) b.offset, (int) b.size);
-
-			throw runtime_error("Internal buffer overflow");
-		}
-
-		memcpy(data_ptr + b.offset, b.data, b.size);
-	}
+	auto reply_size = reply.serialize(rctx->buf.ptr()) + reply.size;
 
 	/* Return data to client */
-	send_message_to_client(rctx->client, move(buf), reply_size);
+	send_message_to_client(rctx->client, move(rctx->buf), reply_size);
 
-	double diff = (get_monotonic_time() - rctx->t_start) / 1e9;
-	printf("read processing took %fms for %d bytes\n",
-			diff * 1e3, (int) rctx->msg.size);
+	// printf("read processing took %fms for %d bytes\n",
+	// 		(get_monotonic_time() - rctx->t_start) / 1e6, (int) rctx->msg.size);
 }
 
 
@@ -1349,7 +1353,8 @@ bool ctrl_ctx::send_message_to_client(shared_ptr<ctrl_client> client, const prot
 	return send_message_to_client(client, move(buf), msg_len);
 }
 
-bool ctrl_ctx::send_message_to_client(shared_ptr<ctrl_client> client, dynamic_buffer&& buf, size_t msg_len)
+bool ctrl_ctx::send_message_to_client(shared_ptr<ctrl_client> client,
+		variant<dynamic_buffer, dynamic_aligned_buffer>&& buf, size_t msg_len)
 {
 	if (client->invalid)
 		return true;
@@ -1702,7 +1707,7 @@ void ctrl_ctx::dd_read(dd_read_request_t&& req)
 	char c = 'a' + req.dd->id % 0x10;
 
 	req.result = err::SUCCESS;
-	req._buf.ensure_size(req.size);
+	req._buf = buf_pool_dd_io.get_buffer(req.size);
 	memset(req._buf.ptr(), c, req.size);
 	req.data = req._buf.ptr();
 
