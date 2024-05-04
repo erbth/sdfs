@@ -6,22 +6,61 @@
 #include <vector>
 #include <list>
 #include <optional>
+#include <queue>
+#include <variant>
 #include "common/utils.h"
 #include "common/io_uring.h"
 #include "common/epoll.h"
 #include "common/signalfd.h"
-#include "common/fixed_buffer.h"
 #include "common/dynamic_buffer.h"
 #include "common/prot_dd.h"
 #include "utils.h"
 
+
+struct dd_queued_msg final
+{
+	std::variant<dynamic_buffer, dynamic_aligned_buffer> vbuf;
+	const size_t msg_len;
+
+	inline dd_queued_msg(
+			std::variant<dynamic_buffer, dynamic_aligned_buffer>&& vbuf,
+			size_t msg_len)
+		: vbuf(std::move(vbuf)), msg_len(msg_len)
+	{
+	}
+
+	inline const char* buf_ptr()
+	{
+		if (std::holds_alternative<dynamic_buffer>(vbuf))
+			return std::get<dynamic_buffer>(vbuf).ptr();
+		else
+			return std::get<dynamic_aligned_buffer>(vbuf).ptr();
+	}
+
+	inline void return_buffer(dynamic_aligned_buffer_pool& pool)
+	{
+		if (std::holds_alternative<dynamic_aligned_buffer>(vbuf))
+			pool.return_buffer(std::move(std::get<dynamic_aligned_buffer>(vbuf)));
+	}
+};
+
+
 /* Connections from controllers */
 struct dd_client final
 {
+	/* After a client was removed from the list but is still kept alive through
+	 * a shared_ptr */
+	bool invalid = false;
+
 	WrappedFD wfd;
 
-	dynamic_buffer rd_buf;
+	/* Receive messages */
+	dynamic_aligned_buffer rd_buf;
 	size_t rd_buf_pos = 0;
+
+	/* Send messages */
+	std::queue<dd_queued_msg> send_queue;
+	size_t send_msg_pos = 0;
 
 	inline int get_fd()
 	{
@@ -57,23 +96,28 @@ protected:
 	/* Clients */
 	std::vector<std::shared_ptr<dd_client>> clients;
 
+	/* Be careful when calling these functions */
+	void remove_client(decltype(clients)::iterator i);
+	void remove_client(std::shared_ptr<dd_client> client);
+
 	void initialize_sock();
 	void initialize_mgr();
 
 	void on_signal(int s);
 	void on_listen_sock(int fd, uint32_t events);
 
+	/* Buffer pool for requests */
+	dynamic_aligned_buffer_pool buf_pool_client{4096, 8};
+
 	void on_client_fd(std::shared_ptr<dd_client> client, int fd, uint32_t events);
 
-	bool process_client_message(std::shared_ptr<dd_client> client,
-			dynamic_buffer&& buf, size_t msg_len);
+	bool process_client_message(std::shared_ptr<dd_client> client, dynamic_aligned_buffer&& buf, size_t msg_len);
+	bool process_client_message(std::shared_ptr<dd_client> client, const prot::dd::req::getattr& msg);
+	bool process_client_message(std::shared_ptr<dd_client> client, const prot::dd::req::read& msg);
 
-	bool process_client_message(std::shared_ptr<dd_client> client,
-			const prot::dd::req::getattr& msg);
-
-	bool send_to_client(std::shared_ptr<dd_client> client,
-			std::shared_ptr<prot::msg> msg,
-			std::optional<fixed_aligned_buffer>&& buf);
+	bool send_message_to_client(std::shared_ptr<dd_client> client, const prot::msg& msg);
+	bool send_message_to_client(std::shared_ptr<dd_client> client,
+			std::variant<dynamic_buffer, dynamic_aligned_buffer>&& buf, size_t msg_len);
 
 	/* io uring event handlers */
 	void on_epoll_ready(int res);

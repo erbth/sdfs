@@ -17,6 +17,7 @@
 #include "common/file_config.h"
 #include "common/dynamic_buffer.h"
 #include "common/prot_client.h"
+#include "common/prot_dd.h"
 #include "common/open_list.h"
 
 extern "C" {
@@ -309,31 +310,6 @@ struct ctx_c_r_read
 };
 
 
-struct ctrl_dd final
-{
-	WrappedFD wfd;
-
-	unsigned id;
-	char gid[16];
-	int port;
-
-	size_t size;
-
-	/* Only true after the DD's connection has been fully initialized */
-	bool connected = false;
-
-	/* Metadata offsets */
-	size_t allocation_bitmap_offset = 0;
-	size_t inode_directory_offset = 0;
-	size_t inode_bitmap_offset = 0;
-
-	inline int get_fd()
-	{
-		return wfd.get_fd();
-	}
-};
-
-
 struct ctrl_queued_msg final
 {
 	std::variant<dynamic_buffer, dynamic_aligned_buffer> vbuf;
@@ -360,6 +336,45 @@ struct ctrl_queued_msg final
 			pool.return_buffer(std::move(std::get<dynamic_aligned_buffer>(vbuf)));
 	}
 };
+
+
+struct ctrl_dd final
+{
+	WrappedFD wfd;
+
+	unsigned id;
+	char gid[16];
+	int port;
+
+	size_t size;
+
+	/* Only true after the DD's connection has been fully initialized */
+	bool connected = false;
+
+
+	/* Receiving messages from the dd */
+	dynamic_aligned_buffer rd_buf;
+	size_t rd_buf_pos = 0;
+
+	/* Sending messages to the dd */
+	std::queue<ctrl_queued_msg> send_queue;
+	size_t send_msg_pos = 0;
+
+	/* Outstanding requests */
+	std::map<uint64_t, dd_read_request_t> read_reqs;
+
+
+	/* Metadata offsets */
+	size_t allocation_bitmap_offset = 0;
+	size_t inode_directory_offset = 0;
+	size_t inode_bitmap_offset = 0;
+
+	inline int get_fd()
+	{
+		return wfd.get_fd();
+	}
+};
+
 
 struct ctrl_client final
 {
@@ -420,6 +435,10 @@ protected:
 	dynamic_aligned_buffer_pool buf_pool_dd_io{4096, 64};
 
 
+	/* Statistics */
+	size_t client_req_cnt_read = 0;
+
+
 	/* Internal operations */
 	/* Locks */
 	void lock_inode(inode_lock_request_t&);
@@ -469,8 +488,16 @@ protected:
 
 	void on_client_lfd(int fd, uint32_t events);
 
-	void on_dd_fd(int fd, uint32_t events);
+	void on_dd_fd(ctrl_dd* dd, int fd, uint32_t events);
 	void on_client_fd(std::shared_ptr<ctrl_client> client, int fd, uint32_t events);
+
+
+	bool process_dd_message(ctrl_dd& dd, dynamic_aligned_buffer&& buf, size_t msg_len);
+	bool process_dd_message(ctrl_dd& dd, prot::dd::reply::read& msg, dynamic_aligned_buffer&& buf);
+
+	bool send_message_to_dd(ctrl_dd& dd, const prot::msg& msg);
+	bool send_message_to_dd(ctrl_dd& dd,
+			std::variant<dynamic_buffer, dynamic_aligned_buffer>&& buf, size_t msg_len);
 
 
 	bool process_client_message(std::shared_ptr<ctrl_client> client, dynamic_buffer&& buf, size_t msg_len);

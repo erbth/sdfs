@@ -11,4 +11,5 @@ add_executable(sdfs-ctrl
 	../common/prot_dd_mgr.cc
 	../common/prot_dd.cc
 	../common/prot_client.cc
+	../common/profiler.cc
 )

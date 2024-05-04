@@ -11,6 +11,7 @@
 #include <mutex>
 #include <new>
 
+
 class dynamic_buffer
 {
 protected:
@@ -150,6 +151,11 @@ public:
 	operator bool() const
 	{
 		return buf != nullptr;
+	}
+
+	bool operator==(const dynamic_aligned_buffer& o)
+	{
+		return buf != nullptr && buf == o.buf;
 	}
 
 	char* ptr()

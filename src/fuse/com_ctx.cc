@@ -42,25 +42,6 @@ void add_req(com_ctrl* ctrl, const request_t& req)
 		throw runtime_error("request id conflict");
 }
 
-/* Other helpers */
-class buffer_pool_returner final
-{
-protected:
-	dynamic_aligned_buffer_pool& pool;
-	dynamic_aligned_buffer buf;
-
-public:
-	buffer_pool_returner(dynamic_aligned_buffer_pool& pool, dynamic_aligned_buffer&& buf)
-		: pool(pool), buf(move(buf))
-	{
-	}
-
-	~buffer_pool_returner()
-	{
-		pool.return_buffer(move(buf));
-	}
-};
-
 /* com_ctx */
 com_ctx::com_ctx()
 {
@@ -226,6 +207,8 @@ void com_ctx::start_threads()
 
 void com_ctx::worker_thread_func()
 {
+	pthread_setname_np(pthread_self(), "com_ctx_thread");
+
 	while (!quit_requested.load(memory_order_acquire))
 		epoll.process_events(-1);
 }
@@ -383,14 +366,12 @@ void com_ctx::on_ctrl_fd(com_ctrl* ctrl, int fd, uint32_t events)
 bool com_ctx::process_message(
 		com_ctrl* ctrl, dynamic_aligned_buffer&& buf, size_t msg_len)
 {
-	auto data_ptr = buf.ptr();
 	buffer_pool_returner bp_ret(buf_pool, move(buf));
-
 	unique_ptr<prot::msg> msg;
 
 	try
 	{
-		msg = prot::client::reply::parse(data_ptr + 4, msg_len);
+		msg = prot::client::reply::parse(bp_ret.buf.ptr() + 4, msg_len);
 	}
 	catch (const prot::exception& e)
 	{

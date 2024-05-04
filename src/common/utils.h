@@ -7,6 +7,7 @@
 #include <string>
 #include <stdexcept>
 #include <system_error>
+#include "common/dynamic_buffer.h"
 
 extern "C" {
 #include <unistd.h>
@@ -157,5 +158,27 @@ public:
 		lk.lock();
 	}
 };
+
+
+class buffer_pool_returner final
+{
+protected:
+	dynamic_aligned_buffer_pool& pool;
+
+public:
+	dynamic_aligned_buffer buf;
+
+	inline buffer_pool_returner(dynamic_aligned_buffer_pool& pool, dynamic_aligned_buffer&& buf)
+		: pool(pool), buf(std::move(buf))
+	{
+	}
+
+	inline ~buffer_pool_returner()
+	{
+		if (buf)
+			pool.return_buffer(std::move(buf));
+	}
+};
+
 
 #endif /* __COMMON_UTILS_H */

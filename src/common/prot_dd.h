@@ -24,22 +24,29 @@ namespace req
 		void parse(const char* buf, size_t size);
 	};
 
-	struct read
+	struct read : public msg
 	{
 		uint64_t request_id;
 
 		size_t offset;
 		size_t length;
+
+		read();
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size = 3*8;
 	};
 
-	struct write
+	struct write : public msg
 	{
 		uint64_t request_id;
 
 		size_t offset;
 		size_t length;
 
-		const char* buf;
+		const char* data;
 	};
 
 	std::unique_ptr<msg> parse(const char* buf, size_t size);
@@ -72,18 +79,33 @@ namespace reply
 		static constexpr size_t msg_size = 4 + 16 + 8 + 8;
 	};
 
-	struct read
+	struct read : public msg
 	{
 		uint64_t request_id;
-		unsigned result;
+		int res{};
 
-		const char* buf;
+		size_t data_length{};
+		const char* data = nullptr;
+
+		read();
+		read(uint64_t request_id, int res);
+
+		/* The data will NOT be serialized, and the return value will NOT
+		 * include the data size. */
+		size_t serialize(char* buf) const override;
+
+		/* Size MUST include the data size - so size is simply the received
+		 * message payload size, like for the other messages. */
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size_base = 8 + 4;
 	};
 
-	struct write
+	struct write : public msg
 	{
 		uint64_t request_id;
-		unsigned result;
+		int res{};
 	};
 
 	std::unique_ptr<msg> parse(const char* buf, size_t size);

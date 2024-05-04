@@ -11,6 +11,7 @@
 #include "common/msg_utils.h"
 #include "common/serialization.h"
 #include "common/strformat.h"
+#include "common/profiler.h"
 
 extern "C" {
 #include <unistd.h>
@@ -370,7 +371,7 @@ void ctrl_ctx::initialize_connect_dd(const struct in6_addr& addr, ctrl_dd& dd)
 			format_size_bin(reply.raw_size).c_str(), (long unsigned) reply.raw_size);
 
 	epoll.add_fd(wfd.get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP,
-			bind_front(&ctrl_ctx::on_dd_fd, this));
+			bind_front(&ctrl_ctx::on_dd_fd, this, &dd));
 
 	dd.wfd = move(wfd);
 	dd.connected = true;
@@ -620,8 +621,204 @@ void ctrl_ctx::on_client_lfd(int fd, uint32_t events)
 }
 
 
-void ctrl_ctx::on_dd_fd(int fd, uint32_t events)
+void ctrl_ctx::on_dd_fd(ctrl_dd* dd, int fd, uint32_t events)
 {
+	if (fd != dd->get_fd())
+		throw runtime_error("Got epoll event for invalid dd fd");
+
+	bool disconnect = false;
+
+	/* Send data */
+	if (events & EPOLLOUT)
+	{
+		auto prof = profiler_get("on_dd_fd(send)");
+
+		bool disable_sender = false;
+		if (dd->send_queue.size() > 0)
+		{
+			auto& qmsg = dd->send_queue.front();
+
+			size_t to_write = min(
+					2 * 1024UL * 1024,
+					qmsg.msg_len - dd->send_msg_pos);
+
+			auto ret = write(
+					dd->get_fd(),
+					qmsg.buf_ptr() + dd->send_msg_pos,
+					to_write);
+
+			if (ret >= 0)
+			{
+				dd->send_msg_pos += ret;
+				if (dd->send_msg_pos == qmsg.msg_len)
+				{
+					qmsg.return_buffer(buf_pool_dd_io);
+					dd->send_queue.pop();
+					dd->send_msg_pos = 0;
+
+					if (dd->send_queue.empty())
+						disable_sender = true;
+				}
+			}
+			else
+			{
+				disconnect = true;
+			}
+		}
+		else
+		{
+			disable_sender = true;
+		}
+
+		if (disable_sender)
+			epoll.change_events(dd->get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP);
+	}
+
+	/* Read data */
+	if (events & EPOLLIN)
+	{
+		auto prof = profiler_get("on_dd_fd(recv)");
+
+		const size_t read_chunk = 2 * 1024 * 1024ULL;
+
+		if (!dd->rd_buf)
+			dd->rd_buf = buf_pool_dd_io.get_buffer(dd->rd_buf_pos + read_chunk);
+		else
+			dd->rd_buf.ensure_size(dd->rd_buf_pos + read_chunk);
+
+		auto ret = read(
+				dd->get_fd(),
+				dd->rd_buf.ptr() + dd->rd_buf_pos,
+				read_chunk);
+
+		if (ret > 0)
+		{
+			dd->rd_buf_pos += ret;
+
+			/* Check if the message has been completely received */
+			while (dd->rd_buf_pos >= 4)
+			{
+				size_t msg_len = ser::read_u32(dd->rd_buf.ptr());
+
+				if (dd->rd_buf_pos >= msg_len + 4)
+				{
+					/* Move the message buffer out */
+					dynamic_aligned_buffer msg_buf(move(dd->rd_buf));
+
+					dd->rd_buf_pos -= msg_len + 4;
+					dd->rd_buf = buf_pool_dd_io.get_buffer(dd->rd_buf_pos);
+					memcpy(
+							dd->rd_buf.ptr(),
+							msg_buf.ptr() + (msg_len + 4),
+							dd->rd_buf_pos);
+
+					/* Process the message */
+					if (process_dd_message(*dd, move(msg_buf), msg_len))
+					{
+						disconnect = true;
+						break;
+					}
+				}
+				else
+				{
+					break;
+				}
+			}
+		}
+		else
+		{
+			disconnect = true;
+		}
+	}
+
+	if (events & (EPOLLHUP | EPOLLRDHUP))
+		disconnect = true;
+
+	if (disconnect)
+		throw runtime_error("Error reading data form dd.\n");
+}
+
+bool ctrl_ctx::process_dd_message(
+		ctrl_dd& dd, dynamic_aligned_buffer&& buf, size_t msg_len)
+{
+	unique_ptr<prot::msg> msg;
+
+	try
+	{
+		msg = prot::dd::reply::parse(buf.ptr() + 4, msg_len);
+	}
+	catch (const prot::exception& e)
+	{
+		fprintf(stderr, "Invalid message from dd: %s\n", e.what());
+		return true;
+	}
+
+	switch (msg->num)
+	{
+		case prot::dd::reply::READ:
+			return process_dd_message(
+					dd,
+					static_cast<prot::dd::reply::read&>(*msg),
+					move(buf));
+
+		default:
+			fprintf(stderr, "dd io: protocol violation\n");
+			return true;
+	}
+}
+
+bool ctrl_ctx::process_dd_message(ctrl_dd& dd, prot::dd::reply::read& msg, dynamic_aligned_buffer&& buf)
+{
+	/* Find request */
+	auto i_req = dd.read_reqs.find(msg.request_id);
+	if (i_req == dd.read_reqs.end())
+	{
+		fprintf(stderr, "dd io: received invalid request id\n");
+		buf_pool_dd_io.return_buffer(move(buf));
+	}
+
+	/* Complete request */
+	auto req = move(i_req->second);
+	dd.read_reqs.erase(i_req);
+
+	req.result = msg.res;
+	if (msg.data_length != req.size)
+		req.result = err::IO;
+
+	req.data = msg.data;
+	req._buf = move(buf);
+
+	auto cb = req.cb_completed;
+	cb(move(req));
+
+	return false;
+}
+
+
+bool ctrl_ctx::send_message_to_dd(ctrl_dd& dd, const prot::msg& msg)
+{
+	dynamic_buffer buf;
+	buf.ensure_size(msg.serialize(nullptr));
+	auto msg_len = msg.serialize(buf.ptr());
+	return send_message_to_dd(dd, move(buf), msg_len);
+}
+
+bool ctrl_ctx::send_message_to_dd(ctrl_dd& dd,
+		variant<dynamic_buffer, dynamic_aligned_buffer>&& buf, size_t msg_len)
+{
+	if (!dd.connected)
+	{
+		fprintf(stderr, "attempted to send message to disconnected dd\n");
+		return true;
+	}
+
+	auto was_empty = dd.send_queue.empty();
+	dd.send_queue.emplace(move(buf), msg_len);
+
+	if (was_empty)
+		epoll.change_events(dd.get_fd(), EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP);
+
+	return false;
 }
 
 
@@ -635,6 +832,8 @@ void ctrl_ctx::on_client_fd(shared_ptr<ctrl_client> client, int fd, uint32_t eve
 	/* Send data */
 	if (events & EPOLLOUT)
 	{
+		auto prof = profiler_get("on_client_fd(send)");
+
 		bool disable_sender = false;
 		if (client->send_queue.size() > 0)
 		{
@@ -679,6 +878,8 @@ void ctrl_ctx::on_client_fd(shared_ptr<ctrl_client> client, int fd, uint32_t eve
 	/* Read data */
 	if (events & EPOLLIN)
 	{
+		auto prof = profiler_get("on_client_fd(recv)");
+
 		const size_t read_chunk = 100 * 1024;
 		client->rd_buf.ensure_size(client->rd_buf_pos + read_chunk);
 
@@ -737,6 +938,8 @@ void ctrl_ctx::on_client_fd(shared_ptr<ctrl_client> client, int fd, uint32_t eve
 bool ctrl_ctx::process_client_message(
 		shared_ptr<ctrl_client> client, dynamic_buffer&& buf, size_t msg_len)
 {
+	auto prof = profiler_get("process_client_message");
+
 	unique_ptr<prot::msg> msg;
 
 	try
@@ -777,7 +980,7 @@ bool ctrl_ctx::process_client_message(
 					static_cast<prot::client::req::read&>(*msg));
 
 		default:
-			fprintf(stderr, "protocol violation\n");
+			fprintf(stderr, "client io: protocol violation\n");
 			return true;
 	}
 }
@@ -1147,6 +1350,8 @@ void ctrl_ctx::cb_c_r_create_getp(shared_ptr<ctx_c_r_create> rctx, get_inode_req
 bool ctrl_ctx::process_client_message(
 		shared_ptr<ctrl_client> client, prot::client::req::read& msg)
 {
+	auto prof = profiler_get("process_client_message(read)");
+
 	/* READ */
 	/* b Lock inode */
 	/* b Retrieve data map(s) */
@@ -1156,6 +1361,10 @@ bool ctrl_ctx::process_client_message(
 	/*   Return data */
 
 	// printf("read %d bytes\n", (int) msg.size);
+
+	client_req_cnt_read++;
+	if ((client_req_cnt_read % 2000) == 0)
+		profiler_list(client_req_cnt_read);
 
 	if (msg.node_id == 0)
 	{
@@ -1181,6 +1390,8 @@ bool ctrl_ctx::process_client_message(
 
 void ctrl_ctx::cb_c_r_read_ilock(shared_ptr<ctx_c_r_read> rctx, inode_lock_request_t& ilck)
 {
+	auto prof = profiler_get("cb_c_r_read_ilock");
+
 	rctx->ilck = inode_lock_witness(bind_front(&ctrl_ctx::unlock_inode, this), ilck);
 
 	/* Retrieve data map(s) */
@@ -1193,6 +1404,8 @@ void ctrl_ctx::cb_c_r_read_ilock(shared_ptr<ctx_c_r_read> rctx, inode_lock_reque
 
 void ctrl_ctx::cb_c_r_read_getnode(shared_ptr<ctx_c_r_read> rctx, get_inode_request_t&& ireq)
 {
+	auto prof = profiler_get("cb_c_r_read_getnode");
+
 	if (ireq.result != err::SUCCESS)
 	{
 		send_message_to_client(
@@ -1268,6 +1481,8 @@ void ctrl_ctx::cb_c_r_read_getnode(shared_ptr<ctx_c_r_read> rctx, get_inode_requ
 void ctrl_ctx::cb_c_r_read_dd(shared_ptr<ctx_c_r_read> rctx, size_t bi,
 		dd_read_request_t&& req)
 {
+	auto prof = profiler_get("cb_c_r_read_dd");
+
 	/* Store result of read request and copy data if required */
 	{
 		auto& b = rctx->blocks[bi];
@@ -1356,6 +1571,8 @@ bool ctrl_ctx::send_message_to_client(shared_ptr<ctrl_client> client, const prot
 bool ctrl_ctx::send_message_to_client(shared_ptr<ctrl_client> client,
 		variant<dynamic_buffer, dynamic_aligned_buffer>&& buf, size_t msg_len)
 {
+	auto prof = profiler_get("send_message_to_client(buf)");
+
 	if (client->invalid)
 		return true;
 
@@ -1704,13 +1921,28 @@ vector<tuple<size_t, size_t, size_t>> ctrl_ctx::map_file_region(
 
 void ctrl_ctx::dd_read(dd_read_request_t&& req)
 {
-	char c = 'a' + req.dd->id % 0x10;
+	auto& dd = *req.dd;
 
-	req.result = err::SUCCESS;
-	req._buf = buf_pool_dd_io.get_buffer(req.size);
-	memset(req._buf.ptr(), c, req.size);
-	req.data = req._buf.ptr();
+	prot::dd::req::read msg;
+	msg.request_id = get_request_id();
+	msg.offset = req.offset;
+	msg.length = req.size;
 
-	auto cb = req.cb_completed;
-	cb(move(req));
+	/* Register request */
+	auto [i,created] = dd.read_reqs.emplace(msg.request_id, move(req));
+	if (!created)
+		throw runtime_error("dd io: request id conflict");
+
+	/* Send message to dd */
+	try
+	{
+		if (send_message_to_dd(dd, msg))
+			throw runtime_error("failed to send message to dd\n");
+	}
+	catch (...)
+	{
+		/* Unregister request */
+		dd.read_reqs.erase(i);
+		throw;
+	}
 }
