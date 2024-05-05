@@ -599,6 +599,18 @@ void ctrl_ctx::on_signal(int s)
 }
 
 
+void ctrl_ctx::on_epoll_ready(int res)
+{
+	if (res < 0)
+		throw runtime_error("async poll on epoll fd failed");
+
+	epoll.process_events(0);
+
+	io_uring.submit_poll(epoll.get_fd(), POLLIN,
+			bind_front(&ctrl_ctx::on_epoll_ready, this));
+}
+
+
 void ctrl_ctx::on_client_lfd(int fd, uint32_t events)
 {
 	WrappedFD wfd;
@@ -830,50 +842,50 @@ void ctrl_ctx::on_client_fd(shared_ptr<ctrl_client> client, int fd, uint32_t eve
 	bool rm_client = false;
 
 	/* Send data */
-	if (events & EPOLLOUT)
-	{
-		auto prof = profiler_get("on_client_fd(send)");
+	// if (events & EPOLLOUT)
+	// {
+	// 	auto prof = profiler_get("on_client_fd(send)");
 
-		bool disable_sender = false;
-		if (client->send_queue.size() > 0)
-		{
-			auto& qmsg = client->send_queue.front();
+	// 	bool disable_sender = false;
+	// 	if (client->send_queue.size() > 0)
+	// 	{
+	// 		auto& qmsg = client->send_queue.front();
 
-			size_t to_write = min(
-					2 * 1024UL * 1024,
-					qmsg.msg_len - client->send_msg_pos);
+	// 		size_t to_write = min(
+	// 				2 * 1024UL * 1024,
+	// 				qmsg.msg_len - client->send_msg_pos);
 
-			auto ret = write(
-					client->get_fd(),
-					qmsg.buf_ptr() + client->send_msg_pos,
-					to_write);
+	// 		auto ret = write(
+	// 				client->get_fd(),
+	// 				qmsg.buf_ptr() + client->send_msg_pos,
+	// 				to_write);
 
-			if (ret >= 0)
-			{
-				client->send_msg_pos += ret;
-				if (client->send_msg_pos == qmsg.msg_len)
-				{
-					qmsg.return_buffer(buf_pool_req);
-					client->send_queue.pop();
-					client->send_msg_pos = 0;
+	// 		if (ret >= 0)
+	// 		{
+	// 			client->send_msg_pos += ret;
+	// 			if (client->send_msg_pos == qmsg.msg_len)
+	// 			{
+	// 				qmsg.return_buffer(buf_pool_req);
+	// 				client->send_queue.pop();
+	// 				client->send_msg_pos = 0;
 
-					if (client->send_queue.empty())
-						disable_sender = true;
-				}
-			}
-			else
-			{
-				rm_client = true;
-			}
-		}
-		else
-		{
-			disable_sender = true;
-		}
+	// 				if (client->send_queue.empty())
+	// 					disable_sender = true;
+	// 			}
+	// 		}
+	// 		else
+	// 		{
+	// 			rm_client = true;
+	// 		}
+	// 	}
+	// 	else
+	// 	{
+	// 		disable_sender = true;
+	// 	}
 
-		if (disable_sender)
-			epoll.change_events(client->get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP);
-	}
+	// 	if (disable_sender)
+	// 		epoll.change_events(client->get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP);
+	// }
 
 	/* Read data */
 	if (events & EPOLLIN)
@@ -933,6 +945,39 @@ void ctrl_ctx::on_client_fd(shared_ptr<ctrl_client> client, int fd, uint32_t eve
 
 	if (rm_client)
 		remove_client(client);
+}
+
+void ctrl_ctx::on_client_writev_finished(shared_ptr<ctrl_client> client, int res)
+{
+	auto prof = profiler_get("on_client_writev_finished");
+
+	if (res < 0)
+	{
+		remove_client(client);
+		return;
+	}
+
+	client->send_msg_pos += res;
+	auto qmsg = &client->send_queue.front();
+
+	if (client->send_msg_pos == qmsg->msg_len)
+	{
+		qmsg->return_buffer(buf_pool_req);
+		client->send_queue.pop();
+		client->send_msg_pos = 0;
+
+		if (client->send_queue.empty())
+			return;
+
+		qmsg = &client->send_queue.front();
+	}
+
+	qmsg->update_iovec(client->send_msg_pos);
+	io_uring.submit_writev(
+			client->get_fd(),
+			&client->send_queue.front().iov, 1, -1,
+			0,
+			bind_front(&ctrl_ctx::on_client_writev_finished, this, client));
 }
 
 bool ctrl_ctx::process_client_message(
@@ -1576,11 +1621,23 @@ bool ctrl_ctx::send_message_to_client(shared_ptr<ctrl_client> client,
 	if (client->invalid)
 		return true;
 
+	if (msg_len > numeric_limits<int>::max())
+		throw invalid_argument("msg_len must fit into an integer");
+
 	auto was_empty = client->send_queue.empty();
 	client->send_queue.emplace(move(buf), msg_len);
 
+	/* TODO: what if io_uring is completely full? */
 	if (was_empty)
-		epoll.change_events(client->get_fd(), EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP);
+	{
+		// epoll.change_events(client->get_fd(), EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP);
+
+		io_uring.submit_writev(
+				client->get_fd(),
+				&client->send_queue.front().iov, 1, -1,
+				0,
+				bind_front(&ctrl_ctx::on_client_writev_finished, this, client));
+	}
 
 	return false;
 }
@@ -1588,8 +1645,11 @@ bool ctrl_ctx::send_message_to_client(shared_ptr<ctrl_client> client,
 
 void ctrl_ctx::main()
 {
+	io_uring.submit_poll(epoll.get_fd(), POLLIN,
+			bind_front(&ctrl_ctx::on_epoll_ready, this));
+
 	while (!quit_requested)
-		epoll.process_events(-1);
+		io_uring.process_requests(true);
 }
 
 

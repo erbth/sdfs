@@ -163,11 +163,13 @@ public:
 ProfilerRegistry reg{};
 
 
-ProfilerProxy profiler_get(const string& name)
+ProfilerProxy profiler_get(const string& name, bool start)
 {
 	auto& p = reg.get(name);
 	ProfilerProxy pp(p);
-	p.start();
+
+	if (start)
+		p.start();
 
 	return pp;
 }

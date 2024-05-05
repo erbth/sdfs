@@ -22,7 +22,7 @@ public:
 
 /* The return value must only be used by one thread at a time. If another thread
  * needs concurrent access, retrieve another ProfilerProxy with profiler_get. */
-ProfilerProxy profiler_get(const std::string& name);
+ProfilerProxy profiler_get(const std::string& name, bool start=true);
 
 void profiler_list();
 void profiler_list(unsigned long long div);

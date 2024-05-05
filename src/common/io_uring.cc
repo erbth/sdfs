@@ -8,6 +8,7 @@ extern "C" {
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
 #include <linux/time_types.h>
 #include "kernel_hdr/io_uring.h"
 }
@@ -250,6 +251,37 @@ void IOUring::submit_poll(int fd, short events, complete_cb_t cb)
 	sqe->opcode = IORING_OP_POLL_ADD;
 	sqe->fd = fd;
 	sqe->poll_events = events;
+
+	auto n = new open_list<complete_cb_t>::node();
+	n->elem = cb;
+
+	sqe->user_data = (uintptr_t) n;
+
+	try
+	{
+		ctx->submit();
+	}
+	catch (...)
+	{
+		delete n;
+		throw;
+	}
+
+	ctx->req_list.add(n);
+}
+
+void IOUring::submit_writev(int fd, const struct iovec *iov, int iovcnt,
+		off_t offset, int flags, complete_cb_t cb)
+{
+	auto sqe = ctx->next_sqe();
+	memset(sqe, 0, sizeof(*sqe));
+
+	sqe->opcode = IORING_OP_WRITEV;
+	sqe->fd = fd;
+	sqe->off = offset;
+	sqe->addr = (decltype(sqe->addr)) iov;
+	sqe->len = iovcnt;
+	sqe->rw_flags = flags;
 
 	auto n = new open_list<complete_cb_t>::node();
 	n->elem = cb;

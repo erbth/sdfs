@@ -19,6 +19,7 @@
 #include "common/prot_client.h"
 #include "common/prot_dd.h"
 #include "common/open_list.h"
+#include "common/io_uring.h"
 
 extern "C" {
 #include <netinet/in.h>
@@ -315,11 +316,15 @@ struct ctrl_queued_msg final
 	std::variant<dynamic_buffer, dynamic_aligned_buffer> vbuf;
 	const size_t msg_len;
 
+	/* For use with io_uring */
+	struct iovec iov{};
+
 	inline ctrl_queued_msg(
 			std::variant<dynamic_buffer, dynamic_aligned_buffer>&& vbuf,
 			size_t msg_len)
 		: vbuf(std::move(vbuf)), msg_len(msg_len)
 	{
+		update_iovec(0);
 	}
 
 	inline const char* buf_ptr()
@@ -334,6 +339,12 @@ struct ctrl_queued_msg final
 	{
 		if (std::holds_alternative<dynamic_aligned_buffer>(vbuf))
 			pool.return_buffer(std::move(std::get<dynamic_aligned_buffer>(vbuf)));
+	}
+
+	inline void update_iovec(size_t offset)
+	{
+		iov.iov_base = (char*) (buf_ptr() + offset);
+		iov.iov_len = msg_len - offset;
 	}
 };
 
@@ -412,6 +423,12 @@ protected:
 		epoll,
 		std::bind_front(&ctrl_ctx::on_signal, this)};
 
+	/* NOTE: Epoll comes before because IOUring polls epoll's filedescriptor */
+	const unsigned io_uring_max_req_in_flight = 120;
+	IOUring io_uring{next_power_of_two(io_uring_max_req_in_flight + 1)};
+
+	unsigned io_uring_req_in_flight = 0;
+
 	/* dds */
 	std::list<ctrl_dd> dds;
 
@@ -486,10 +503,13 @@ protected:
 
 	void on_signal(int s);
 
+	void on_epoll_ready(int res);
+
 	void on_client_lfd(int fd, uint32_t events);
 
 	void on_dd_fd(ctrl_dd* dd, int fd, uint32_t events);
 	void on_client_fd(std::shared_ptr<ctrl_client> client, int fd, uint32_t events);
+	void on_client_writev_finished(std::shared_ptr<ctrl_client> client, int res);
 
 
 	bool process_dd_message(ctrl_dd& dd, dynamic_aligned_buffer&& buf, size_t msg_len);

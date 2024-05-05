@@ -31,6 +31,10 @@ public:
 
 	void submit_poll(int fd, short events, complete_cb_t cb);
 
+	/* Similar to pwritev2 */
+	void submit_writev(int fd, const struct iovec *iov, int iovcnt,
+			off_t offset, int flags, complete_cb_t cb);
+
 	/* If block is true and no requests are finished yet, block until a request
 	 * becomes available */
 	void process_requests(bool block);
