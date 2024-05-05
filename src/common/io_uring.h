@@ -32,8 +32,12 @@ public:
 	void submit_poll(int fd, short events, complete_cb_t cb);
 
 	/* Similar to pwritev2 */
-	void submit_writev(int fd, const struct iovec *iov, int iovcnt,
+	void queue_writev(int fd, const struct iovec *iov, int iovcnt,
 			off_t offset, int flags, complete_cb_t cb);
+
+	/* NOTE: If this fails (with an exception), the queued requests will not be
+	 * deleted */
+	void submit();
 
 	/* If block is true and no requests are finished yet, block until a request
 	 * becomes available */

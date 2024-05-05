@@ -77,6 +77,10 @@ struct IOUringCtx final
 	/* Request processing */
 	unsigned req_in_flight = 0;
 
+	/* Requests for which sqes have been allocated already but which are not
+	 * submitted yet. */
+	unsigned outstanding_reqs = 0;
+
 	/* Request list */
 	open_list<IOUring::complete_cb_t> req_list;
 
@@ -213,23 +217,32 @@ struct IOUringCtx final
 		auto head = load_acquire(sq_ring.head);
 		auto tail = *sq_ring.tail;
 
-		if (tail - head >= *sq_ring.ring_entries)
+		if ((tail - head) + outstanding_reqs >= *sq_ring.ring_entries)
 			throw runtime_error("sq ring full");
 
-		return &ptr_sqes[tail & sq_ring_mask];
+		auto sqe = &ptr_sqes[(tail + outstanding_reqs) & sq_ring_mask];
+		outstanding_reqs++;
+
+		return sqe;
 	}
 
 	void submit()
 	{
-		req_in_flight++;
+		if (outstanding_reqs == 0)
+			return;
+
+		req_in_flight += outstanding_reqs;
 
 		auto tail = *sq_ring.tail;
-		tail++;
+		tail += outstanding_reqs;
 		store_release(sq_ring.tail, tail);
 
 		check_syscall(
-				syscall(__NR_io_uring_enter, ufd.get_fd(), 1, 0, 0, nullptr, 0),
+				syscall(__NR_io_uring_enter, ufd.get_fd(),
+					outstanding_reqs, 0, 0, nullptr, 0),
 				"io_uring_enter");
+
+		outstanding_reqs = 0;
 	}
 };
 
@@ -255,22 +268,16 @@ void IOUring::submit_poll(int fd, short events, complete_cb_t cb)
 	auto n = new open_list<complete_cb_t>::node();
 	n->elem = cb;
 
+	/* NOTE: There is no point in deleting this list entry if submission fails,
+	 * because the SQE will be on the ring, anyway. A more sofisticated error
+	 * recovery strategy would be required. */
 	sqe->user_data = (uintptr_t) n;
-
-	try
-	{
-		ctx->submit();
-	}
-	catch (...)
-	{
-		delete n;
-		throw;
-	}
-
 	ctx->req_list.add(n);
+
+	ctx->submit();
 }
 
-void IOUring::submit_writev(int fd, const struct iovec *iov, int iovcnt,
+void IOUring::queue_writev(int fd, const struct iovec *iov, int iovcnt,
 		off_t offset, int flags, complete_cb_t cb)
 {
 	auto sqe = ctx->next_sqe();
@@ -287,18 +294,12 @@ void IOUring::submit_writev(int fd, const struct iovec *iov, int iovcnt,
 	n->elem = cb;
 
 	sqe->user_data = (uintptr_t) n;
-
-	try
-	{
-		ctx->submit();
-	}
-	catch (...)
-	{
-		delete n;
-		throw;
-	}
-
 	ctx->req_list.add(n);
+}
+
+void IOUring::submit()
+{
+	ctx->submit();
 }
 
 void IOUring::process_requests(bool block)

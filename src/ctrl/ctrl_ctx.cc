@@ -951,6 +951,8 @@ void ctrl_ctx::on_client_writev_finished(shared_ptr<ctrl_client> client, int res
 {
 	auto prof = profiler_get("on_client_writev_finished");
 
+	io_uring_req_in_flight--;
+
 	if (res < 0)
 	{
 		remove_client(client);
@@ -958,26 +960,60 @@ void ctrl_ctx::on_client_writev_finished(shared_ptr<ctrl_client> client, int res
 	}
 
 	client->send_msg_pos += res;
+
+	/* Remove all messages that have been sent */
 	auto qmsg = &client->send_queue.front();
 
-	if (client->send_msg_pos == qmsg->msg_len)
+	while (client->send_msg_pos >= qmsg->msg_len)
 	{
 		qmsg->return_buffer(buf_pool_req);
-		client->send_queue.pop();
-		client->send_msg_pos = 0;
+		client->send_queue.pop_front();
+		client->send_msg_pos -= qmsg->msg_len;
 
 		if (client->send_queue.empty())
+		{
+			if (client->send_msg_pos != 0)
+				throw runtime_error("send_msg_pos should be 0 on empty queue");
+
 			return;
+		}
 
 		qmsg = &client->send_queue.front();
 	}
 
-	qmsg->update_iovec(client->send_msg_pos);
-	io_uring.submit_writev(
+	/* Submit messages on queue */
+	if (io_uring_req_in_flight >= io_uring_max_req_in_flight)
+		return;
+
+	unsigned cnt_msgs = 0;
+	auto iq = client->send_queue.begin();
+
+	auto offset = client->send_msg_pos;
+
+	for (;
+			cnt_msgs < sizeof(client->send_iovs) / sizeof(client->send_iovs[0]) &&
+				iq != client->send_queue.end();
+			cnt_msgs++, iq++)
+	{
+		if (offset >= iq->msg_len)
+			throw runtime_error("offset > iq->msg_len()");
+
+		auto& iov = client->send_iovs[cnt_msgs];
+		iov.iov_base = (char*) iq->buf_ptr() + offset;
+		iov.iov_len = iq->msg_len - offset;
+
+		offset = 0;
+	}
+
+	io_uring.queue_writev(
 			client->get_fd(),
-			&client->send_queue.front().iov, 1, -1,
+			client->send_iovs, cnt_msgs, -1,
 			0,
 			bind_front(&ctrl_ctx::on_client_writev_finished, this, client));
+
+	io_uring.submit();
+
+	io_uring_req_in_flight++;
 }
 
 bool ctrl_ctx::process_client_message(
@@ -1625,18 +1661,23 @@ bool ctrl_ctx::send_message_to_client(shared_ptr<ctrl_client> client,
 		throw invalid_argument("msg_len must fit into an integer");
 
 	auto was_empty = client->send_queue.empty();
-	client->send_queue.emplace(move(buf), msg_len);
+	client->send_queue.emplace_back(move(buf), msg_len);
 
-	/* TODO: what if io_uring is completely full? */
-	if (was_empty)
+	/* TODO: what to do in the other case... */
+	if (was_empty && io_uring_req_in_flight < io_uring_max_req_in_flight)
 	{
-		// epoll.change_events(client->get_fd(), EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP);
+		auto& qmsg = client->send_queue.front();
+		client->send_iovs[0].iov_base = (char*) qmsg.buf_ptr();
+		client->send_iovs[0].iov_len = qmsg.msg_len;
 
-		io_uring.submit_writev(
+		io_uring.queue_writev(
 				client->get_fd(),
-				&client->send_queue.front().iov, 1, -1,
+				client->send_iovs, 1, -1,
 				0,
 				bind_front(&ctrl_ctx::on_client_writev_finished, this, client));
+
+		io_uring.submit();
+		io_uring_req_in_flight++;
 	}
 
 	return false;

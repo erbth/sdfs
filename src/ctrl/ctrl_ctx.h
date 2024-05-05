@@ -5,6 +5,7 @@
 #include <map>
 #include <optional>
 #include <queue>
+#include <deque>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -316,15 +317,11 @@ struct ctrl_queued_msg final
 	std::variant<dynamic_buffer, dynamic_aligned_buffer> vbuf;
 	const size_t msg_len;
 
-	/* For use with io_uring */
-	struct iovec iov{};
-
 	inline ctrl_queued_msg(
 			std::variant<dynamic_buffer, dynamic_aligned_buffer>&& vbuf,
 			size_t msg_len)
 		: vbuf(std::move(vbuf)), msg_len(msg_len)
 	{
-		update_iovec(0);
 	}
 
 	inline const char* buf_ptr()
@@ -339,12 +336,6 @@ struct ctrl_queued_msg final
 	{
 		if (std::holds_alternative<dynamic_aligned_buffer>(vbuf))
 			pool.return_buffer(std::move(std::get<dynamic_aligned_buffer>(vbuf)));
-	}
-
-	inline void update_iovec(size_t offset)
-	{
-		iov.iov_base = (char*) (buf_ptr() + offset);
-		iov.iov_len = msg_len - offset;
 	}
 };
 
@@ -400,8 +391,12 @@ struct ctrl_client final
 	size_t rd_buf_pos = 0;
 
 	/* Send messages */
-	std::queue<ctrl_queued_msg> send_queue;
+	std::deque<ctrl_queued_msg> send_queue;
 	size_t send_msg_pos = 0;
+	struct iovec send_iovs[32]{};
+
+	/* At least one message on the queue has been submitted to io_uring */
+	bool send_msg_submitted = false;
 
 	inline int get_fd()
 	{
@@ -424,7 +419,7 @@ protected:
 		std::bind_front(&ctrl_ctx::on_signal, this)};
 
 	/* NOTE: Epoll comes before because IOUring polls epoll's filedescriptor */
-	const unsigned io_uring_max_req_in_flight = 120;
+	const unsigned io_uring_max_req_in_flight = 250;
 	IOUring io_uring{next_power_of_two(io_uring_max_req_in_flight + 1)};
 
 	unsigned io_uring_req_in_flight = 0;
