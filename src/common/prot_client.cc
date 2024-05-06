@@ -196,6 +196,47 @@ namespace req
 	}
 
 
+	write::write()
+		: msg(WRITE)
+	{
+	}
+
+	size_t write::serialize(char* buf) const
+	{
+		size_t size = 16 + msg_size_base;
+
+		if (buf)
+		{
+			swrite_u32(buf, size + this->size - 4);
+			swrite_u32(buf, num);
+			swrite_u64(buf, req_id);
+
+			swrite_u64(buf, node_id);
+			swrite_u64(buf, offset);
+			swrite_u64(buf, this->size);
+		}
+
+		return size;
+	}
+
+	void write::parse(const char* buf, size_t size)
+	{
+		if (size < 12 + msg_size_base)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(buf);
+
+		node_id = sread_u64(buf);
+		offset = sread_u64(buf);
+		this->size = sread_u64(buf);
+
+		if (this->size + msg_size_base + 12 != size)
+			throw invalid_msg_size(num, size);
+
+		data = buf;
+	}
+
+
 	unique_ptr<msg> parse(const char* buf, size_t size)
 	{
 		if (size < 4)
@@ -235,6 +276,13 @@ namespace req
 			case READ:
 			{
 				auto msg = make_unique<read>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			case WRITE:
+			{
+				auto msg = make_unique<write>();
 				msg->parse(buf, size);
 				return msg;
 			}
@@ -494,6 +542,43 @@ namespace reply
 	}
 
 
+	write::write()
+		: msg(WRITE)
+	{
+	}
+
+	write::write(uint64_t req_id, int res)
+		: msg(WRITE, req_id), res(res)
+	{
+	}
+
+	size_t write::serialize(char* buf) const
+	{
+		size_t size = 16 + msg_size;
+
+		if (buf)
+		{
+			swrite_u32(buf, size - 4);
+			swrite_u32(buf, num);
+			swrite_u64(buf, req_id);
+
+			swrite_i32(buf, res);
+		}
+
+		return size;
+	}
+
+	void write::parse(const char* buf, size_t size)
+	{
+		if (size != 12 + msg_size)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(buf);
+
+		res = sread_i32(buf);
+	}
+
+
 	unique_ptr<msg> parse(const char* buf, size_t size)
 	{
 		if (size < 4)
@@ -533,6 +618,13 @@ namespace reply
 			case READ:
 			{
 				auto msg = make_unique<read>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			case WRITE:
+			{
+				auto msg = make_unique<write>();
 				msg->parse(buf, size);
 				return msg;
 			}

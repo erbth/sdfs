@@ -66,7 +66,7 @@ protected:
 		.getattr = _op_getattr,
 		.open = _op_open,
 		.read = _op_read,
-		//.write = _op_write,
+		.write = _op_write,
 		.release = _op_release,
 		.readdir = _op_readdir,
 		.statfs = _op_statfs,
@@ -91,6 +91,9 @@ protected:
 
 	void cb_read(fuse_req_t req, fuse_ino_t ino, open_list<file_ctx>::node* fn,
 			prot::client::reply::read& msg);
+
+	void cb_write(fuse_req_t req, fuse_ino_t ino, size_t size, open_list<file_ctx>::node* fn,
+			prot::client::reply::write& msg);
 
 	/* File handling */
 	open_list<file_ctx> open_files;

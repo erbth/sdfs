@@ -12,7 +12,8 @@ enum error_code : int
 	NOTDIR,
 	NOSPC,
 	NAMETOOLONG,
-	ISDIR
+	ISDIR,
+	NXIO
 };
 };
 

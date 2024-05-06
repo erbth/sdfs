@@ -330,6 +330,12 @@ bool dd_ctx::process_client_message(shared_ptr<dd_client> client,
 					client,
 					static_cast<prot::dd::req::read&>(*msg));
 
+		case prot::dd::req::WRITE:
+			return process_client_message(
+					client,
+					static_cast<prot::dd::req::write&>(*msg),
+					move(bp_ret.buf));
+
 		default:
 			fprintf(stderr, "protocol violation\n");
 			return true;
@@ -349,21 +355,213 @@ bool dd_ctx::process_client_message(shared_ptr<dd_client> client,
 	return send_message_to_client(client, reply);
 }
 
+/* READ */
 bool dd_ctx::process_client_message(shared_ptr<dd_client> client,
 		const prot::dd::req::read& msg)
 {
-	auto header_size = prot::dd::reply::read().serialize(nullptr);
-	auto buf = buf_pool_client.get_buffer(header_size + msg.length);
+	/* Check parameters */
+	if (
+			msg.length > MAX_IO_REQ_SIZE ||
+			msg.length == 0 ||
+			msg.offset + msg.length > di.usable_size())
+	{
+		return send_message_to_client(
+				client,
+				prot::dd::reply::read(msg.request_id, err::INVAL));
+	}
+
+	/* Submit IO */
+	auto qe = get_free_io_queue_entry();
+	if (!qe)
+		throw runtime_error("IO queue full");
+
+	qe->client = client;
+	qe->client_request_id = msg.request_id;
+
+	qe->offset = msg.offset;
+	qe->length = msg.length;
+	qe->req_offset = 0;
+	qe->update_io_params();
+
+
+	io_uring.queue_readv(wfd.get_fd(), &qe->iov, 1, qe->io_offset, 0,
+			bind_front(&dd_ctx::on_read_io_finished, this, qe));
+
+	io_uring.submit();
+
+	return false;
+}
+
+void dd_ctx::on_read_io_finished(disk_io_req* qe, int res)
+{
+	if (res <= 0)
+	{
+		send_message_to_client(
+				qe->client,
+				prot::dd::reply::read(qe->client_request_id, err::IO));
+
+		return_io_queue_entry(qe);
+		return;
+	}
+
+	qe->req_offset += res;
+
+	if (qe->req_offset < qe->io_length)
+	{
+		qe->update_io_params();
+
+		io_uring.queue_readv(wfd.get_fd(), &qe->iov, 1,
+				qe->io_offset + qe->req_offset, 0,
+				bind_front(&dd_ctx::on_read_io_finished, this, qe));
+
+		io_uring.submit();
+
+		return;
+	}
+
 
 	/* Add message header */
-	prot::dd::reply::read reply(msg.request_id, err::SUCCESS);
-	reply.data_length = msg.length;
-	auto reply_size = reply.serialize(buf.ptr()) + msg.length;
+	prot::dd::reply::read reply(qe->client_request_id, err::SUCCESS);
+	reply.data_length = qe->length;
+	int header_size = reply.serialize(nullptr);
+	if (header_size > 4096)
+		throw runtime_error("reply header too large");
 
-	memset(buf.ptr() + header_size, 'a', msg.length);
+	qe->base_for_send = qe->buf.ptr() + (4096 - header_size) + (qe->offset - qe->io_offset);
+	qe->length_for_send = reply.serialize(qe->base_for_send) + qe->length;
 
 	/* Return data to client */
-	return send_message_to_client(client, move(buf), reply_size);
+	send_message_to_client(qe);
+}
+
+
+bool dd_ctx::process_client_message(shared_ptr<dd_client> client,
+		const prot::dd::req::write& msg, dynamic_aligned_buffer&& buf)
+{
+	/* Check parameters */
+	if (
+			msg.length > MAX_IO_REQ_SIZE ||
+			msg.length == 0 ||
+			msg.offset + msg.length > di.usable_size())
+	{
+		buf_pool_client.return_buffer(move(buf));
+		return send_message_to_client(
+				client,
+				prot::dd::reply::write(msg.request_id, err::INVAL));
+	}
+
+	/* If this is an unaligned write, read the corresponding region first */
+	auto qe = get_free_io_queue_entry();
+	if (!qe)
+		throw runtime_error("IO queue full");
+
+	qe->client = client;
+	qe->client_request_id = msg.request_id;
+	qe->wr_buf = move(buf);
+	qe->wr_base = msg.data;
+
+	qe->offset = msg.offset;
+	qe->length = msg.length;
+	qe->req_offset = 0;
+	qe->update_io_params();
+
+	if (qe->io_offset != qe->offset || qe->io_length != qe->length)
+	{
+		/* Read the corresponding region */
+		io_uring.queue_readv(wfd.get_fd(), &qe->iov, 1, qe->io_offset, 0,
+				bind_front(&dd_ctx::on_write_read_finished, this, qe));
+
+		io_uring.submit();
+	}
+	else
+	{
+		/* Directly write data */
+		write_req_write(qe);
+	}
+
+	return false;
+}
+
+void dd_ctx::on_write_read_finished(disk_io_req* qe, int res)
+{
+	if (res <= 0)
+	{
+		send_message_to_client(
+				qe->client,
+				prot::dd::reply::write(qe->client_request_id, err::IO));
+
+		buf_pool_client.return_buffer(move(qe->wr_buf));
+		return_io_queue_entry(qe);
+		return;
+	}
+
+	qe->req_offset += res;
+
+	if (qe->req_offset < qe->io_length)
+	{
+		qe->update_io_params();
+
+		io_uring.queue_readv(wfd.get_fd(), &qe->iov, 1,
+				qe->io_offset + qe->req_offset, 0,
+				bind_front(&dd_ctx::on_write_read_finished, this, qe));
+
+		io_uring.submit();
+
+		return;
+	}
+
+	/* Write data */
+	qe->req_offset = 0;
+	qe->update_io_params();
+	write_req_write(qe);
+}
+
+void dd_ctx::write_req_write(disk_io_req* qe)
+{
+	/* Copy data into IO buffer */
+	memcpy((char*) qe->iov.iov_base + (qe->offset - qe->io_offset), qe->wr_base, qe->length);
+	qe->wr_base = nullptr;
+	buf_pool_client.return_buffer(move(qe->wr_buf));
+
+	/* Submit write */
+	io_uring.queue_writev(wfd.get_fd(), &qe->iov, 1, qe->io_offset, 0,
+			bind_front(&dd_ctx::on_write_io_finished, this, qe));
+
+	io_uring.submit();
+}
+
+void dd_ctx::on_write_io_finished(disk_io_req* qe, int res)
+{
+	if (res <= 0)
+	{
+		send_message_to_client(
+				qe->client,
+				prot::dd::reply::write(qe->client_request_id, err::IO));
+
+		return_io_queue_entry(qe);
+		return;
+	}
+
+	qe->req_offset += res;
+	if (qe->req_offset < qe->io_length)
+	{
+		qe->update_io_params();
+
+		io_uring.queue_writev(wfd.get_fd(), &qe->iov, 1,
+				qe->io_offset + qe->req_offset, 0,
+				bind_front(&dd_ctx::on_write_io_finished, this, qe));
+
+		io_uring.submit();
+
+		return;
+	}
+
+	/* Notify client */
+	send_message_to_client(
+			qe->client,
+			prot::dd::reply::write(qe->client_request_id, err::SUCCESS));
+
+	return_io_queue_entry(qe);
 }
 
 
@@ -382,12 +580,70 @@ bool dd_ctx::send_message_to_client(shared_ptr<dd_client> client,
 		return true;
 
 	auto was_empty = client->send_queue.empty();
-	client->send_queue.emplace(move(buf), msg_len);
+
+	if (holds_alternative<dynamic_buffer>(buf))
+		client->send_queue.emplace(move(get<dynamic_buffer>(buf)), msg_len);
+	else
+		client->send_queue.emplace(move(get<dynamic_aligned_buffer>(buf)), msg_len);
 
 	if (was_empty)
 		epoll.change_events(client->get_fd(), EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP);
 
 	return false;
+}
+
+bool dd_ctx::send_message_to_client(disk_io_req* qe)
+{
+	auto client = qe->client;
+
+	if (client->invalid)
+		return true;
+
+	auto was_empty = client->send_queue.empty();
+
+	/* qe->req_offset is the negative header size */
+	auto msg_len = qe->length_for_send;
+	client->send_queue.emplace(move(qe), msg_len);
+
+	if (was_empty)
+		epoll.change_events(client->get_fd(), EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP);
+
+	return false;
+}
+
+
+disk_io_req* dd_ctx::get_free_io_queue_entry()
+{
+	for (auto& qe : io_queue)
+	{
+		if (!qe.active)
+		{
+			qe.active = true;
+			return &qe;
+		}
+	}
+
+	return nullptr;
+}
+
+void dd_ctx::return_io_queue_entry(disk_io_req* qe)
+{
+	qe->offset = 0;
+	qe->length = 0;
+	qe->io_offset = 0;
+	qe->io_length = 0;
+	qe->req_offset = 0;
+	qe->update_io_params();
+
+	qe->client = nullptr;
+	qe->client_request_id = 0;
+	qe->base_for_send = nullptr;
+	qe->length_for_send = 0;
+
+	qe->wr_buf = dynamic_aligned_buffer();
+	qe->wr_base = nullptr;
+
+	qe->active = false;
 }
 
 
@@ -410,4 +666,21 @@ void dd_ctx::main()
 
 	while (!quit_requested)
 		io_uring.process_requests(true);
+}
+
+
+const char* dd_queued_msg::buf_ptr()
+{
+	if (std::holds_alternative<dynamic_buffer>(vbuf))
+		return std::get<dynamic_buffer>(vbuf).ptr();
+	else if (std::holds_alternative<dynamic_aligned_buffer>(vbuf))
+		return std::get<dynamic_aligned_buffer>(vbuf).ptr();
+	else
+		return std::get<disk_io_req*>(vbuf)->base_for_send;
+}
+
+dd_queued_msg::~dd_queued_msg()
+{
+	if (holds_alternative<disk_io_req*>(vbuf))
+		dd_ctx::return_io_queue_entry(get<disk_io_req*>(vbuf));
 }

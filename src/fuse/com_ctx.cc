@@ -406,6 +406,11 @@ bool com_ctx::process_message(
 					ctrl,
 					static_cast<prot::client::reply::read&>(*msg));
 
+		case prot::client::reply::WRITE:
+			return process_message(
+					ctrl,
+					static_cast<prot::client::reply::write&>(*msg));
+
 		default:
 			fprintf(stderr, "protocol violation\n");
 			return true;
@@ -467,13 +472,27 @@ bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::read& msg)
 	return false;
 }
 
+bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::write& msg)
+{
+	/* Find corresponding request */
+	auto& req = find_req_for_reply(ctrl, msg);
+	req.cb_write(msg);
+	finish_req(ctrl, req);
+	return false;
+}
 
-bool com_ctx::send_message(com_ctrl* ctrl, const prot::msg& msg)
+
+bool com_ctx::send_message(com_ctrl* ctrl, const prot::msg& msg,
+		const char* data, size_t data_length)
 {
 	dynamic_buffer buf;
-	buf.ensure_size(msg.serialize(nullptr));
-	auto msg_len = msg.serialize(buf.ptr());
-	return send_message(ctrl, move(buf), msg_len);
+	buf.ensure_size(msg.serialize(nullptr) + data_length);
+	auto hdr_len = msg.serialize(buf.ptr());
+
+	if (data_length > 0)
+		memcpy(buf.ptr() + hdr_len, data, data_length);
+
+	return send_message(ctrl, move(buf), hdr_len + data_length);
 }
 
 bool com_ctx::send_message(com_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len)
@@ -587,4 +606,25 @@ void com_ctx::request_read(unsigned long node_id, size_t offset, size_t size,
 
 	add_req(ctrl, req);
 	send_message(ctrl, msg);
+}
+
+void com_ctx::request_write(unsigned long node_id, size_t offset, size_t size,
+		const char* buf, req_cb_write_t cb)
+{
+	unique_lock lk(m);
+	request_t req{};
+
+	auto ctrl = choose_ctrl();
+	ctrl->set_req_id(req);
+
+	req.cb_write = cb;
+
+	prot::client::req::write msg;
+	msg.req_id = req.id;
+	msg.node_id = node_id;
+	msg.offset = offset;
+	msg.size = size;
+
+	add_req(ctrl, req);
+	send_message(ctrl, msg, buf, size);
 }

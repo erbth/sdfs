@@ -179,6 +179,14 @@ struct inode_allocator_lock_request_t
 };
 typedef lock_witness<inode_allocator_lock_request_t> inode_allocator_lock_witness;
 
+struct block_allocator_lock_request_t
+{
+	using cb_acquired_t = std::function<void(block_allocator_lock_request_t&)>;
+
+	cb_acquired_t cb_acquired;
+};
+typedef lock_witness<block_allocator_lock_request_t> block_allocator_lock_witness;
+
 
 struct get_inode_request_t final
 {
@@ -231,6 +239,22 @@ struct inode_directory_t
 	size_t allocated_count = 0;
 };
 
+struct block_allocator_t
+{
+	/* Block allocator lock */
+	bool locked = false;
+	std::list<block_allocator_lock_request_t> lock_reqs;
+
+	/* Allocation bitmap */
+	fixed_aligned_buffer _buffer;
+	uint8_t* bitmap = nullptr;
+
+	/* true if the cached bitmap differs from the version stored on dd */
+	bool dirty = false;
+
+	size_t allocated_count = 0;
+};
+
 
 /* Contexts for dd IO */
 struct dd_read_request_t
@@ -248,6 +272,20 @@ struct dd_read_request_t
 
 	/* The data is stored somewhere in this buffer */
 	dynamic_aligned_buffer _buf;
+};
+
+struct dd_write_request_t
+{
+	using cb_completed_t = std::function<void(dd_write_request_t&&)>;
+
+	ctrl_dd* dd;
+	size_t offset;
+	size_t size;
+	const char* data = nullptr;
+	cb_completed_t cb_completed;
+
+	/* Will be filled by dd_write */
+	int result = -1;
 };
 
 
@@ -311,6 +349,43 @@ struct ctx_c_r_read
 	}
 };
 
+struct ctx_c_r_write
+{
+	std::shared_ptr<ctrl_client> client;
+	prot::client::req::write msg;
+	dynamic_buffer _buf;
+
+	unsigned long long t_start;
+
+	inode_lock_witness ilck;
+	std::shared_ptr<inode> node;
+
+	size_t allocated_size{};
+
+	struct block_t
+	{
+		size_t offset;
+		size_t size;
+
+		ctrl_dd* dd;
+		size_t dd_offset;
+
+		bool completed = false;
+		int result = -1;
+
+		inline block_t(size_t offset, size_t size, ctrl_dd* dd, size_t dd_offset)
+			: offset(offset), size(size), dd(dd), dd_offset(dd_offset)
+		{
+		}
+	};
+	std::vector<block_t> blocks;
+
+	inline ctx_c_r_write(const prot::client::req::write& msg)
+		: msg(msg)
+	{
+	}
+};
+
 
 struct ctrl_queued_msg final
 {
@@ -364,6 +439,7 @@ struct ctrl_dd final
 
 	/* Outstanding requests */
 	std::map<uint64_t, dd_read_request_t> read_reqs;
+	std::map<uint64_t, dd_write_request_t> write_reqs;
 
 
 	/* Metadata offsets */
@@ -437,6 +513,9 @@ protected:
 	/* inode directory */
 	inode_directory_t inode_directory;
 
+	/* Block allocator */
+	block_allocator_t block_allocator;
+
 	/* Request id generator */
 	uint64_t next_request_id = 0;
 	uint64_t get_request_id();
@@ -449,6 +528,7 @@ protected:
 
 	/* Statistics */
 	size_t client_req_cnt_read = 0;
+	size_t client_req_cnt_write = 0;
 
 
 	/* Internal operations */
@@ -458,6 +538,15 @@ protected:
 
 	void lock_inode_allocator(inode_allocator_lock_request_t&);
 	void unlock_inode_allocator(inode_allocator_lock_request_t&);
+
+	void lock_block_allocator(block_allocator_lock_request_t&);
+	void unlock_block_allocator(block_allocator_lock_request_t&);
+
+	/* Blocks */
+	/* Returns -1 if not that many consecutive blocks are available, or the
+	 * index to the region. Must be called with a lock on the block allocator.
+	 * */
+	ssize_t get_free_blocks(size_t count);
 
 	/* Inodes */
 	void get_inode(get_inode_request_t&&);
@@ -477,6 +566,7 @@ protected:
 
 	/* dd IO interface */
 	void dd_read(dd_read_request_t&& req);
+	void dd_write(dd_write_request_t&& req);
 
 
 	/* Be careful when calling these functions */
@@ -493,6 +583,7 @@ protected:
 	void initialize_client_listener();
 
 	void build_data_map();
+	void initialize_block_allocator();
 	void initialize_inode_directory();
 	void initialize_root_directory();
 
@@ -509,8 +600,11 @@ protected:
 
 	bool process_dd_message(ctrl_dd& dd, dynamic_aligned_buffer&& buf, size_t msg_len);
 	bool process_dd_message(ctrl_dd& dd, prot::dd::reply::read& msg, dynamic_aligned_buffer&& buf);
+	bool process_dd_message(ctrl_dd& dd, prot::dd::reply::write& msg);
 
-	bool send_message_to_dd(ctrl_dd& dd, const prot::msg& msg);
+	bool send_message_to_dd(ctrl_dd& dd, const prot::msg& msg,
+			const char* data = nullptr, size_t data_length = 0);
+
 	bool send_message_to_dd(ctrl_dd& dd,
 			std::variant<dynamic_buffer, dynamic_aligned_buffer>&& buf, size_t msg_len);
 
@@ -521,6 +615,8 @@ protected:
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::readdir& msg);
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::create& msg);
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::read& msg);
+	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::write& msg,
+			dynamic_buffer&& buf);
 
 	bool send_message_to_client(std::shared_ptr<ctrl_client> client, const prot::msg& msg);
 	bool send_message_to_client(std::shared_ptr<ctrl_client> client,
@@ -545,6 +641,12 @@ protected:
 	void cb_c_r_read_ilock(std::shared_ptr<ctx_c_r_read> rctx, inode_lock_request_t& ilck);
 	void cb_c_r_read_getnode(std::shared_ptr<ctx_c_r_read> rctx, get_inode_request_t&& ireq);
 	void cb_c_r_read_dd(std::shared_ptr<ctx_c_r_read> rctx, size_t bi, dd_read_request_t&& req);
+
+	void cb_c_r_write_ilock(std::shared_ptr<ctx_c_r_write> rctx, inode_lock_request_t& ilck);
+	void cb_c_r_write_getnode(std::shared_ptr<ctx_c_r_write> rctx, get_inode_request_t&& ireq);
+	void cb_c_r_write_balloc(std::shared_ptr<ctx_c_r_write> rctx, block_allocator_lock_request_t& blck);
+	void cb_c_r_write_write(std::shared_ptr<ctx_c_r_write> rctx);
+	void cb_c_r_write_dd(std::shared_ptr<ctx_c_r_write> rctx, size_t bi, dd_write_request_t&& req);
 
 
 public:

@@ -449,6 +449,7 @@ void ctrl_ctx::initialize()
 
 	/* Build data map and initialize inode directory */
 	build_data_map();
+	initialize_block_allocator();
 	initialize_inode_directory();
 	initialize_root_directory();
 
@@ -528,6 +529,31 @@ void ctrl_ctx::build_data_map()
 	sort(dmap.dd_rr_order.begin(), dmap.dd_rr_order.end(), [](auto a, auto b) {
 			return a->id < b->id;
 	});
+}
+
+
+void ctrl_ctx::initialize_block_allocator()
+{
+	block_allocator._buffer = fixed_aligned_buffer(
+			4096, data_map.allocation_bitmap_size);
+
+	block_allocator.bitmap = (uint8_t*) block_allocator._buffer.ptr();
+
+	memset(block_allocator.bitmap, 0, data_map.allocation_bitmap_size);
+
+	/* Read block allocation bitmap from first dd if valid */
+	/* TODO */
+
+	/* Initialize allocated block count */
+	block_allocator.allocated_count = 0;
+	for (size_t i = 0; i < data_map.allocation_bitmap_size * 8; i++)
+	{
+		auto off = i / 8;
+		auto mask = 1 << (i % 8);
+
+		if (block_allocator.bitmap[off] & mask)
+			block_allocator.allocated_count++;
+	}
 }
 
 
@@ -751,13 +777,14 @@ void ctrl_ctx::on_dd_fd(ctrl_dd* dd, int fd, uint32_t events)
 }
 
 bool ctrl_ctx::process_dd_message(
-		ctrl_dd& dd, dynamic_aligned_buffer&& buf, size_t msg_len)
+		ctrl_dd& dd, dynamic_aligned_buffer&& _buf, size_t msg_len)
 {
+	buffer_pool_returner bp_ret(buf_pool_dd_io, move(_buf));
 	unique_ptr<prot::msg> msg;
 
 	try
 	{
-		msg = prot::dd::reply::parse(buf.ptr() + 4, msg_len);
+		msg = prot::dd::reply::parse(bp_ret.buf.ptr() + 4, msg_len);
 	}
 	catch (const prot::exception& e)
 	{
@@ -771,7 +798,12 @@ bool ctrl_ctx::process_dd_message(
 			return process_dd_message(
 					dd,
 					static_cast<prot::dd::reply::read&>(*msg),
-					move(buf));
+					move(bp_ret.buf));
+
+		case prot::dd::reply::WRITE:
+			return process_dd_message(
+					dd,
+					static_cast<prot::dd::reply::write&>(*msg));
 
 		default:
 			fprintf(stderr, "dd io: protocol violation\n");
@@ -787,6 +819,7 @@ bool ctrl_ctx::process_dd_message(ctrl_dd& dd, prot::dd::reply::read& msg, dynam
 	{
 		fprintf(stderr, "dd io: received invalid request id\n");
 		buf_pool_dd_io.return_buffer(move(buf));
+		return true;
 	}
 
 	/* Complete request */
@@ -806,13 +839,40 @@ bool ctrl_ctx::process_dd_message(ctrl_dd& dd, prot::dd::reply::read& msg, dynam
 	return false;
 }
 
+bool ctrl_ctx::process_dd_message(ctrl_dd& dd, prot::dd::reply::write& msg)
+{
+	/* Find request */
+	auto i_req = dd.write_reqs.find(msg.request_id);
+	if (i_req == dd.write_reqs.end())
+	{
+		fprintf(stderr, "dd io: received invalid request id\n");
+		return true;
+	}
 
-bool ctrl_ctx::send_message_to_dd(ctrl_dd& dd, const prot::msg& msg)
+	/* Complete request */
+	auto req = move(i_req->second);
+	dd.write_reqs.erase(i_req);
+
+	req.result = msg.res;
+
+	auto cb = req.cb_completed;
+	cb(move(req));
+
+	return false;
+}
+
+
+bool ctrl_ctx::send_message_to_dd(ctrl_dd& dd, const prot::msg& msg,
+		const char* data, size_t data_length)
 {
 	dynamic_buffer buf;
-	buf.ensure_size(msg.serialize(nullptr));
-	auto msg_len = msg.serialize(buf.ptr());
-	return send_message_to_dd(dd, move(buf), msg_len);
+	buf.ensure_size(msg.serialize(nullptr) + data_length);
+	auto hdr_len = msg.serialize(buf.ptr());
+
+	if (data_length > 0)
+		memcpy(buf.ptr() + hdr_len, data, data_length);
+
+	return send_message_to_dd(dd, move(buf), hdr_len + data_length);
 }
 
 bool ctrl_ctx::send_message_to_dd(ctrl_dd& dd,
@@ -1060,6 +1120,12 @@ bool ctrl_ctx::process_client_message(
 					client,
 					static_cast<prot::client::req::read&>(*msg));
 
+		case prot::client::req::WRITE:
+			return process_client_message(
+					client,
+					static_cast<prot::client::req::write&>(*msg),
+					move(buf));
+
 		default:
 			fprintf(stderr, "client io: protocol violation\n");
 			return true;
@@ -1073,9 +1139,8 @@ bool ctrl_ctx::process_client_message(
 
 	reply.req_id = msg.req_id;
 
-	/* TODO */
 	reply.size_total = data_map.total_data_size;
-	reply.size_used = 0;
+	reply.size_used = block_allocator.allocated_count * data_map.allocation_granularity;
 
 	reply.inodes_total = data_map.total_inode_count;
 	reply.inodes_used = inode_directory.allocated_count;
@@ -1339,8 +1404,7 @@ void ctrl_ctx::cb_c_r_create_ilock(shared_ptr<ctx_c_r_create> rctx, inode_lock_r
 	rctx->node->type = inode::TYPE_FILE;
 	rctx->node->nlink = 1;
 	rctx->node->mtime = get_wt_now();
-	rctx->node->size = 100ULL * 1024 * 1024 * 1024;
-	rctx->node->allocations.emplace_back(0, 100ULL * 1024 * 1024 * 1024);
+	rctx->node->size = 0;
 
 	/* Lock parent inode w */
 	inode_lock_request_t req;
@@ -1444,8 +1508,8 @@ bool ctrl_ctx::process_client_message(
 	// printf("read %d bytes\n", (int) msg.size);
 
 	client_req_cnt_read++;
-	if ((client_req_cnt_read % 2000) == 0)
-		profiler_list(client_req_cnt_read);
+	// if ((client_req_cnt_read % 2000) == 0)
+	// 	profiler_list(client_req_cnt_read);
 
 	if (msg.node_id == 0)
 	{
@@ -1491,7 +1555,7 @@ void ctrl_ctx::cb_c_r_read_getnode(shared_ptr<ctx_c_r_read> rctx, get_inode_requ
 	{
 		send_message_to_client(
 				rctx->client,
-				prot::client::reply::create(rctx->msg.req_id, ireq.result));
+				prot::client::reply::read(rctx->msg.req_id, ireq.result));
 		return;
 	}
 
@@ -1499,7 +1563,7 @@ void ctrl_ctx::cb_c_r_read_getnode(shared_ptr<ctx_c_r_read> rctx, get_inode_requ
 	{
 		send_message_to_client(
 				rctx->client,
-				prot::client::reply::create(rctx->msg.req_id, err::ISDIR));
+				prot::client::reply::read(rctx->msg.req_id, err::ISDIR));
 		return;
 	}
 
@@ -1523,7 +1587,7 @@ void ctrl_ctx::cb_c_r_read_getnode(shared_ptr<ctx_c_r_read> rctx, get_inode_requ
 	{
 		auto b_num = b_o / data_map.block_size;
 		auto dd = data_map.dd_rr_order[b_num % data_map.n_dd];
-		auto dd_offset = b_o - b_num * data_map.block_size;
+		auto dd_offset = b_o % data_map.block_size + (b_num / data_map.n_dd) * data_map.block_size;
 		rctx->blocks.emplace_back(b_file_o - rctx->msg.offset, b_s, dd, dd_offset);
 	}
 
@@ -1622,20 +1686,214 @@ void ctrl_ctx::cb_c_r_read_dd(shared_ptr<ctx_c_r_read> rctx, size_t bi,
 }
 
 
-/* Write */
-/* Lock inode w */
-/* Retrieve data map(s) */
-/*   Lock block allocator */
-/*   Get free blocks */
-/*   Unlock block allocator */
-/* Update timestamps and size if required */
-/* Unlock inode w */
-/* Split data */
-/* Write data */
-/* Inform client */
+bool ctrl_ctx::process_client_message(
+		shared_ptr<ctrl_client> client, prot::client::req::write& msg,
+		dynamic_buffer&& buf)
+{
+	/* Write */
+	/* b Lock inode w */
+	/* b Retrieve data map(s) */
+	/* b   Lock block allocator if required */
+	/*     Get free blocks */
+	/*     Unlock block allocator */
+	/*   Update timestamps, size, and data map if required */
+	/*   Split data */
+	/* b Write data */
+	/*   Unlock inode w */
+	/*   Inform client */
+
+	client_req_cnt_write++;
+
+	if (msg.node_id == 0)
+	{
+		return send_message_to_client(
+				client,
+				prot::client::reply::write(msg.req_id, err::INVAL));
+	}
+
+	auto rctx = make_shared<ctx_c_r_write>(msg);
+	rctx->client = client;
+	rctx->t_start = get_monotonic_time();
+	rctx->_buf = move(buf);
+
+	/* Lock inode w */
+	inode_lock_request_t req;
+
+	req.node_id = rctx->msg.node_id;
+	req.write = true;
+	req.cb_acquired = bind_front(&ctrl_ctx::cb_c_r_write_ilock, this, rctx);
+
+	lock_inode(req);
+
+	return false;
+}
+
+void ctrl_ctx::cb_c_r_write_ilock(shared_ptr<ctx_c_r_write> rctx, inode_lock_request_t& ilck)
+{
+	rctx->ilck = inode_lock_witness(bind_front(&ctrl_ctx::unlock_inode, this), ilck);
+
+	/* Retrieve data map(s) */
+	get_inode_request_t req;
+
+	req.node_id = rctx->msg.node_id;
+	req.cb_finished = bind_front(&ctrl_ctx::cb_c_r_write_getnode, this, rctx);
+	get_inode(move(req));
+}
+
+void ctrl_ctx::cb_c_r_write_getnode(shared_ptr<ctx_c_r_write> rctx, get_inode_request_t&& ireq)
+{
+	if (ireq.result != err::SUCCESS)
+	{
+		send_message_to_client(
+				rctx->client,
+				prot::client::reply::write(rctx->msg.req_id, ireq.result));
+		return;
+	}
+
+	if (ireq.node->type != inode::TYPE_FILE)
+	{
+		send_message_to_client(
+				rctx->client,
+				prot::client::reply::write(rctx->msg.req_id, err::ISDIR));
+		return;
+	}
+
+	rctx->node = ireq.node;
 
 
+	/* Determine if new blocks need to be allocated */
+	if (rctx->msg.offset > rctx->node->size + 1)
+	{
+		send_message_to_client(
+				rctx->client,
+				prot::client::reply::write(rctx->msg.req_id, err::NXIO));
+		return;
+	}
 
+	rctx->allocated_size = rctx->node->get_allocated_size();
+
+	if (rctx->msg.offset + rctx->msg.size > rctx->allocated_size)
+	{
+		/* Lock block allocator */
+		block_allocator_lock_request_t req;
+		req.cb_acquired = bind_front(&ctrl_ctx::cb_c_r_write_balloc, this, rctx);
+
+		lock_block_allocator(req);
+	}
+	else
+	{
+		cb_c_r_write_write(rctx);
+	}
+}
+
+void ctrl_ctx::cb_c_r_write_balloc(shared_ptr<ctx_c_r_write> rctx, block_allocator_lock_request_t& blck)
+{
+	block_allocator_lock_witness blckw(bind_front(&ctrl_ctx::unlock_block_allocator, this), blck);
+
+	/* Get free blocks */
+	size_t required_blocks = (((rctx->msg.offset + rctx->msg.size) - rctx->allocated_size) +
+			(data_map.allocation_granularity - 1)) / data_map.allocation_granularity;
+
+	auto start = get_free_blocks(required_blocks);
+	if (start < 0)
+	{
+		send_message_to_client(
+				rctx->client,
+				prot::client::reply::write(rctx->msg.req_id, err::NOSPC));
+		return;
+	}
+
+	/* Update data map */
+	rctx->node->dirty = true;
+
+	auto alloc_start = start * data_map.allocation_granularity;
+	auto alloc_size = required_blocks * data_map.allocation_granularity;
+	bool merged = false;
+
+	if (rctx->node->allocations.size() > 0)
+	{
+		auto& prev_alloc = rctx->node->allocations.back();
+
+		/* Try to merge with previous allocation */
+		if (prev_alloc.offset + prev_alloc.size == alloc_start)
+		{
+			prev_alloc.size += alloc_size;
+			merged = true;
+		}
+	}
+
+	if (!merged)
+		rctx->node->allocations.emplace_back(alloc_start, alloc_size);
+
+	cb_c_r_write_write(rctx);
+}
+
+void ctrl_ctx::cb_c_r_write_write(shared_ptr<ctx_c_r_write> rctx)
+{
+	/* Update timestamps, size */
+	rctx->node->dirty = true;
+	rctx->node->mtime = get_wt_now();
+	rctx->node->size = max(rctx->node->size, rctx->msg.offset + rctx->msg.size);
+
+	/* Map data to dds */
+	for (auto [b_o, b_s, b_file_o] : map_file_region(*(rctx->node), rctx->msg.offset, rctx->msg.size))
+	{
+		auto b_num = b_o / data_map.block_size;
+		auto dd = data_map.dd_rr_order[b_num % data_map.n_dd];
+		auto dd_offset = b_o % data_map.block_size + (b_num / data_map.n_dd) * data_map.block_size;
+		rctx->blocks.emplace_back(b_file_o - rctx->msg.offset, b_s, dd, dd_offset);
+	}
+
+	/* Write data to dds */
+	for (size_t i = 0; i < rctx->blocks.size(); i++)
+	{
+		auto& b = rctx->blocks[i];
+
+		dd_write_request_t req;
+
+		req.dd = b.dd;
+		req.offset = b.dd_offset;
+		req.size = b.size;
+		req.data = rctx->msg.data + b.offset;
+		req.cb_completed = bind_front(&ctrl_ctx::cb_c_r_write_dd, this, rctx, i);
+
+		dd_write(move(req));
+	}
+}
+
+void ctrl_ctx::cb_c_r_write_dd(shared_ptr<ctx_c_r_write> rctx, size_t bi,
+		dd_write_request_t&& req)
+{
+	/* Store result of write request */
+	{
+		auto& b = rctx->blocks[bi];
+		b.result = req.result;
+		b.completed = true;
+	}
+
+	/* Test if all write requests have completed */
+	for (auto& b : rctx->blocks)
+	{
+		if (!b.completed)
+			return;
+	}
+
+	/* Check return codes of individual block write requests */
+	for (auto& b : rctx->blocks)
+	{
+		if (b.result != err::SUCCESS)
+		{
+			send_message_to_client(
+					rctx->client,
+					prot::client::reply::write(rctx->msg.req_id, b.result));
+			return;
+		}
+	}
+
+	/* Inform client (and unlock inode w implicitely after exit) */
+	send_message_to_client(rctx->client,
+			prot::client::reply::write(rctx->msg.req_id, err::SUCCESS));
+}
 
 
 bool ctrl_ctx::send_message_to_client(shared_ptr<ctrl_client> client, const prot::msg& msg)
@@ -1863,6 +2121,96 @@ void ctrl_ctx::unlock_inode_allocator(inode_allocator_lock_request_t& req)
 }
 
 
+void ctrl_ctx::lock_block_allocator(block_allocator_lock_request_t& req)
+{
+	if (!block_allocator.locked)
+	{
+		block_allocator.locked = true;
+
+		/* NOTE: It is very important that unlock_block_allocator can be called
+		 * from this callback.
+		 *
+		 * NOTE: cb_aquired might reference a shared_ptr (partially evaluated
+		 * function) to an object, which might contain a copy of req. This would
+		 * lead to a depenency loop of the shared_ptr. To prevent this and as
+		 * cb_acquired will not be needed anymore after calling it here, pass a
+		 * copy of req to cb_acquired which has cb_acquired set to nullptr. */
+		block_allocator_lock_request_t r2(req);
+		r2.cb_acquired = nullptr;
+
+		auto cb = req.cb_acquired;
+		cb(r2);
+	}
+	else
+	{
+		block_allocator.lock_reqs.push_back(req);
+	}
+}
+
+void ctrl_ctx::unlock_block_allocator(block_allocator_lock_request_t& req)
+{
+	if (!block_allocator.locked)
+		throw invalid_argument("Lock not held");
+
+	block_allocator.locked = false;
+
+	/* Process pending lock requests; Note that the cb_acquired function
+	 * supplied by the lock requester might call unlock_block_allocator, too.
+	 * This leads to recursive invocation of this function. The innermost
+	 * invocation will run its loop as long as possible, and than the outer
+	 * invocations will continue. Hence it is important the check the state of
+	 * the lock after each run and take into account that the lock queue might
+	 * change. */
+	while (!block_allocator.locked &&
+			block_allocator.lock_reqs.size())
+	{
+		block_allocator.locked = true;
+
+		auto r = block_allocator.lock_reqs.front();
+		block_allocator.lock_reqs.pop_front();
+
+		auto cb = r.cb_acquired;
+		r.cb_acquired = nullptr;
+		cb(r);
+	}
+}
+
+
+ssize_t ctrl_ctx::get_free_blocks(size_t count)
+{
+	auto total_blocks = data_map.total_data_size / data_map.allocation_granularity;
+
+	for (size_t i = 0; i < total_blocks - count; i++)
+	{
+		bool found = true;
+
+		for (size_t j = 0; j < count; j++)
+		{
+			auto pos = i + j;
+			if (block_allocator.bitmap[pos / 8] & (1 << (pos % 8)))
+			{
+				found = false;
+				break;
+			}
+		}
+
+		if (found)
+		{
+			for (size_t j = 0; j < count; j++)
+			{
+				auto pos = i + j;
+				block_allocator.bitmap[pos / 8] |= (1 << (pos % 8));
+			}
+
+			block_allocator.allocated_count += count;
+			return i;
+		}
+	}
+
+	return -1;
+}
+
+
 void ctrl_ctx::get_inode(get_inode_request_t&& req)
 {
 	/* If inode is in cache, return it */
@@ -2044,6 +2392,34 @@ void ctrl_ctx::dd_read(dd_read_request_t&& req)
 	{
 		/* Unregister request */
 		dd.read_reqs.erase(i);
+		throw;
+	}
+}
+
+void ctrl_ctx::dd_write(dd_write_request_t&& req)
+{
+	auto& dd = *req.dd;
+
+	prot::dd::req::write msg;
+	msg.request_id = get_request_id();
+	msg.offset = req.offset;
+	msg.length = req.size;
+
+	/* Register request */
+	auto [i,created] = dd.write_reqs.emplace(msg.request_id, move(req));
+	if (!created)
+		throw runtime_error("dd io: request id conflict");
+
+	/* Send message to dd */
+	try
+	{
+		if (send_message_to_dd(dd, msg, req.data, req.size))
+			throw runtime_error("failed to send message to dd\n");
+	}
+	catch (...)
+	{
+		/* Unregister request */
+		dd.write_reqs.erase(i);
 		throw;
 	}
 }

@@ -46,7 +46,14 @@ namespace req
 		size_t offset;
 		size_t length;
 
-		const char* data;
+		/* Only used by parse */
+		const char* data = nullptr;
+
+		write();
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+		static constexpr size_t header_size = 8 + 8*3;
 	};
 
 	std::unique_ptr<msg> parse(const char* buf, size_t size);
@@ -106,6 +113,15 @@ namespace reply
 	{
 		uint64_t request_id;
 		int res{};
+
+		write();
+		write(uint64_t request_id, int res);
+
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size = 8 + 4;
 	};
 
 	std::unique_ptr<msg> parse(const char* buf, size_t size);

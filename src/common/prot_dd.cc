@@ -61,12 +61,48 @@ namespace req
 
 	void read::parse(const char* buf, size_t size)
 	{
-		if (size != msg_size - 4)
+		if (size != 4 + msg_size)
+			throw invalid_msg_size(num, size);
+
+		request_id = sread_u64(buf);
+		offset = sread_u64(buf);
+		length = sread_u64(buf);
+	}
+
+
+	write::write()
+		: msg(WRITE)
+	{
+	}
+
+	size_t write::serialize(char* buf) const
+	{
+		if (buf)
 		{
-			request_id = sread_u64(buf);
-			offset = sread_u64(buf);
-			length = sread_u64(buf);
+			swrite_u32(buf, header_size + length - 4);
+			swrite_u32(buf, num);
+
+			swrite_u64(buf, request_id);
+			swrite_u64(buf, offset);
+			swrite_u64(buf, length);
 		}
+
+		return header_size;
+	}
+
+	void write::parse(const char* buf, size_t size)
+	{
+		if (size < header_size - 4)
+			throw invalid_msg_size(num, size);
+
+		request_id = sread_u64(buf);
+		offset = sread_u64(buf);
+		length = sread_u64(buf);
+
+		if (size != header_size - 4 + length)
+			throw invalid_msg_size(num, size);
+
+		data = buf;
 	}
 
 
@@ -88,6 +124,13 @@ namespace req
 			case READ:
 			{
 				auto msg = make_unique<read>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			case WRITE:
+			{
+				auto msg = make_unique<write>();
 				msg->parse(buf, size);
 				return msg;
 			}
@@ -178,6 +221,42 @@ namespace reply
 	}
 
 
+	write::write()
+		: msg(WRITE)
+	{
+	}
+
+	write::write(uint64_t request_id, int res)
+		: msg(WRITE), request_id(request_id), res(res)
+	{
+	}
+
+	size_t write::serialize(char* buf) const
+	{
+		size_t size = 8 + msg_size;
+
+		if (buf)
+		{
+			swrite_u32(buf, size - 4);
+			swrite_u32(buf, num);
+
+			swrite_u64(buf, request_id);
+			swrite_i32(buf, res);
+		}
+
+		return size;
+	}
+
+	void write::parse(const char* buf, size_t size)
+	{
+		if (size != 4 + msg_size)
+			throw invalid_msg_size(num, size);
+
+		request_id = sread_u64(buf);
+		res = sread_i32(buf);
+	}
+
+
 	unique_ptr<msg> parse(const char* buf, size_t size)
 	{
 		if (size < 4)
@@ -196,6 +275,13 @@ namespace reply
 			case READ:
 			{
 				auto msg = make_unique<read>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			case WRITE:
+			{
+				auto msg = make_unique<write>();
 				msg->parse(buf, size);
 				return msg;
 			}

@@ -94,6 +94,29 @@ namespace req
 		static constexpr size_t msg_size = 3*8;
 	};
 
+	struct write : public msg
+	{
+		unsigned long node_id;
+		size_t offset;
+		size_t size;
+
+		/* Will only be used by parse */
+		const char* data = nullptr;
+
+		write();
+
+		/* The data will NOT be serialized, and the return value will NOT
+		 * include the data size. */
+		size_t serialize(char* buf) const override;
+
+		/* Size MUST include the data size - so size is simply the received
+		 * message payload size, like for the other messages. */
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size_base = 8*3;
+	};
+
 	std::unique_ptr<msg> parse(const char* buf, size_t size);
 };
 
@@ -214,6 +237,20 @@ namespace reply
 
 	protected:
 		static constexpr size_t msg_size_base = 4 + 8;
+	};
+
+	struct write : public msg
+	{
+		int res{};
+
+		write();
+		write(uint64_t req_id, int res);
+
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size = 4;
 	};
 
 	std::unique_ptr<msg> parse(const char* buf, size_t size);

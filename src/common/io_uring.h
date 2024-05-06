@@ -9,6 +9,7 @@
 
 extern "C" {
 #include <poll.h>
+#include <sys/uio.h>
 }
 
 static_assert(sizeof(short) == 2);
@@ -30,6 +31,10 @@ public:
 	~IOUring();
 
 	void submit_poll(int fd, short events, complete_cb_t cb);
+
+	/* Similar to preadv2 */
+	void queue_readv(int fd, const struct iovec *iov, int iovcnt,
+			off_t offset, int flags, complete_cb_t cb);
 
 	/* Similar to pwritev2 */
 	void queue_writev(int fd, const struct iovec *iov, int iovcnt,

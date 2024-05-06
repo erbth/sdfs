@@ -52,6 +52,9 @@ int convert_error_code(int c)
 	case err::ISDIR:
 		return EISDIR;
 
+	case err::NXIO:
+		return ENXIO;
+
 	default:
 		return EIO;
 	};
@@ -275,7 +278,9 @@ void sdfs_fuse_ctx::op_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 void sdfs_fuse_ctx::op_write(fuse_req_t req, fuse_ino_t ino, const char* buf,
 		size_t size, off_t off, struct fuse_file_info* fi)
 {
-	check_call(fuse_reply_err(req, EIO), "fuse_reply_err");
+	cctx.request_write(ino, off, size, buf,
+			bind_front(&sdfs_fuse_ctx::cb_write, this, req, ino, size,
+				reinterpret_cast<open_list<file_ctx>::node*>(fi->fh)));
 }
 
 void sdfs_fuse_ctx::op_release(fuse_req_t req, fuse_ino_t ino,
@@ -614,4 +619,20 @@ void sdfs_fuse_ctx::cb_read(fuse_req_t req, fuse_ino_t ino, open_list<file_ctx>:
 
 	check_call(fuse_reply_buf(req, msg.data, msg.size), "fuse_reply_data");
 	//printf("read(%u)\n", (unsigned) ino);
+}
+
+
+void sdfs_fuse_ctx::cb_write(fuse_req_t req, fuse_ino_t ino, size_t size,
+		open_list<file_ctx>::node* fn, prot::client::reply::write& msg)
+{
+	if (msg.res != err::SUCCESS)
+	{
+		check_call(
+				fuse_reply_err(req, convert_error_code(msg.res)),
+				"fuse_reply_err");
+		return;
+	}
+
+	/* Either the entire write operation succeeds or fails */
+	check_call(fuse_reply_write(req, size), "fuse_reply_write");
 }

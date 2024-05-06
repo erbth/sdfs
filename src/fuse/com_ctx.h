@@ -46,6 +46,8 @@ typedef std::function<void(prot::client::reply::create&)> req_cb_create_t;
  * be kept allocated as long as the data is processed. */
 typedef std::function<void(prot::client::reply::read&)> req_cb_read_t;
 
+typedef std::function<void(prot::client::reply::write&)> req_cb_write_t;
+
 struct request_t final
 {
 	uint64_t id;
@@ -55,6 +57,7 @@ struct request_t final
 	req_cb_readdir_t cb_readdir;
 	req_cb_create_t cb_create;
 	req_cb_read_t cb_read;
+	req_cb_write_t cb_write;
 };
 
 struct com_ctrl final
@@ -125,8 +128,11 @@ protected:
 	bool process_message(com_ctrl* ctrl, prot::client::reply::readdir& msg);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::create& msg);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::read& msg);
+	bool process_message(com_ctrl* ctrl, prot::client::reply::write& msg);
 
-	bool send_message(com_ctrl* ctrl, const prot::msg& msg);
+	bool send_message(com_ctrl* ctrl, const prot::msg& msg,
+			const char* data = nullptr, size_t data_length = 0);
+
 	bool send_message(com_ctrl* ctrl, dynamic_buffer&& buf, size_t msg_len);
 
 public:
@@ -147,6 +153,9 @@ public:
 
 	void request_read(unsigned long node_id, size_t offset, size_t size,
 			req_cb_read_t cb);
+
+	void request_write(unsigned long node_id, size_t offset, size_t size,
+			const char* buf, req_cb_write_t cb);
 };
 
 #endif /* __COM_CTX_H */
