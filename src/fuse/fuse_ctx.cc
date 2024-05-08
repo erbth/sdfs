@@ -77,6 +77,7 @@ struct stat generate_st_buf_from_getfattr(
 	s.st_gid = fctx->gid;
 
 	s.st_size = msg.size;
+	s.st_blocks = (msg.allocated_size + 511) / 512;
 	s.st_mtim.tv_sec = msg.mtime / 1000000;
 	s.st_mtim.tv_nsec = (msg.mtime % 1000000) * 1000;
 
@@ -292,7 +293,7 @@ void sdfs_fuse_ctx::op_release(fuse_req_t req, fuse_ino_t ino,
 	open_files.remove(fn);
 	delete fn;
 
-	printf("close(%u)\n", (unsigned) ino);
+	// printf("close(%u)\n", (unsigned) ino);
 
 	check_call(fuse_reply_err(req, 0), "fuse_reply_err");
 }
@@ -569,7 +570,7 @@ void sdfs_fuse_ctx::cb_open(fuse_req_t req, fuse_ino_t ino, int flags,
 		return;
 	}
 
-	printf("open(%u)\n", (unsigned) ino);
+	// printf("open(%u)\n", (unsigned) ino);
 }
 
 void sdfs_fuse_ctx::cb_create(fuse_req_t req, int flags,
@@ -602,7 +603,7 @@ void sdfs_fuse_ctx::cb_create(fuse_req_t req, int flags,
 		return;
 	}
 
-	printf("create(%u)\n", (unsigned) ino);
+	// printf("create(%u)\n", (unsigned) ino);
 }
 
 

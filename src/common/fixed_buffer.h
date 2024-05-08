@@ -50,6 +50,11 @@ public:
 		return buf;
 	}
 
+	size_t get_size()
+	{
+		return size;
+	}
+
 	virtual ~fixed_buffer()
 	{
 		if (buf)

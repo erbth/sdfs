@@ -59,8 +59,38 @@ void send_packet_msg(int fd, const prot::msg& msg)
 }
 
 
-template <std::unique_ptr<prot::msg>(&P)(const char*, size_t)>
-std::unique_ptr<prot::msg> receive_stream_msg(int fd, int timeout)
+template <class MSGCLS>
+class _receive_stream_msg_proxy final
+{
+protected:
+	dynamic_buffer buf;
+	std::unique_ptr<prot::msg> _msg;
+	MSGCLS* msg;
+
+public:
+	_receive_stream_msg_proxy(dynamic_buffer&& buf, std::unique_ptr<prot::msg>&& _msg)
+		: buf(std::move(buf)), _msg(std::move(_msg))
+	{
+		msg = dynamic_cast<MSGCLS*>(this->_msg.get());
+		if (!msg)
+			throw std::runtime_error("protocol violation in receive_stream_msg");
+	}
+
+	_receive_stream_msg_proxy(const _receive_stream_msg_proxy& o) = delete;
+
+	MSGCLS& operator*()
+	{
+		return *msg;
+	}
+
+	MSGCLS* operator->()
+	{
+		return msg;
+	}
+};
+
+template <class MSGCLS, std::unique_ptr<prot::msg>(&P)(const char*, size_t)>
+_receive_stream_msg_proxy<MSGCLS> receive_stream_msg(int fd, int timeout)
 {
 	dynamic_buffer buf;
 
@@ -89,6 +119,8 @@ std::unique_ptr<prot::msg> receive_stream_msg(int fd, int timeout)
 		auto ret = check_syscall(poll(&pfd, 1, timeout), "poll");
 		if (ret > 0)
 		{
+			buf.ensure_size(size);
+
 			auto cnt_read = check_syscall(
 					read(fd, buf.ptr() + pos, size == 4 ? 1 : (size - pos)),
 					"read");
@@ -111,17 +143,8 @@ std::unique_ptr<prot::msg> receive_stream_msg(int fd, int timeout)
 		timeout -= delay;
 	}
 
-	return P(buf.ptr() + 4, size - 4);
-}
-
-template <std::unique_ptr<prot::msg>(&P)(const char*, size_t), unsigned num>
-inline std::unique_ptr<prot::msg> receive_stream_msg(int fd, int timeout)
-{
-	auto msg = receive_stream_msg<P>(fd, timeout);
-	if (msg->num != num)
-		throw std::runtime_error("protocol violation");
-
-	return msg;
+	auto msg = P(buf.ptr() + 4, size - 4);
+	return _receive_stream_msg_proxy<MSGCLS>(std::move(buf), std::move(msg));
 }
 
 void send_stream_msg(int fd, const prot::msg& msg)

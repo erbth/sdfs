@@ -21,6 +21,7 @@
 #include "common/prot_dd.h"
 #include "common/open_list.h"
 #include "common/io_uring.h"
+#include "common/timerfd.h"
 
 extern "C" {
 #include <netinet/in.h>
@@ -127,7 +128,7 @@ struct inode
 	size_t size = 0;
 
 	/* In microseconds */
-	unsigned long mtime;
+	unsigned long mtime{};
 
 
 	/* For files */
@@ -228,7 +229,10 @@ struct inode_directory_t
 	bool allocator_locked = false;
 	std::list<inode_allocator_lock_request_t> allocator_lock_reqs;
 
-	/* Inode allocator */
+	/* Inode allocator
+	 * Note that inode numbers start at 1, but the inode with id 1 is encoded in
+	 * the first bit of the bitmap. So the bit-position is node_id - 1.
+	 * Accordingly same holds for the on-disk storage of inodes. */
 	fixed_aligned_buffer _allocator_buffer;
 	uint8_t* allocator_bitmap = nullptr;
 
@@ -386,6 +390,96 @@ struct ctx_c_r_write
 	}
 };
 
+struct ctx_m_s_balloc
+{
+	block_allocator_lock_witness blck;
+
+	struct block_t
+	{
+		size_t offset;
+		size_t size;
+		const char* data;
+
+		ctrl_dd* dd;
+
+		bool completed = false;
+		int result = -1;
+
+		inline block_t(size_t offset, size_t size, const char* data, ctrl_dd* dd)
+			: offset(offset), size(size), data(data), dd(dd)
+		{
+		}
+	};
+	std::vector<block_t> blocks;
+};
+
+struct ctx_m_s_ialloc
+{
+	inode_allocator_lock_witness ialck;
+
+	struct block_t
+	{
+		size_t offset;
+		size_t size;
+		const char* data;
+
+		ctrl_dd* dd;
+
+		bool completed = false;
+		int result = -1;
+
+		inline block_t(size_t offset, size_t size, const char* data, ctrl_dd* dd)
+			: offset(offset), size(size), data(data), dd(dd)
+		{
+		}
+	};
+	std::vector<block_t> blocks;
+};
+
+struct ctx_m_s_inodes
+{
+	inode_lock_witness ilck;
+
+	fixed_buffer buf{4096};
+
+	struct node_to_store_t
+	{
+		unsigned long node_id;
+		std::shared_ptr<inode> node;
+
+		node_to_store_t(unsigned long node_id, std::shared_ptr<inode> node)
+			: node_id(node_id), node(node)
+		{
+		}
+	};
+	std::vector<node_to_store_t> nodes_to_store;
+
+	struct block_t
+	{
+		ctrl_dd* dd;
+
+		bool completed = false;
+		int result = -1;
+
+		inline block_t(ctrl_dd* dd)
+			: dd(dd)
+		{
+		}
+	};
+	std::vector<block_t> blocks;
+};
+
+
+struct ctx_m_g_inode
+{
+	get_inode_request_t req;
+
+	inline ctx_m_g_inode(get_inode_request_t&& req)
+		: req(std::move(req))
+	{
+	}
+};
+
 
 struct ctrl_queued_msg final
 {
@@ -485,14 +579,22 @@ class ctrl_ctx final
 {
 protected:
 	FileConfig cfg;
+	bool format_on_startup = false;
 
 	bool quit_requested = false;
+	bool quit_main_loop = false;
+
+	bool background_job_enabled = false;
 
 	Epoll epoll;
 	SignalFD sfd{
 		{SIGINT, SIGTERM},
 		epoll,
 		std::bind_front(&ctrl_ctx::on_signal, this)};
+
+	TimerFD bg_tfd{
+		epoll,
+		std::bind_front(&ctrl_ctx::on_background_timer, this)};
 
 	/* NOTE: Epoll comes before because IOUring polls epoll's filedescriptor */
 	const unsigned io_uring_max_req_in_flight = 250;
@@ -530,6 +632,10 @@ protected:
 	size_t client_req_cnt_read = 0;
 	size_t client_req_cnt_write = 0;
 
+	/* Global state control */
+	bool stop_accepting_new_clients = false;
+	bool stop_accepting_client_requests = false;
+
 
 	/* Internal operations */
 	/* Locks */
@@ -549,7 +655,11 @@ protected:
 	ssize_t get_free_blocks(size_t count);
 
 	/* Inodes */
+	/* Must be called with a lock (read or write) on the inode */
 	void get_inode(get_inode_request_t&&);
+
+	/* Callback internally used by get_inode */
+	void cb_m_g_inode(std::shared_ptr<ctx_m_g_inode> rctx, dd_read_request_t&& dd_req);
 
 	/* Inode directory */
 	void mark_inode_allocated(unsigned long);
@@ -567,6 +677,9 @@ protected:
 	/* dd IO interface */
 	void dd_read(dd_read_request_t&& req);
 	void dd_write(dd_write_request_t&& req);
+
+	/* Only to be used during initialization, before the main loop is running */
+	fixed_buffer dd_read_sync_startup(ctrl_dd* dd, size_t offset, size_t size);
 
 
 	/* Be careful when calling these functions */
@@ -588,6 +701,7 @@ protected:
 	void initialize_root_directory();
 
 	void on_signal(int s);
+	void on_background_timer();
 
 	void on_epoll_ready(int res);
 
@@ -648,12 +762,44 @@ protected:
 	void cb_c_r_write_write(std::shared_ptr<ctx_c_r_write> rctx);
 	void cb_c_r_write_dd(std::shared_ptr<ctx_c_r_write> rctx, size_t bi, dd_write_request_t&& req);
 
+	/* Storing metadata on disk */
+	void store_metadata();
+
+	void store_allocation_bitmap();
+	void store_inode_allocator_bitmap();
+	void store_inodes();
+
+	/* Callbacks and internal functions for metadata writing */
+	void cb_m_s_balloc_lck(std::shared_ptr<ctx_m_s_balloc> rctx, block_allocator_lock_request_t& blck);
+	void cb_m_s_balloc_dd(std::shared_ptr<ctx_m_s_balloc> rctx, size_t bi, dd_write_request_t&& req);
+
+	void cb_m_s_ialloc_lck(std::shared_ptr<ctx_m_s_ialloc> rctx, inode_allocator_lock_request_t& blck);
+	void cb_m_s_ialloc_dd(std::shared_ptr<ctx_m_s_ialloc> rctx, size_t bi, dd_write_request_t&& req);
+
+	void store_inodes_node(std::shared_ptr<ctx_m_s_inodes> rctx);
+	void cb_m_s_inodes_ilock(std::shared_ptr<ctx_m_s_inodes> rctx, inode_lock_request_t& ilck);
+	void cb_m_s_inodes_dd(std::shared_ptr<ctx_m_s_inodes> rctx, size_t bi, dd_write_request_t&& req);
+
+
+	/* Shutdown procedure */
+	int shutdown_state = 0;
+
+	/* To be called in every main loop iteration once shutdown is to be
+	 * initiated. */
+	void perform_shutdown();
+
+	void initiate_shutdown();
+	void shutdown_wait_for_operations();
+	void shutdown_wait_metadata();
+
 
 public:
 	ctrl_ctx();
 	~ctrl_ctx();
 
-	void initialize();
+	/* If format is true, the filesystem will be wiped during startung (useful
+	 * for initializing new filesystems) */
+	void initialize(bool format);
 
 	void main();
 };

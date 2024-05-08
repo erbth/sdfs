@@ -354,6 +354,7 @@ namespace reply
 			swrite_u64(buf, nlink);
 			swrite_u64(buf, mtime);
 			swrite_u64(buf, this->size);
+			swrite_u64(buf, allocated_size);
 		}
 
 		return size;
@@ -371,6 +372,7 @@ namespace reply
 		nlink = sread_u64(buf);
 		mtime = sread_u64(buf);
 		this->size = sread_u64(buf);
+		allocated_size = sread_u64(buf);
 	}
 
 

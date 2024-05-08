@@ -164,13 +164,14 @@ namespace reply
 		size_t nlink{};
 		unsigned long mtime{};
 		size_t size{};
+		size_t allocated_size{};
 
 		getfattr();
 		size_t serialize(char* buf) const override;
 		void parse(const char* buf, size_t size);
 
 	protected:
-		static constexpr size_t msg_size = 4 + 1 + 3*8;
+		static constexpr size_t msg_size = 4 + 1 + 4*8;
 	};
 
 	struct readdir : public msg

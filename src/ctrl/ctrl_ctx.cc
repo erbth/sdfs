@@ -298,11 +298,11 @@ void ctrl_ctx::initialize_dd_host(const string& addr_str)
 	/* List dds */
 	send_stream_msg(wfd.get_fd(), prot::dd_mgr_fe::req::query_dds());
 	auto reply = receive_stream_msg<
-		prot::dd_mgr_fe::reply::parse,
-		(unsigned) prot::dd_mgr_fe::reply::msg_nums::QUERY_DDS
+		prot::dd_mgr_fe::reply::query_dds,
+		prot::dd_mgr_fe::reply::parse
 			>(wfd.get_fd(), 30000);
 
-	for (const auto& desc : static_cast<prot::dd_mgr_fe::reply::query_dds&>(*reply).dds)
+	for (const auto& desc : reply->dds)
 	{
 		for (auto& dd : dds)
 		{
@@ -346,29 +346,29 @@ void ctrl_ctx::initialize_connect_dd(const struct in6_addr& addr, ctrl_dd& dd)
 
 	/* Query dd parameters */
 	send_stream_msg(wfd.get_fd(), prot::dd::req::getattr());
-	auto _reply = receive_stream_msg<prot::dd::reply::parse, prot::dd::reply::GETATTR>
+	auto reply = receive_stream_msg<
+		prot::dd::reply::getattr,
+		prot::dd::reply::parse>
 			(wfd.get_fd(), 30000);
 
-	auto& reply = static_cast<prot::dd::reply::getattr&>(*_reply);
-
 	/* Ensure id and guid match */
-	if (dd.id != reply.id)
+	if (dd.id != reply->id)
 	{
-		printf("    invalid id (%u)\n", reply.id);
+		printf("    invalid id (%u)\n", reply->id);
 		return;
 	}
 
-	if (memcmp(dd.gid, reply.gid, sizeof(dd.gid)) != 0)
+	if (memcmp(dd.gid, reply->gid, sizeof(dd.gid)) != 0)
 	{
 		printf("    gid mismatch\n");
 		return;
 	}
 
 	/* populate ctrl_dd structure */
-	dd.size = reply.size;
+	dd.size = reply->size;
 	printf("    size: %s (%lu B), raw size: %s (%lu B)\n",
-			format_size_bin(reply.size).c_str(), (long unsigned) reply.size,
-			format_size_bin(reply.raw_size).c_str(), (long unsigned) reply.raw_size);
+			format_size_bin(reply->size).c_str(), (long unsigned) reply->size,
+			format_size_bin(reply->raw_size).c_str(), (long unsigned) reply->raw_size);
 
 	epoll.add_fd(wfd.get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP,
 			bind_front(&ctrl_ctx::on_dd_fd, this, &dd));
@@ -439,8 +439,12 @@ void ctrl_ctx::initialize_client_listener()
 			EPOLLIN, bind_front(&ctrl_ctx::on_client_lfd, this));
 }
 
-void ctrl_ctx::initialize()
+void ctrl_ctx::initialize(bool format)
 {
+	format_on_startup = format;
+	if (format_on_startup)
+		printf("Filesystem will be formatted.\n\n");
+
 	/* Read config file and check values */
 	initialize_cfg();
 
@@ -455,6 +459,10 @@ void ctrl_ctx::initialize()
 
 	/* Create listening sockets */
 	initialize_client_listener();
+
+	/* Start background job */
+	background_job_enabled = true;
+	bg_tfd.start(10000000);
 }
 
 
@@ -541,8 +549,24 @@ void ctrl_ctx::initialize_block_allocator()
 
 	memset(block_allocator.bitmap, 0, data_map.allocation_bitmap_size);
 
-	/* Read block allocation bitmap from first dd if valid */
-	/* TODO */
+	/* Read block allocation bitmap from first dd */
+	if (!format_on_startup)
+	{
+		auto dd = &dds.front();
+		auto buf = dd_read_sync_startup(
+				dd,
+				dd->allocation_bitmap_offset,
+				data_map.allocation_bitmap_size);
+
+		if (buf.get_size() != data_map.allocation_bitmap_size)
+			throw runtime_error("Failed to read block allocation bitmap");
+
+		memcpy(block_allocator.bitmap, buf.ptr(), data_map.allocation_bitmap_size);
+	}
+	else
+	{
+		block_allocator.dirty = true;
+	}
 
 	/* Initialize allocated block count */
 	block_allocator.allocated_count = 0;
@@ -559,19 +583,35 @@ void ctrl_ctx::initialize_block_allocator()
 
 void ctrl_ctx::initialize_inode_directory()
 {
-	size_t alloc_size = (data_map.total_inode_count + 7) / 8;
-	if (alloc_size > 100 * 1024 * 1024ULL)
+	size_t bitmap_disk_size = (data_map.total_inode_count + 7) / 8;
+	if (bitmap_disk_size > 100 * 1024 * 1024ULL)
 		throw runtime_error("Inode directory allocator too large");
 
-	alloc_size = (alloc_size + 4095) & ~(4095ULL);
+	auto alloc_size = (bitmap_disk_size + 4095) & ~(4095ULL);
 
 	inode_directory._allocator_buffer = fixed_aligned_buffer(4096, alloc_size);
 	inode_directory.allocator_bitmap = (uint8_t*) inode_directory._allocator_buffer.ptr();
 
 	memset(inode_directory.allocator_bitmap, 0, alloc_size);
 
-	/* Read inode allocation bitmap from first dd if valid */
-	/* TODO */
+	/* Read inode allocation bitmap from first dd */
+	if (!format_on_startup)
+	{
+		auto dd = &dds.front();
+		auto buf = dd_read_sync_startup(
+				dd,
+				dd->inode_bitmap_offset,
+				bitmap_disk_size);
+
+		if (buf.get_size() != bitmap_disk_size)
+			throw runtime_error("Failed to read imap allocator bitmap");
+
+		memcpy(inode_directory.allocator_bitmap, buf.ptr(), bitmap_disk_size);
+	}
+	else
+	{
+		inode_directory.allocator_dirty = true;
+	}
 
 	/* Initialize allocated inode count */
 	inode_directory.allocated_count = 0;
@@ -587,10 +627,8 @@ void ctrl_ctx::initialize_inode_directory()
 
 void ctrl_ctx::initialize_root_directory()
 {
-	/* Try to load the root directory and create one if it does not yet exist.
-	 * */
-
-	if (true)
+	/* Create the root directory if it does not exist yet. */
+	if ((inode_directory.allocator_bitmap[0] & 0x01) == 0)
 	{
 		printf("The root directory does not exist, creating a new one\n");
 
@@ -625,6 +663,18 @@ void ctrl_ctx::on_signal(int s)
 }
 
 
+void ctrl_ctx::on_background_timer()
+{
+	if (!background_job_enabled)
+		return;
+
+	/* Note that it is no problem if two store_metadata calls overlap, as long
+	 * as the dds are not overwhelmed by the IO they generated. All resources
+	 * are protected by locks. */
+	store_metadata();
+}
+
+
 void ctrl_ctx::on_epoll_ready(int res)
 {
 	if (res < 0)
@@ -639,6 +689,12 @@ void ctrl_ctx::on_epoll_ready(int res)
 
 void ctrl_ctx::on_client_lfd(int fd, uint32_t events)
 {
+	if (stop_accepting_new_clients)
+	{
+		epoll.remove_fd(client_lfd.get_fd());
+		return;
+	}
+
 	WrappedFD wfd;
 	wfd.set_errno(accept4(fd, nullptr, nullptr, SOCK_CLOEXEC), "accept");
 
@@ -669,7 +725,7 @@ void ctrl_ctx::on_dd_fd(ctrl_dd* dd, int fd, uint32_t events)
 	/* Send data */
 	if (events & EPOLLOUT)
 	{
-		auto prof = profiler_get("on_dd_fd(send)");
+		// auto prof = profiler_get("on_dd_fd(send)");
 
 		bool disable_sender = false;
 		if (dd->send_queue.size() > 0)
@@ -715,7 +771,7 @@ void ctrl_ctx::on_dd_fd(ctrl_dd* dd, int fd, uint32_t events)
 	/* Read data */
 	if (events & EPOLLIN)
 	{
-		auto prof = profiler_get("on_dd_fd(recv)");
+		// auto prof = profiler_get("on_dd_fd(recv)");
 
 		const size_t read_chunk = 2 * 1024 * 1024ULL;
 
@@ -901,56 +957,17 @@ void ctrl_ctx::on_client_fd(shared_ptr<ctrl_client> client, int fd, uint32_t eve
 
 	bool rm_client = false;
 
-	/* Send data */
-	// if (events & EPOLLOUT)
-	// {
-	// 	auto prof = profiler_get("on_client_fd(send)");
-
-	// 	bool disable_sender = false;
-	// 	if (client->send_queue.size() > 0)
-	// 	{
-	// 		auto& qmsg = client->send_queue.front();
-
-	// 		size_t to_write = min(
-	// 				2 * 1024UL * 1024,
-	// 				qmsg.msg_len - client->send_msg_pos);
-
-	// 		auto ret = write(
-	// 				client->get_fd(),
-	// 				qmsg.buf_ptr() + client->send_msg_pos,
-	// 				to_write);
-
-	// 		if (ret >= 0)
-	// 		{
-	// 			client->send_msg_pos += ret;
-	// 			if (client->send_msg_pos == qmsg.msg_len)
-	// 			{
-	// 				qmsg.return_buffer(buf_pool_req);
-	// 				client->send_queue.pop();
-	// 				client->send_msg_pos = 0;
-
-	// 				if (client->send_queue.empty())
-	// 					disable_sender = true;
-	// 			}
-	// 		}
-	// 		else
-	// 		{
-	// 			rm_client = true;
-	// 		}
-	// 	}
-	// 	else
-	// 	{
-	// 		disable_sender = true;
-	// 	}
-
-	// 	if (disable_sender)
-	// 		epoll.change_events(client->get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP);
-	// }
-
 	/* Read data */
-	if (events & EPOLLIN)
+	bool have_r_event = events & EPOLLIN;
+	if (have_r_event && stop_accepting_client_requests)
 	{
-		auto prof = profiler_get("on_client_fd(recv)");
+		have_r_event = false;
+		epoll.change_events(client->get_fd(), EPOLLHUP | EPOLLRDHUP);
+	}
+
+	if (have_r_event)
+	{
+		// auto prof = profiler_get("on_client_fd(recv)");
 
 		const size_t read_chunk = 100 * 1024;
 		client->rd_buf.ensure_size(client->rd_buf_pos + read_chunk);
@@ -1009,7 +1026,7 @@ void ctrl_ctx::on_client_fd(shared_ptr<ctrl_client> client, int fd, uint32_t eve
 
 void ctrl_ctx::on_client_writev_finished(shared_ptr<ctrl_client> client, int res)
 {
-	auto prof = profiler_get("on_client_writev_finished");
+	// auto prof = profiler_get("on_client_writev_finished");
 
 	io_uring_req_in_flight--;
 
@@ -1079,7 +1096,7 @@ void ctrl_ctx::on_client_writev_finished(shared_ptr<ctrl_client> client, int res
 bool ctrl_ctx::process_client_message(
 		shared_ptr<ctrl_client> client, dynamic_buffer&& buf, size_t msg_len)
 {
-	auto prof = profiler_get("process_client_message");
+	// auto prof = profiler_get("process_client_message");
 
 	unique_ptr<prot::msg> msg;
 
@@ -1210,6 +1227,7 @@ void ctrl_ctx::cb_c_r_getfattr_inode(
 			reply.nlink = req.node->nlink;
 			reply.mtime = req.node->mtime;
 			reply.size = req.node->size;
+			reply.allocated_size = req.node->get_allocated_size();
 		}
 		else
 		{
@@ -1468,6 +1486,7 @@ void ctrl_ctx::cb_c_r_create_getp(shared_ptr<ctx_c_r_create> rctx, get_inode_req
 	rctx->parent_node->dirty = true;
 	rctx->parent_node->files.emplace_back(rctx->msg.name, rctx->node_id, inode::TYPE_FILE);
 	rctx->parent_node->size++;
+	rctx->parent_node->mtime = get_wt_now();
 
 	/* Unlock inodes and inode allocator, and inform client */
 	prot::client::reply::create reply(rctx->msg.req_id, err::SUCCESS);
@@ -1495,7 +1514,7 @@ void ctrl_ctx::cb_c_r_create_getp(shared_ptr<ctx_c_r_create> rctx, get_inode_req
 bool ctrl_ctx::process_client_message(
 		shared_ptr<ctrl_client> client, prot::client::req::read& msg)
 {
-	auto prof = profiler_get("process_client_message(read)");
+	// auto prof = profiler_get("process_client_message(read)");
 
 	/* READ */
 	/* b Lock inode */
@@ -1535,7 +1554,7 @@ bool ctrl_ctx::process_client_message(
 
 void ctrl_ctx::cb_c_r_read_ilock(shared_ptr<ctx_c_r_read> rctx, inode_lock_request_t& ilck)
 {
-	auto prof = profiler_get("cb_c_r_read_ilock");
+	// auto prof = profiler_get("cb_c_r_read_ilock");
 
 	rctx->ilck = inode_lock_witness(bind_front(&ctrl_ctx::unlock_inode, this), ilck);
 
@@ -1549,7 +1568,7 @@ void ctrl_ctx::cb_c_r_read_ilock(shared_ptr<ctx_c_r_read> rctx, inode_lock_reque
 
 void ctrl_ctx::cb_c_r_read_getnode(shared_ptr<ctx_c_r_read> rctx, get_inode_request_t&& ireq)
 {
-	auto prof = profiler_get("cb_c_r_read_getnode");
+	// auto prof = profiler_get("cb_c_r_read_getnode");
 
 	if (ireq.result != err::SUCCESS)
 	{
@@ -1626,7 +1645,7 @@ void ctrl_ctx::cb_c_r_read_getnode(shared_ptr<ctx_c_r_read> rctx, get_inode_requ
 void ctrl_ctx::cb_c_r_read_dd(shared_ptr<ctx_c_r_read> rctx, size_t bi,
 		dd_read_request_t&& req)
 {
-	auto prof = profiler_get("cb_c_r_read_dd");
+	// auto prof = profiler_get("cb_c_r_read_dd");
 
 	/* Store result of read request and copy data if required */
 	{
@@ -1759,6 +1778,18 @@ void ctrl_ctx::cb_c_r_write_getnode(shared_ptr<ctx_c_r_write> rctx, get_inode_re
 	}
 
 	rctx->node = ireq.node;
+
+	/* Ensure that at least one allocation can be added. Note that the next
+	 * blocks might be consecutive, in which case the last allocation could be
+	 * extended - however this would be more complex to rollback, hence rather
+	 * keep one allocation spared on each file. */
+	if (rctx->node->allocations.size() >= 240)
+	{
+		send_message_to_client(
+				rctx->client,
+				prot::client::reply::write(rctx->msg.req_id, err::NOSPC));
+		return;
+	}
 
 
 	/* Determine if new blocks need to be allocated */
@@ -1910,7 +1941,7 @@ bool ctrl_ctx::send_message_to_client(shared_ptr<ctrl_client> client, const prot
 bool ctrl_ctx::send_message_to_client(shared_ptr<ctrl_client> client,
 		variant<dynamic_buffer, dynamic_aligned_buffer>&& buf, size_t msg_len)
 {
-	auto prof = profiler_get("send_message_to_client(buf)");
+	// auto prof = profiler_get("send_message_to_client(buf)");
 
 	if (client->invalid)
 		return true;
@@ -1947,8 +1978,13 @@ void ctrl_ctx::main()
 	io_uring.submit_poll(epoll.get_fd(), POLLIN,
 			bind_front(&ctrl_ctx::on_epoll_ready, this));
 
-	while (!quit_requested)
+	while (!quit_main_loop)
+	{
 		io_uring.process_requests(true);
+
+		if (quit_requested)
+			perform_shutdown();
+	}
 }
 
 
@@ -2180,7 +2216,8 @@ ssize_t ctrl_ctx::get_free_blocks(size_t count)
 {
 	auto total_blocks = data_map.total_data_size / data_map.allocation_granularity;
 
-	for (size_t i = 0; i < total_blocks - count; i++)
+	/* The last used block is i + count - 1 */
+	for (size_t i = 0; i <= total_blocks - count; i++)
 	{
 		bool found = true;
 
@@ -2196,6 +2233,8 @@ ssize_t ctrl_ctx::get_free_blocks(size_t count)
 
 		if (found)
 		{
+			block_allocator.dirty = true;
+
 			for (size_t j = 0; j < count; j++)
 			{
 				auto pos = i + j;
@@ -2213,6 +2252,9 @@ ssize_t ctrl_ctx::get_free_blocks(size_t count)
 
 void ctrl_ctx::get_inode(get_inode_request_t&& req)
 {
+	if (req.node_id >= data_map.total_inode_count || req.node_id == 0)
+		throw invalid_argument("Inode id out of range");
+
 	/* If inode is in cache, return it */
 	auto i = inode_directory.cached_inodes.find(req.node_id);
 	if (i != inode_directory.cached_inodes.end())
@@ -2228,10 +2270,46 @@ void ctrl_ctx::get_inode(get_inode_request_t&& req)
 	}
 
 	/* Retrieve inode */
-	req.result = err::NOENT;
-	auto cb = req.cb_finished;
-	req.cb_finished = nullptr;
-	cb(move(req));
+	auto rctx = make_shared<ctx_m_g_inode>(move(req));
+
+	/* Compute position on disk and issue IO request on first dd */
+	dd_read_request_t dd_req;
+
+	dd_req.dd = &dds.front();
+	dd_req.offset = dd_req.dd->inode_directory_offset + (rctx->req.node_id - 1) * 4096;
+	dd_req.size = 4096;
+	dd_req.cb_completed = bind_front(&ctrl_ctx::cb_m_g_inode, this, rctx);
+
+	dd_read(move(dd_req));
+}
+
+void ctrl_ctx::cb_m_g_inode(shared_ptr<ctx_m_g_inode> rctx, dd_read_request_t&& dd_req)
+{
+	if (dd_req.result != err::SUCCESS)
+	{
+		rctx->req.result = err::IO;
+		auto cb = rctx->req.cb_finished;
+		rctx->req.cb_finished = nullptr;
+		cb(move(rctx->req));
+		return;
+	}
+
+	/* Parse inode */
+	auto node = make_shared<inode>();
+	node->parse(dd_req.data);
+
+	/* Note that it is perfectly fine that this insertion does not happen - in
+	 * this case another concurrent read-process (the inode is under
+	 * non-exclusive lock if this is a read-request) did fetch the inode
+	 * already.  Simply return that copy, then. */
+	auto [i, inserted] = inode_directory.cached_inodes.insert({rctx->req.node_id, node});
+
+	rctx->req.result = err::SUCCESS;
+	rctx->req.node = i->second;
+
+	auto cb = rctx->req.cb_finished;
+	rctx->req.cb_finished = nullptr;
+	cb(move(rctx->req));
 }
 
 
@@ -2239,6 +2317,8 @@ void ctrl_ctx::mark_inode_allocated(unsigned long node_id)
 {
 	if (node_id >= data_map.total_inode_count || node_id == 0)
 		throw invalid_argument("Inode id out of range");
+
+	node_id--;
 
 	auto off = node_id / 8;
 	auto mask = 1 << (node_id % 8);
@@ -2256,6 +2336,8 @@ void ctrl_ctx::mark_inode_unallocated(unsigned long node_id)
 	if (node_id >= data_map.total_inode_count || node_id == 0)
 		throw invalid_argument("Inode id out of range");
 
+	node_id--;
+
 	auto off = node_id / 8;
 	auto mask = 1 << (node_id % 8);
 	if (!(inode_directory.allocator_bitmap[off] & mask))
@@ -2269,13 +2351,13 @@ void ctrl_ctx::mark_inode_unallocated(unsigned long node_id)
 
 long ctrl_ctx::get_free_inode()
 {
-	for (unsigned long i = 1; i < data_map.total_inode_count; i++)
+	for (unsigned long i = 0; i < data_map.total_inode_count; i++)
 	{
 		auto off = i / 8;
 		auto mask = 1 << (i % 8);
 
 		if (!(inode_directory.allocator_bitmap[off] & mask))
-			return i;
+			return i + 1;
 	}
 
 	return -1;
@@ -2422,4 +2504,465 @@ void ctrl_ctx::dd_write(dd_write_request_t&& req)
 		dd.write_reqs.erase(i);
 		throw;
 	}
+}
+
+
+/* Only to be used during initialization, before the main loop is running */
+fixed_buffer ctrl_ctx::dd_read_sync_startup(
+		ctrl_dd* dd, size_t offset, size_t size)
+{
+	fixed_buffer buf(size);
+
+	for (size_t pos = 0; pos < size; pos += 1024 * 1024)
+	{
+		size_t to_read = min(1024 * 1024UL, size - pos);
+
+		prot::dd::req::read req;
+		req.request_id = get_request_id();
+		req.offset = offset + pos;
+		req.length = to_read;
+
+		send_stream_msg(dd->get_fd(), req);
+		auto reply = receive_stream_msg<
+			prot::dd::reply::read,
+			prot::dd::reply::parse>
+				(dd->get_fd(), 30000);
+
+		if (
+				reply->request_id != req.request_id ||
+				reply->res != err::SUCCESS ||
+				reply->data_length != to_read)
+		{
+			throw runtime_error("Failed to read from dd during startup");
+		}
+
+		memcpy(buf.ptr(), reply->data, reply->data_length);
+	}
+
+	return buf;
+}
+
+
+void ctrl_ctx::store_metadata()
+{
+	store_allocation_bitmap();
+	store_inode_allocator_bitmap();
+	store_inodes();
+}
+
+void ctrl_ctx::store_allocation_bitmap()
+{
+	if (!block_allocator.dirty)
+		return;
+
+	/* b Lock block allocator */
+	/* b Write allocation bitmap to all dds */
+	/*   Unlock block allocator */
+
+	auto rctx = make_shared<ctx_m_s_balloc>();
+
+	/* Lock block allocator */
+	block_allocator_lock_request_t req;
+	req.cb_acquired = bind_front(&ctrl_ctx::cb_m_s_balloc_lck, this, rctx);
+
+	lock_block_allocator(req);
+}
+
+void ctrl_ctx::cb_m_s_balloc_lck(shared_ptr<ctx_m_s_balloc> rctx,
+		block_allocator_lock_request_t& blck)
+{
+	rctx->blck = block_allocator_lock_witness(bind_front(&ctrl_ctx::unlock_block_allocator, this), blck);
+
+	/* Generate write requests */
+	const size_t block_size = 1024 * 1024;
+	for (size_t pos = 0; pos < data_map.allocation_bitmap_size; pos += block_size)
+	{
+		auto to_write = min(block_size, data_map.allocation_bitmap_size - pos);
+
+		for (auto& dd : dds)
+		{
+			rctx->blocks.emplace_back(
+					dd.allocation_bitmap_offset + pos,
+					to_write,
+					(char*) block_allocator.bitmap + pos,
+					&dd);
+		}
+	}
+
+	/* Write to all dds */
+	for (size_t i = 0; i < rctx->blocks.size(); i++)
+	{
+		auto& b = rctx->blocks[i];
+
+		dd_write_request_t req;
+
+		req.dd = b.dd;
+		req.offset = b.offset;
+		req.size = b.size;
+		req.data = b.data;
+		req.cb_completed = bind_front(&ctrl_ctx::cb_m_s_balloc_dd, this, rctx, i);
+
+		dd_write(move(req));
+	}
+}
+
+void ctrl_ctx::cb_m_s_balloc_dd(shared_ptr<ctx_m_s_balloc> rctx, size_t bi,
+		dd_write_request_t&& req)
+{
+	/* Store result of write request */
+	{
+		auto& b = rctx->blocks[bi];
+		b.result = req.result;
+		b.completed = true;
+	}
+
+	/* Test if all write requests have completed */
+	for (auto& b : rctx->blocks)
+	{
+		if (!b.completed)
+			return;
+	}
+
+	/* Check return codes of individual block write requests */
+	bool error = false;
+	for (auto& b : rctx->blocks)
+	{
+		if (b.result != err::SUCCESS)
+		{
+			error = true;
+			fprintf(stderr, "Failed to write allocation bitmap to dd %u.\n",
+					(unsigned) b.dd->id);
+		}
+	}
+
+	if (error)
+		throw runtime_error("Failed to write allocation bitmap to disk");
+
+	/* Reset dirty flags */
+	block_allocator.dirty = false;
+}
+
+
+void ctrl_ctx::store_inode_allocator_bitmap()
+{
+	if (!inode_directory.allocator_dirty)
+		return;
+
+	/* b Lock inode allocator */
+	/* b Write allocation bitmap to all dds */
+	/*   Unlock inode allocator */
+
+	auto rctx = make_shared<ctx_m_s_ialloc>();
+
+	/* Lock inode allocator */
+	inode_allocator_lock_request_t req;
+	req.cb_acquired = bind_front(&ctrl_ctx::cb_m_s_ialloc_lck, this, rctx);
+
+	lock_inode_allocator(req);
+}
+
+void ctrl_ctx::cb_m_s_ialloc_lck(shared_ptr<ctx_m_s_ialloc> rctx,
+		inode_allocator_lock_request_t& ialck)
+{
+	rctx->ialck = inode_allocator_lock_witness(bind_front(&ctrl_ctx::unlock_inode_allocator, this), ialck);
+
+	/* Generate write requests */
+	const size_t block_size = 1024 * 1024;
+	const size_t bitmap_size = (data_map.total_inode_count + 7) / 8;
+
+	for (size_t pos = 0; pos < bitmap_size; pos += block_size)
+	{
+		auto to_write = min(block_size, bitmap_size - pos);
+
+		for (auto& dd : dds)
+		{
+			rctx->blocks.emplace_back(
+					dd.inode_bitmap_offset + pos,
+					to_write,
+					(char*) inode_directory.allocator_bitmap + pos,
+					&dd);
+		}
+	}
+
+	/* Write to all dds */
+	for (size_t i = 0; i < rctx->blocks.size(); i++)
+	{
+		auto& b = rctx->blocks[i];
+
+		dd_write_request_t req;
+
+		req.dd = b.dd;
+		req.offset = b.offset;
+		req.size = b.size;
+		req.data = b.data;
+		req.cb_completed = bind_front(&ctrl_ctx::cb_m_s_ialloc_dd, this, rctx, i);
+
+		dd_write(move(req));
+	}
+}
+
+void ctrl_ctx::cb_m_s_ialloc_dd(shared_ptr<ctx_m_s_ialloc> rctx, size_t bi,
+		dd_write_request_t&& req)
+{
+	/* Store result of write request */
+	{
+		auto& b = rctx->blocks[bi];
+		b.result = req.result;
+		b.completed = true;
+	}
+
+	/* Test if all write requests have completed */
+	for (auto& b : rctx->blocks)
+	{
+		if (!b.completed)
+			return;
+	}
+
+	/* Check return codes of individual block write requests */
+	bool error = false;
+	for (auto& b : rctx->blocks)
+	{
+		if (b.result != err::SUCCESS)
+		{
+			error = true;
+			fprintf(stderr, "Failed to write inode allocator bitmap to dd %u.\n",
+					(unsigned) b.dd->id);
+		}
+	}
+
+	if (error)
+		throw runtime_error("Failed to write inode allocator bitmap to disk");
+
+	/* Reset dirty flag */
+	inode_directory.allocator_dirty = false;
+}
+
+void ctrl_ctx::store_inodes()
+{
+	/* Find all inodes that need to be stored */
+	auto rctx = make_shared<ctx_m_s_inodes>();
+
+	for (auto [node_id, node] : inode_directory.cached_inodes)
+	{
+		if (node->dirty)
+			rctx->nodes_to_store.emplace_back(node_id, node);
+	}
+
+	/* Submit first node if any */
+	if (rctx->nodes_to_store.size() > 0)
+	{
+		for (auto& dd : dds)
+			rctx->blocks.emplace_back(&dd);
+
+		store_inodes_node(rctx);
+	}
+}
+
+void ctrl_ctx::store_inodes_node(shared_ptr<ctx_m_s_inodes> rctx)
+{
+	/* Lock inode */
+	inode_lock_request_t req;
+	req.node_id = rctx->nodes_to_store.back().node_id;
+	req.cb_acquired = bind_front(&ctrl_ctx::cb_m_s_inodes_ilock, this, rctx);
+
+	lock_inode(req);
+}
+
+void ctrl_ctx::cb_m_s_inodes_ilock(shared_ptr<ctx_m_s_inodes> rctx,
+		inode_lock_request_t& ilck)
+{
+	rctx->ilck = inode_lock_witness(bind_front(&ctrl_ctx::unlock_inode, this), ilck);
+
+	auto& nts = rctx->nodes_to_store.back();
+
+	/* Check if the node is still cached, otherwise proceed with the next
+	 * node.
+	 * NOTE: This might lead to a large recursion depth... */
+	if (inode_directory.cached_inodes.find(nts.node_id) == inode_directory.cached_inodes.end())
+	{
+		rctx->nodes_to_store.pop_back();
+		rctx->ilck = inode_lock_witness();
+		store_inodes_node(rctx);
+		return;
+	}
+
+	/* Calculate position, serialize inodes, reset dirty flag, and unlock
+	 * inode */
+	auto pos = (nts.node_id - 1) * 4096;
+	nts.node->serialize(rctx->buf.ptr());
+
+	nts.node->dirty = false;
+
+	 /* Calculate positions on dds and submit io requests */
+	for (size_t i = 0; i < rctx->blocks.size(); i++)
+	{
+		auto& b = rctx->blocks[i];
+		b.completed = false;
+		b.result = -1;
+
+		dd_write_request_t req;
+
+		req.dd = b.dd;
+		req.offset = b.dd->inode_directory_offset + pos;
+		req.size = 4096;
+		req.data = rctx->buf.ptr();
+		req.cb_completed = bind_front(&ctrl_ctx::cb_m_s_inodes_dd, this, rctx, i);
+
+		dd_write(move(req));
+	}
+}
+
+void ctrl_ctx::cb_m_s_inodes_dd(shared_ptr<ctx_m_s_inodes> rctx, size_t bi, dd_write_request_t&& req)
+{
+	/* Store result of write request */
+	{
+		auto& b = rctx->blocks[bi];
+		b.result = req.result;
+		b.completed = true;
+	}
+
+	/* Test if all write requests have completed */
+	for (auto& b : rctx->blocks)
+	{
+		if (!b.completed)
+			return;
+	}
+
+	/* Check return codes of individual write requests */
+	for (auto& b : rctx->blocks)
+	{
+		if (b.result != err::SUCCESS)
+			throw runtime_error("Failed to write inode to disk");
+	}
+
+	/* Reset dirty flag of inode and unlock inode */
+	rctx->nodes_to_store.back().node->dirty = false;
+	rctx->nodes_to_store.pop_back();
+	rctx->ilck = inode_lock_witness();
+
+	/* Continue with next inode if any */
+	if (rctx->nodes_to_store.size() > 0)
+		store_inodes_node(rctx);
+}
+
+
+void ctrl_ctx::perform_shutdown()
+{
+	/* SHUTDOWN PROCEDURE */
+	/* 0 Stop accepting new clients */
+	/* 0 Stop answering new client requests */
+	/* 0 Stop background tasks */
+	/* 1 Wait for all clients to become idle and for background tasks to stop */
+	/* 1 Remove all clients */
+	/* 2 Save metadata */
+	/* 2 Stop main loop */
+
+	switch (shutdown_state)
+	{
+	case 0:
+		initiate_shutdown();
+		break;
+
+	case 1:
+		shutdown_wait_for_operations();
+		break;
+
+	case 2:
+		shutdown_wait_metadata();
+		break;
+
+	default:
+		throw runtime_error("invalid shutdown state");
+	}
+}
+
+void ctrl_ctx::initiate_shutdown()
+{
+	printf("Shutdown procedure initiated.\n");
+
+	/* Stop accepting new clients */
+	stop_accepting_new_clients = true;
+
+	/* Stop answering new client requests */
+	stop_accepting_client_requests = true;
+
+	/* Stop background tasks */
+	background_job_enabled = false;
+	bg_tfd.stop();
+
+	shutdown_state = 1;
+
+	printf("  waiting for operations to complete...\n");
+	shutdown_wait_for_operations();
+}
+
+void ctrl_ctx::shutdown_wait_for_operations()
+{
+	/* Check for all kinds of pending requests - these are the only asynchronous
+	 * operations that can be in progress. */
+
+	/* dd IO requests */
+	for (auto& dd : dds)
+	{
+		if (dd.read_reqs.size() > 0 || dd.write_reqs.size() > 0)
+			return;
+	}
+
+	/* inode lock requests */
+	/* Note that a held lock is no reasion for an entity to block - hence they
+	 * do not need to be checked here. */
+	for (auto& [node_id,nl] : inode_directory.node_locks)
+	{
+		if (nl.reqs.size() > 0)
+			return;
+	}
+
+	/* inode allocator lock requests */
+	if (inode_directory.allocator_lock_reqs.size() > 0)
+		return;
+
+	/* block allocator lock requests */
+	if (block_allocator.lock_reqs.size() > 0)
+		return;
+
+	/* Clients with outgoing messages in in flight
+	 * Note that invalid clients with a non-empty send-queue that still exist
+	 * will be removed shortly after, i.e. when the last message in flight was
+	 * successfully sent or sending aborted with an error. */
+	for (auto c : clients)
+	{
+		if (c->send_queue.size() > 0)
+			return;
+	}
+
+	/* io uring requests in flight (should be caught be the other request types
+	 * though, hence the exception) */
+	if (io_uring_req_in_flight != 0)
+		throw runtime_error("io uring request in flight during shutdown");
+
+	/* Remove all clients */
+	while (clients.size() > 0)
+		remove_client(clients.begin());
+
+	/* Initiate final metadata saving */
+	store_metadata();
+
+	shutdown_state = 2;
+
+	printf("  waiting for metadata to be saved...\n");
+	shutdown_wait_metadata();
+}
+
+void ctrl_ctx::shutdown_wait_metadata()
+{
+	/* Wait for metadata to be saved; this can only be delayed by dd IO */
+	for (auto& dd : dds)
+	{
+		if (dd.read_reqs.size() > 0 || dd.write_reqs.size() > 0)
+			return;
+	}
+
+	/* Stop the main loop */
+	printf("  stopping.\n");
+	quit_main_loop = true;
 }
