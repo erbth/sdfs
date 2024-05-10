@@ -749,7 +749,7 @@ protected:
 
 	void print_cfg();
 
-	void initialize_dd_host(const std::string& addr_str);
+	std::pair<WrappedFD, struct sockaddr_in6> initialize_dd_host(const std::string& addr_str);
 	void initialize_connect_dd(const struct in6_addr& addr, ctrl_dd& dd);
 
 	void initialize_cfg();

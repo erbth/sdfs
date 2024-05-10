@@ -237,7 +237,7 @@ void ctrl_ctx::initialize_cfg()
 		throw runtime_error("At least one dd and dd-host must be defined");
 }
 
-void ctrl_ctx::initialize_dd_host(const string& addr_str)
+pair<WrappedFD, struct sockaddr_in6> ctrl_ctx::initialize_dd_host(const string& addr_str)
 {
 	printf("Connecting to dd-host %s...\n", addr_str.c_str());
 
@@ -269,18 +269,24 @@ void ctrl_ctx::initialize_dd_host(const string& addr_str)
 
 	try
 	{
-		for (struct addrinfo* ai = addrs; ai; ai = ai->ai_next)
+		while (!connected && !quit_requested)
 		{
-			wfd.set_errno(socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0), "socket");
-
-			addr.sin6_addr = ((const struct sockaddr_in6&) ai->ai_addr).sin6_addr;
-
-			auto ret = connect(wfd.get_fd(), (const struct sockaddr*) &addr, sizeof(addr));
-			if (ret == 0)
+			for (struct addrinfo* ai = addrs; ai; ai = ai->ai_next)
 			{
-				connected = true;
-				break;
+				wfd.set_errno(socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0), "socket");
+
+				addr.sin6_addr = ((const struct sockaddr_in6&) ai->ai_addr).sin6_addr;
+
+				auto ret = connect(wfd.get_fd(), (const struct sockaddr*) &addr, sizeof(addr));
+				if (ret == 0)
+				{
+					connected = true;
+					break;
+				}
 			}
+
+			if (!connected)
+				sfd.check(1000);
 		}
 
 		freeaddrinfo(addrs);
@@ -294,37 +300,7 @@ void ctrl_ctx::initialize_dd_host(const string& addr_str)
 	if (!connected)
 		throw runtime_error("Failed to connect to dd-host `" + addr_str + "'");
 
-
-	/* List dds */
-	send_stream_msg(wfd.get_fd(), prot::dd_mgr_fe::req::query_dds());
-	auto reply = receive_stream_msg<
-		prot::dd_mgr_fe::reply::query_dds,
-		prot::dd_mgr_fe::reply::parse
-			>(wfd.get_fd(), 30000);
-
-	for (const auto& desc : reply->dds)
-	{
-		for (auto& dd : dds)
-		{
-			if (dd.id == desc.id)
-			{
-				if (desc.port < SDFS_DD_PORT_START || desc.port > SDFS_DD_PORT_END)
-					throw runtime_error("Received invalid dd port");
-
-				if (dd.wfd)
-				{
-					printf("  ignoring duplicate dd: %u\n", dd.id);
-					continue;
-				}
-
-				dd.port = desc.port;
-				initialize_connect_dd(addr.sin6_addr, dd);
-				break;
-			}
-		}
-	}
-
-	printf("\n");
+	return make_pair(move(wfd), addr);
 }
 
 void ctrl_ctx::initialize_connect_dd(const struct in6_addr& addr, ctrl_dd& dd)
@@ -389,21 +365,88 @@ void ctrl_ctx::initialize_connect_dds()
 	}
 
 	/* Connect to dd hosts and to corresponding dds */
+	vector<pair<WrappedFD, struct sockaddr_in6>> ddh_conns;
 	for (const auto& ddh : cfg.dd_hosts)
-		initialize_dd_host(ddh.addr_str);
+		ddh_conns.emplace_back(move(initialize_dd_host(ddh.addr_str)));
 
-	/* Check if all dds are connected */
-	bool have_unconnected = false;
-	printf("dd status:\n");
-	for (auto& dd : dds)
+	/* Connect to dds - this means waiting until all dds appear at dd hosts and
+	 * connecting to them. */
+	map<unsigned, int> connected_dds_hosts;
+	bool have_unconnected = true;
+
+	printf("Waiting for dds...\n");
+
+	bool change = true;
+	while (!quit_requested)
 	{
-		printf("  %u: %s\n", dd.id, (dd.connected ? "conn" : "unconn"));
+		for (auto& [ddh_conn, addr] : ddh_conns)
+		{
+			/* List dds */
+			send_stream_msg(ddh_conn.get_fd(), prot::dd_mgr_fe::req::query_dds());
+			auto reply = receive_stream_msg<
+				prot::dd_mgr_fe::reply::query_dds,
+				prot::dd_mgr_fe::reply::parse
+					>(ddh_conn.get_fd(), 30000);
 
-		if (!dd.connected)
-			have_unconnected = true;
+			for (const auto& desc : reply->dds)
+			{
+				for (auto& dd : dds)
+				{
+					if (dd.id == desc.id)
+					{
+						if (desc.port < SDFS_DD_PORT_START || desc.port > SDFS_DD_PORT_END)
+							throw runtime_error("Received invalid dd port");
+
+						if (dd.wfd)
+						{
+							auto ref = connected_dds_hosts.find(dd.id);
+							if (
+									dd.port != desc.port ||
+									(ref != connected_dds_hosts.end() && ref->second != ddh_conn.get_fd())
+							   )
+							{
+								printf("  ignoring duplicate dd (different host/port): %u\n", dd.id);
+							}
+
+							continue;
+						}
+
+						dd.port = desc.port;
+						initialize_connect_dd(addr.sin6_addr, dd);
+
+						connected_dds_hosts.emplace(dd.id, ddh_conn.get_fd());
+						change = true;
+						break;
+					}
+				}
+			}
+		}
+
+		if (change)
+		{
+			/* Check if all dds are connected */
+			bool all_connected = true;
+			printf("\ndd status:\n");
+			for (auto& dd : dds)
+			{
+				printf("  %u: %s\n", dd.id, (dd.connected ? "conn" : "unconn"));
+
+				if (!dd.connected)
+					all_connected = false;
+			}
+
+			printf("\n");
+
+			if (all_connected)
+			{
+				have_unconnected = false;
+				break;
+			}
+		}
+
+		change = false;
+		sfd.check(1000);
 	}
-
-	printf("\n");
 
 	if (have_unconnected)
 		throw runtime_error("unconnected dds present");

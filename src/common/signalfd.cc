@@ -3,6 +3,7 @@
 extern "C" {
 #include <unistd.h>
 #include <sys/signalfd.h>
+#include <poll.h>
 }
 
 using namespace std;
@@ -44,4 +45,16 @@ void SignalFD::on_sfd(int fd, uint32_t events)
 		throw system_error(errno, generic_category(), "read(signalfd)");
 
 	cb(fdsi.ssi_signo);
+}
+
+void SignalFD::check(int timeout)
+{
+	struct pollfd pfd = {
+		.fd = wfd.get_fd(),
+		.events = POLLIN,
+		.revents = 0
+	};
+
+	if (check_syscall(poll(&pfd, 1, timeout), "poll(signalfd)") > 0)
+		on_sfd(wfd.get_fd(), EPOLLIN);
 }
