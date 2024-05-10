@@ -1062,7 +1062,7 @@ void ctrl_ctx::on_client_writev_finished(shared_ptr<ctrl_client> client, int res
 
 	/* Submit messages on queue */
 	if (io_uring_req_in_flight >= io_uring_max_req_in_flight)
-		return;
+		throw runtime_error("io uring instance full");
 
 	unsigned cnt_msgs = 0;
 	auto iq = client->send_queue.begin();
@@ -2223,9 +2223,11 @@ bool ctrl_ctx::send_message_to_client(shared_ptr<ctrl_client> client,
 	auto was_empty = client->send_queue.empty();
 	client->send_queue.emplace_back(move(buf), msg_len);
 
-	/* TODO: what to do in the other case... */
-	if (was_empty && io_uring_req_in_flight < io_uring_max_req_in_flight)
+	if (was_empty)
 	{
+		if (io_uring_req_in_flight >= io_uring_max_req_in_flight)
+			throw runtime_error("io uring instance full");
+
 		auto& qmsg = client->send_queue.front();
 		client->send_iovs[0].iov_base = (char*) qmsg.buf_ptr();
 		client->send_iovs[0].iov_len = qmsg.msg_len;

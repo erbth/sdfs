@@ -620,10 +620,7 @@ struct ctrl_client final
 	/* Send messages */
 	std::deque<ctrl_queued_msg> send_queue;
 	size_t send_msg_pos = 0;
-	struct iovec send_iovs[32]{};
-
-	/* At least one message on the queue has been submitted to io_uring */
-	bool send_msg_submitted = false;
+	struct iovec send_iovs[128]{};
 
 	inline int get_fd()
 	{
@@ -654,8 +651,9 @@ protected:
 		std::bind_front(&ctrl_ctx::on_background_timer, this)};
 
 	/* NOTE: Epoll comes before because IOUring polls epoll's filedescriptor */
-	const unsigned io_uring_max_req_in_flight = 250;
-	IOUring io_uring{next_power_of_two(io_uring_max_req_in_flight + 1)};
+	const unsigned io_uring_max_req_in_flight = 4080;
+	/* poll + in-flight */
+	IOUring io_uring{next_power_of_two(io_uring_max_req_in_flight + 2)};
 
 	unsigned io_uring_req_in_flight = 0;
 

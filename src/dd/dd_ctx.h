@@ -145,7 +145,8 @@ protected:
 		std::bind(&dd_ctx::on_signal, this, std::placeholders::_1)};
 
 	/* NOTE: Epoll comes before because IOUring polls epoll's filedescriptor */
-	IOUring io_uring{next_power_of_two(max_ios_in_flight + 1)};
+	/* poll + in-flight */
+	IOUring io_uring{next_power_of_two(max_ios_in_flight + 2)};
 
 	int port = 0;
 	WrappedFD sock;
