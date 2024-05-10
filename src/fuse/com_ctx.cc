@@ -381,6 +381,11 @@ bool com_ctx::process_message(
 
 	switch (msg->num)
 	{
+		case prot::client::reply::FORGET:
+			return process_message(
+					ctrl,
+					static_cast<prot::client::reply::forget&>(*msg));
+
 		case prot::client::reply::GETATTR:
 			return process_message(
 					ctrl,
@@ -390,6 +395,11 @@ bool com_ctx::process_message(
 			return process_message(
 					ctrl,
 					static_cast<prot::client::reply::getfattr&>(*msg));
+
+		case prot::client::reply::UNLINK:
+			return process_message(
+					ctrl,
+					static_cast<prot::client::reply::unlink&>(*msg));
 
 		case prot::client::reply::READDIR:
 			return process_message(
@@ -417,6 +427,15 @@ bool com_ctx::process_message(
 	}
 }
 
+bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::forget& msg)
+{
+	/* Find corresponding request */
+	auto& req = find_req_for_reply(ctrl, msg);
+	req.cb_forget(msg);
+	finish_req(ctrl, req);
+	return false;
+}
+
 bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::getattr& msg)
 {
 	/* Find corresponding request */
@@ -441,6 +460,15 @@ bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::getfattr& msg
 	/* Find corresponding request */
 	auto& req = find_req_for_reply(ctrl, msg);
 	req.cb_getfattr(msg);
+	finish_req(ctrl, req);
+	return false;
+}
+
+bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::unlink& msg)
+{
+	/* Find corresponding request */
+	auto& req = find_req_for_reply(ctrl, msg);
+	req.cb_unlink(msg);
 	finish_req(ctrl, req);
 	return false;
 }
@@ -516,6 +544,24 @@ com_ctrl* com_ctx::choose_ctrl()
 }
 
 
+void com_ctx::request_forget(unsigned long node_id, req_cb_forget_t cb)
+{
+	unique_lock lk(m);
+	request_t req{};
+
+	auto ctrl = choose_ctrl();
+	ctrl->set_req_id(req);
+
+	req.cb_forget = cb;
+
+	prot::client::req::forget msg;
+	msg.req_id = req.id;
+	msg.node_id = node_id;
+
+	add_req(ctrl, req);
+	send_message(ctrl, msg);
+}
+
 void com_ctx::request_getattr(req_cb_getattr_t cb)
 {
 	unique_lock lk(m);
@@ -544,6 +590,26 @@ void com_ctx::request_getfattr(unsigned long node_id, req_cb_getfattr_t cb)
 	prot::client::req::getfattr msg;
 	msg.req_id = req.id;
 	msg.node_id = node_id;
+
+	add_req(ctrl, req);
+	send_message(ctrl, msg);
+}
+
+void com_ctx::request_unlink(unsigned long parent_node_id, const char* name,
+		req_cb_unlink_t cb)
+{
+	unique_lock lk(m);
+	request_t req{};
+
+	auto ctrl = choose_ctrl();
+	ctrl->set_req_id(req);
+
+	req.cb_unlink = cb;
+
+	prot::client::req::unlink msg;
+	msg.req_id = req.id;
+	msg.parent_node_id = parent_node_id;
+	msg.name = name;
 
 	add_req(ctrl, req);
 	send_message(ctrl, msg);

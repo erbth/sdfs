@@ -36,8 +36,10 @@ struct req_getattr_result
 	size_t inodes_used;
 };
 
+typedef std::function<void(prot::client::reply::forget&)> req_cb_forget_t;
 typedef std::function<void(req_getattr_result)> req_cb_getattr_t;
 typedef std::function<void(prot::client::reply::getfattr&)> req_cb_getfattr_t;
+typedef std::function<void(prot::client::reply::unlink&)> req_cb_unlink_t;
 typedef std::function<void(prot::client::reply::readdir&)> req_cb_readdir_t;
 typedef std::function<void(prot::client::reply::create&)> req_cb_create_t;
 
@@ -52,8 +54,10 @@ struct request_t final
 {
 	uint64_t id;
 
+	req_cb_forget_t cb_forget;
 	req_cb_getattr_t cb_getattr;
 	req_cb_getfattr_t cb_getfattr;
+	req_cb_unlink_t cb_unlink;
 	req_cb_readdir_t cb_readdir;
 	req_cb_create_t cb_create;
 	req_cb_read_t cb_read;
@@ -123,8 +127,10 @@ protected:
 	void on_ctrl_fd(com_ctrl* ctrl, int fd, uint32_t events);
 
 	bool process_message(com_ctrl* ctrl, dynamic_aligned_buffer&& buf, size_t msg_len);
+	bool process_message(com_ctrl* ctrl, prot::client::reply::forget& msg);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::getattr& msg);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::getfattr& msg);
+	bool process_message(com_ctrl* ctrl, prot::client::reply::unlink& msg);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::readdir& msg);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::create& msg);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::read& msg);
@@ -145,8 +151,12 @@ public:
 	void initialize();
 	void start_threads();
 
+	void request_forget(unsigned long node_id, req_cb_forget_t cb);
 	void request_getattr(req_cb_getattr_t cb);
 	void request_getfattr(unsigned long node_id, req_cb_getfattr_t cb);
+	void request_unlink(unsigned long parent_node_id, const char*
+			name, req_cb_unlink_t cb);
+
 	void request_readdir(unsigned long node_id, req_cb_readdir_t cb);
 	void request_create(unsigned long parent_node_id, const char* name,
 			req_cb_create_t cb);

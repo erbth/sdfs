@@ -160,6 +160,82 @@ namespace req
 	}
 
 
+	unlink::unlink()
+		: msg(UNLINK)
+	{
+	}
+
+	size_t unlink::serialize(char* buf) const
+	{
+		if (name.size() > 255)
+			throw invalid_argument("name may be at most 255 characters long");
+
+		size_t size = 16 + msg_size_base + name.size();
+
+		if (buf)
+		{
+			swrite_u32(buf, size - 4);
+			swrite_u32(buf, num);
+			swrite_u64(buf, req_id);
+
+			swrite_u64(buf, parent_node_id);
+			swrite_u8(buf, name.size());
+
+			memcpy(buf, name.c_str(), name.size());
+		}
+
+		return size;
+	}
+
+	void unlink::parse(const char* buf, size_t size)
+	{
+		if (size < 12 + msg_size_base)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(buf);
+
+		parent_node_id = sread_u64(buf);
+		auto namesz = sread_u8(buf);
+
+		if (size != 12 + msg_size_base + namesz)
+			throw invalid_msg_size(num, size);
+
+		name = string(buf, namesz);
+	}
+
+
+	forget::forget()
+		: msg(FORGET)
+	{
+	}
+
+	size_t forget::serialize(char* buf) const
+	{
+		size_t size = 16 + msg_size;
+
+		if (buf)
+		{
+			swrite_u32(buf, size - 4);
+			swrite_u32(buf, num);
+			swrite_u64(buf, req_id);
+
+			swrite_u64(buf, node_id);
+		}
+
+		return size;
+	}
+
+	void forget::parse(const char* buf, size_t size)
+	{
+		if (size != 12 + msg_size)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(buf);
+
+		node_id = sread_u64(buf);
+	}
+
+
 	read::read()
 		: msg(READ)
 	{
@@ -269,6 +345,20 @@ namespace req
 			case CREATE:
 			{
 				auto msg = make_unique<create>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			case UNLINK:
+			{
+				auto msg = make_unique<unlink>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			case FORGET:
+			{
+				auto msg = make_unique<forget>();
 				msg->parse(buf, size);
 				return msg;
 			}
@@ -500,6 +590,80 @@ namespace reply
 	}
 
 
+	unlink::unlink()
+		: msg(UNLINK)
+	{
+	}
+
+	unlink::unlink(uint64_t req_id, int res)
+		: msg(UNLINK, req_id), res(res)
+	{
+	}
+
+	size_t unlink::serialize(char* buf) const
+	{
+		size_t size = 16 + msg_size;
+
+		if (buf)
+		{
+			swrite_u32(buf, size - 4);
+			swrite_u32(buf, num);
+			swrite_u64(buf, req_id);
+
+			swrite_i32(buf, res);
+		}
+
+		return size;
+	}
+
+	void unlink::parse(const char* buf, size_t size)
+	{
+		if (size != 12 + msg_size)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(buf);
+
+		res = sread_i32(buf);
+	}
+
+
+	forget::forget()
+		: msg(FORGET)
+	{
+	}
+
+	forget::forget(uint64_t req_id, int res)
+		: msg(FORGET, req_id), res(res)
+	{
+	}
+
+	size_t forget::serialize(char* buf) const
+	{
+		size_t size = 16 + msg_size;
+
+		if (buf)
+		{
+			swrite_u32(buf, size - 4);
+			swrite_u32(buf, num);
+			swrite_u64(buf, req_id);
+
+			swrite_i32(buf, res);
+		}
+
+		return size;
+	}
+
+	void forget::parse(const char* buf, size_t size)
+	{
+		if (size != 12 + msg_size)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(buf);
+
+		res = sread_i32(buf);
+	}
+
+
 	read::read()
 		: msg(READ)
 	{
@@ -613,6 +777,20 @@ namespace reply
 			case CREATE:
 			{
 				auto msg = make_unique<create>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			case UNLINK:
+			{
+				auto msg = make_unique<unlink>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
+			case FORGET:
+			{
+				auto msg = make_unique<forget>();
 				msg->parse(buf, size);
 				return msg;
 			}

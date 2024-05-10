@@ -24,6 +24,10 @@ struct msg : public prot::msg
 
 namespace req
 {
+	/* GETFATTR and CREATE are the only operations which introduces a reference
+	 * of the client on the file. Hence each request of READ or WRITE should be
+	 * preceeded by a request of GETFATTR (or CREATE), otherwise the file might
+	 * be deleted in between. */
 	enum msg_nums : unsigned {
 		GETATTR = 1,
 		GETFATTR,
@@ -31,6 +35,7 @@ namespace req
 		CREATE,
 		UNLINK,
 		MKDIR,
+		FORGET,
 		READ,
 		WRITE
 	};
@@ -77,6 +82,31 @@ namespace req
 
 	protected:
 		static constexpr size_t msg_size_base = 9;
+	};
+
+	struct unlink : public msg
+	{
+		unsigned long parent_node_id;
+		std::string name;
+
+		unlink();
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size_base = 9;
+	};
+
+	struct forget : public msg
+	{
+		unsigned long node_id;
+
+		forget();
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size = 8;
 	};
 
 
@@ -129,6 +159,7 @@ namespace reply
 		CREATE,
 		UNLINK,
 		MKDIR,
+		FORGET,
 		READ,
 		WRITE
 	};
@@ -214,6 +245,34 @@ namespace reply
 
 	protected:
 		static constexpr size_t msg_size = 4 + 4*8;
+	};
+
+	struct unlink : public msg
+	{
+		int res{};
+
+		unlink();
+		unlink(uint64_t req_id, int res);
+
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size = 4;
+	};
+
+	struct forget : public msg
+	{
+		int res{};
+
+		forget();
+		forget(uint64_t req_id, int res);
+
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size = 4;
 	};
 
 	struct read : public msg

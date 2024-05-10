@@ -3,6 +3,7 @@
 
 #define FUSE_USE_VERSION 34
 
+#include <mutex>
 #include <fuse_lowlevel.h>
 #include "com_ctx.h"
 #include "common/open_list.h"
@@ -28,7 +29,9 @@ protected:
 	/* Operations */
 
 	void op_lookup(fuse_req_t req, fuse_ino_t parent, const char* name);
+	void op_forget(fuse_req_t req, fuse_ino_t ino, uint64_t lookup);
 	void op_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi);
+	void op_unlink(fuse_req_t req, fuse_ino_t parent, const char* name);
 	void op_readdir(fuse_req_t req, fuse_ino_t ino,
 			size_t size, off_t off, struct fuse_file_info* fi);
 
@@ -44,7 +47,9 @@ protected:
 			mode_t mode, struct fuse_file_info* fi);
 
 	static void _op_lookup(fuse_req_t req, fuse_ino_t parent, const char* name);
+	static void _op_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup);
 	static void _op_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi);
+	static void _op_unlink(fuse_req_t req, fuse_ino_t parent, const char* name);
 	static void _op_readdir(fuse_req_t req, fuse_ino_t ino,
 			size_t size, off_t off, struct fuse_file_info* fi);
 
@@ -63,7 +68,9 @@ protected:
 
 	static constexpr struct fuse_lowlevel_ops f_ops = {
 		.lookup = _op_lookup,
+		.forget = _op_forget,
 		.getattr = _op_getattr,
+		.unlink = _op_unlink,
 		.open = _op_open,
 		.read = _op_read,
 		.write = _op_write,
@@ -80,8 +87,10 @@ protected:
 	void cb_lookup2(fuse_req_t req, fuse_ino_t parent, fuse_ino_t ino,
 			prot::client::reply::getfattr& msg);
 
+	void cb_forget(fuse_req_t req, prot::client::reply::forget& msg);
 	void cb_getattr(fuse_req_t req, req_getattr_result res);
 	void cb_getfattr(fuse_req_t req, fuse_ino_t ino, prot::client::reply::getfattr& msg);
+	void cb_unlink(fuse_req_t req, prot::client::reply::unlink& msg);
 	void cb_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 			prot::client::reply::readdir& msg);
 
@@ -96,10 +105,18 @@ protected:
 			prot::client::reply::write& msg);
 
 	/* File handling */
+	std::mutex m_open_files;
 	open_list<file_ctx> open_files;
 
 	open_list<file_ctx>::node* setup_file_struct(
 		int flags, struct fuse_file_info& fi, fuse_ino_t ino);
+
+	std::mutex m_lookup_counts;
+	std::map<fuse_ino_t, uint64_t> lookup_counts;
+
+	/* NOTE: This function locks the list by itself. Make sure to keep this in
+	 * mind for avoiding deadlocks. */
+	void increase_lookup_count(fuse_ino_t ino);
 
 public:
 	sdfs_fuse_ctx(int argc, char** argv);

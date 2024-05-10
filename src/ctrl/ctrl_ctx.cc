@@ -668,6 +668,8 @@ void ctrl_ctx::on_background_timer()
 	if (!background_job_enabled)
 		return;
 
+	purge_unreferenced_inodes();
+
 	/* Note that it is no problem if two store_metadata calls overlap, as long
 	 * as the dds are not overwhelmed by the IO they generated. All resources
 	 * are protected by locks. */
@@ -1132,6 +1134,16 @@ bool ctrl_ctx::process_client_message(
 					client,
 					static_cast<prot::client::req::create&>(*msg));
 
+		case prot::client::req::UNLINK:
+			return process_client_message(
+					client,
+					static_cast<prot::client::req::unlink&>(*msg));
+
+		case prot::client::req::FORGET:
+			return process_client_message(
+					client,
+					static_cast<prot::client::req::forget&>(*msg));
+
 		case prot::client::req::READ:
 			return process_client_message(
 					client,
@@ -1228,6 +1240,9 @@ void ctrl_ctx::cb_c_r_getfattr_inode(
 			reply.mtime = req.node->mtime;
 			reply.size = req.node->size;
 			reply.allocated_size = req.node->get_allocated_size();
+
+			/* Reference inode */
+			inode_add_client_ref(req.node, client);
 		}
 		else
 		{
@@ -1424,6 +1439,9 @@ void ctrl_ctx::cb_c_r_create_ilock(shared_ptr<ctx_c_r_create> rctx, inode_lock_r
 	rctx->node->mtime = get_wt_now();
 	rctx->node->size = 0;
 
+	/* Reference inode */
+	inode_add_client_ref(rctx->node, rctx->client);
+
 	/* Lock parent inode w */
 	inode_lock_request_t req;
 	req.node_id = rctx->msg.parent_node_id;
@@ -1499,16 +1517,269 @@ void ctrl_ctx::cb_c_r_create_getp(shared_ptr<ctx_c_r_create> rctx, get_inode_req
 }
 
 
-/* UNLINK */
-/* Lock inode allocator */
-/* Lock inode w */
-/* Remove inode */
-/* Free blocks */
-/* Unlock inode w */
-/* Unlock inode allocator */
+bool ctrl_ctx::process_client_message(
+		shared_ptr<ctrl_client> client, prot::client::req::unlink& msg)
+{
+	/* UNLINK */
+	/* b Lock parent inode w */
+	/* b Retrieve parent inode */
+	/*   Find link to inode */
+	/* b Lock inode w */
+	/* b Retrieve inode */
+	/*   Remove link */
+
+	if (msg.parent_node_id == 0 || msg.name.size() == 0)
+	{
+		return send_message_to_client(
+				client,
+				prot::client::reply::unlink(msg.req_id, err::INVAL));
+	}
+
+	auto rctx = make_shared<ctx_c_r_unlink>(msg);
+	rctx->client = client;
+
+	/* Lock parent inode w */
+	inode_lock_request_t req;
+
+	req.node_id = rctx->msg.parent_node_id;
+	req.write = true;
+	req.cb_acquired = bind_front(&ctrl_ctx::cb_c_r_unlink_ilock, this, rctx);
+	lock_inode(req);
+
+	return false;
+}
+
+void ctrl_ctx::cb_c_r_unlink_ilock(
+		shared_ptr<ctx_c_r_unlink> rctx, inode_lock_request_t& ilck)
+{
+	rctx->p_ilck = inode_lock_witness(bind_front(&ctrl_ctx::unlock_inode, this), ilck);
+
+	/* Retrieve parent inode */
+	get_inode_request_t req;
+
+	req.node_id = rctx->msg.parent_node_id;
+	req.cb_finished = bind_front(&ctrl_ctx::cb_c_r_unlink_getnode, this, rctx);
+	get_inode(move(req));
+}
+
+void ctrl_ctx::cb_c_r_unlink_getnode(
+		shared_ptr<ctx_c_r_unlink> rctx, get_inode_request_t&& ireq)
+{
+	if (ireq.result != err::SUCCESS)
+	{
+		send_message_to_client(
+				rctx->client,
+				prot::client::reply::unlink(rctx->msg.req_id, ireq.result));
+		return;
+	}
+
+	rctx->parent_node = ireq.node;
+
+	if (rctx->parent_node->type != inode::TYPE_DIRECTORY)
+	{
+		send_message_to_client(
+				rctx->client,
+				prot::client::reply::unlink(rctx->msg.req_id, err::NOTDIR));
+		return;
+	}
+
+	/* Find link to inode */
+	bool found = false;
+
+	for (const auto& [name, node_id, node_type] : rctx->parent_node->files)
+	{
+		if (name == rctx->msg.name)
+		{
+			if (node_type != inode::TYPE_FILE)
+			{
+				send_message_to_client(
+						rctx->client,
+						prot::client::reply::unlink(rctx->msg.req_id, err::ISDIR));
+				return;
+			}
+
+			found = true;
+			rctx->entry_node_id = node_id;
+			break;
+		}
+	}
+
+	if (!found)
+	{
+		send_message_to_client(
+				rctx->client,
+				prot::client::reply::unlink(rctx->msg.req_id, err::NOENT));
+		return;
+	}
+
+	/* Lock inode w */
+	inode_lock_request_t req;
+
+	req.node_id = rctx->entry_node_id;
+	req.write = true;
+	req.cb_acquired = bind_front(&ctrl_ctx::cb_c_r_unlink_lock_entry, this, rctx);
+
+	lock_inode(req);
+}
+
+void ctrl_ctx::cb_c_r_unlink_lock_entry(
+		shared_ptr<ctx_c_r_unlink> rctx, inode_lock_request_t& ilck)
+{
+	rctx->e_ilck = inode_lock_witness(bind_front(&ctrl_ctx::unlock_inode, this), ilck);
+
+	/* Retrieve inode */
+	get_inode_request_t req;
+
+	req.node_id = rctx->entry_node_id;
+	req.cb_finished = bind_front(&ctrl_ctx::cb_c_r_unlink_get_entry, this, rctx);
+
+	get_inode(move(req));
+}
+
+void ctrl_ctx::cb_c_r_unlink_get_entry(
+		shared_ptr<ctx_c_r_unlink> rctx, get_inode_request_t&& req)
+{
+	if (req.result != err::SUCCESS)
+	{
+		send_message_to_client(
+				rctx->client,
+				prot::client::reply::unlink(rctx->msg.req_id, req.result));
+		return;
+	}
+
+	auto entry = req.node;
+
+	/* Remove link */
+	auto entry_node_id = rctx->entry_node_id;
+	auto i = find_if(
+			rctx->parent_node->files.begin(),
+			rctx->parent_node->files.end(),
+			[entry_node_id](auto& e){ return get<1>(e) == entry_node_id; });
+
+	if (i == rctx->parent_node->files.end())
+		throw runtime_error("Directory entry disappeared during unlink");
+
+	rctx->parent_node->files.erase(i);
+	rctx->parent_node->dirty = true;
+
+	if (entry->nlink == 0)
+		throw runtime_error("Unlink on inode with link count 0");
+
+	entry->nlink--;
+	entry->dirty = true;
+
+	send_message_to_client(
+			rctx->client,
+			prot::client::reply::unlink(rctx->msg.req_id, err::SUCCESS));
+}
+
 
 /* MKDIR */
 /* like CREATE */
+
+
+bool ctrl_ctx::process_client_message(
+		shared_ptr<ctrl_client> client, prot::client::req::forget& msg)
+{
+	/* NOTE: This procedure does not guarantee consistend block/inode/inode
+	 * directory metadata on unclean shutdown. */
+
+	/* FORGET */
+	/* b Lock inode allocator */
+	/* b Lock inode w */
+	/* b Retrieve inode */
+	/*   Delete inode if not referenced anymore: */
+	/*     b Lock block allocator */
+	/*       Unallocate ranges */
+	/*       Unallocate inode */
+
+	if (msg.node_id == 0)
+	{
+		return send_message_to_client(
+				client,
+				prot::client::reply::forget(msg.req_id, err::INVAL));
+	}
+
+	auto rctx = make_shared<ctx_c_r_forget>(msg);
+	rctx->client = client;
+
+	/* Lock inode allocator */
+	inode_allocator_lock_request_t req;
+	req.cb_acquired = bind_front(&ctrl_ctx::cb_c_r_forget_ialck, this, rctx);
+
+	lock_inode_allocator(req);
+	return false;
+}
+
+void ctrl_ctx::cb_c_r_forget_ialck(
+		shared_ptr<ctx_c_r_forget> rctx, inode_allocator_lock_request_t& ialck)
+{
+	rctx->ialck = inode_allocator_lock_witness(
+			bind_front(&ctrl_ctx::unlock_inode_allocator, this), ialck);
+
+	/* Lock inode w */
+	inode_lock_request_t req;
+
+	req.node_id = rctx->msg.node_id;
+	req.write = true;
+	req.cb_acquired = bind_front(&ctrl_ctx::cb_c_r_forget_ilck, this, rctx);
+
+	lock_inode(req);
+}
+
+void ctrl_ctx::cb_c_r_forget_ilck(
+		shared_ptr<ctx_c_r_forget> rctx, inode_lock_request_t& ilck)
+{
+	rctx->ilck = inode_lock_witness(bind_front(&ctrl_ctx::unlock_inode, this), ilck);
+
+	/* Retrieve inode */
+	get_inode_request_t req;
+
+	req.node_id = rctx->msg.node_id;
+	req.cb_finished = bind_front(&ctrl_ctx::cb_c_r_forget_getnode, this, rctx);
+
+	get_inode(move(req));
+}
+
+void ctrl_ctx::cb_c_r_forget_getnode(
+		shared_ptr<ctx_c_r_forget> rctx, get_inode_request_t&& node_req)
+{
+	if (node_req.result != err::SUCCESS)
+	{
+		send_message_to_client(
+				rctx->client,
+				prot::client::reply::forget(rctx->msg.req_id, node_req.result));
+		return;
+	}
+
+	rctx->node = node_req.node;
+
+	/* Perform forget for this client */
+	inode_remove_client_ref(rctx->node, rctx->client);
+
+	/* Check if inode is still referenced by another link or another client */
+	if (rctx->node->nlink > 0 || rctx->node->client_refs.size() > 0)
+	{
+		send_message_to_client(
+				rctx->client,
+				prot::client::reply::forget(rctx->msg.req_id, err::SUCCESS));
+		return;
+	}
+
+	/* Lock block allocator */
+	block_allocator_lock_request_t req;
+	req.cb_acquired = bind_front(&ctrl_ctx::cb_c_r_forget_blck, this, rctx);
+	lock_block_allocator(req);
+}
+
+void ctrl_ctx::cb_c_r_forget_blck(
+		shared_ptr<ctx_c_r_forget> rctx, block_allocator_lock_request_t blck)
+{
+	rctx->blck = block_allocator_lock_witness(
+			bind_front(&ctrl_ctx::unlock_block_allocator, this), blck);
+
+	delete_inode(rctx->msg.node_id, rctx->node);
+}
 
 
 bool ctrl_ctx::process_client_message(
@@ -1709,7 +1980,7 @@ bool ctrl_ctx::process_client_message(
 		shared_ptr<ctrl_client> client, prot::client::req::write& msg,
 		dynamic_buffer&& buf)
 {
-	/* Write */
+	/* WRITE */
 	/* b Lock inode w */
 	/* b Retrieve data map(s) */
 	/* b   Lock block allocator if required */
@@ -2249,11 +2520,49 @@ ssize_t ctrl_ctx::get_free_blocks(size_t count)
 	return -1;
 }
 
+void ctrl_ctx::unallocate_blocks(size_t start, size_t count)
+{
+	auto total_blocks = data_map.total_data_size / data_map.allocation_granularity;
+
+	if (start + count > total_blocks)
+		throw invalid_argument("start + count out of range");
+
+
+	for (size_t i = start; i < start + count; i++)
+	{
+		auto pos = i / 8;
+		uint8_t mask = (1 << (i % 8));
+
+		if ((block_allocator.bitmap[pos] & mask) == 0)
+			throw runtime_error("attempted to unallocate block which is not allocated");
+
+		block_allocator.dirty = true;
+		block_allocator.bitmap[pos] &= ~mask;
+		block_allocator.allocated_count--;
+	}
+}
+
 
 void ctrl_ctx::get_inode(get_inode_request_t&& req)
 {
 	if (req.node_id >= data_map.total_inode_count || req.node_id == 0)
 		throw invalid_argument("Inode id out of range");
+
+	/* Check if inode exists, i.e. is allocated */
+	/* This function needs to be called with the inode locked. Hence we can
+	 * access the inode allocator without a lock on the node allocator itself,
+	 * because this bit in the node allocator cannot be changed. */
+	auto alloc_node_id = req.node_id - 1;
+	if ((inode_directory.allocator_bitmap[alloc_node_id / 8] & (1 << (alloc_node_id % 8))) == 0)
+	{
+		req.result = err::NOENT;
+
+		/* Same problem as in lock_inode */
+		auto cb = req.cb_finished;
+		req.cb_finished = nullptr;
+		cb(move(req));
+		return;
+	}
 
 	/* If inode is in cache, return it */
 	auto i = inode_directory.cached_inodes.find(req.node_id);
@@ -2306,6 +2615,7 @@ void ctrl_ctx::cb_m_g_inode(shared_ptr<ctx_m_g_inode> rctx, dd_read_request_t&& 
 
 	rctx->req.result = err::SUCCESS;
 	rctx->req.node = i->second;
+	rctx->req.was_in_cache = !inserted;
 
 	auto cb = rctx->req.cb_finished;
 	rctx->req.cb_finished = nullptr;
@@ -2361,6 +2671,86 @@ long ctrl_ctx::get_free_inode()
 	}
 
 	return -1;
+}
+
+
+void ctrl_ctx::inode_add_client_ref(shared_ptr<inode> node, shared_ptr<ctrl_client> client)
+{
+	if (client->invalid)
+		return;
+
+	/* Check if client is on list and cleanup destroyed clients */
+	bool found = false;
+
+	vector<decltype(node->client_refs)::iterator> to_delete;
+
+	for (auto i = node->client_refs.begin(); i != node->client_refs.end(); i++)
+	{
+		auto lo = i->lock();
+		if (lo)
+		{
+			if (lo == client)
+				found = true;
+		}
+		else
+		{
+			to_delete.push_back(i);
+		}
+	}
+
+	for (auto j = to_delete.rbegin(); j != to_delete.rend(); j++)
+		node->client_refs.erase(*j);
+
+	if (!found)
+		node->client_refs.push_back(client);
+}
+
+void ctrl_ctx::inode_remove_client_ref(shared_ptr<inode> node, shared_ptr<ctrl_client> client)
+{
+	/* Remove client if it is on the list and cleanup destroyed clients */
+	vector<decltype(node->client_refs)::iterator> to_delete;
+
+	for (auto i = node->client_refs.begin(); i != node->client_refs.end(); i++)
+	{
+		auto lo = i->lock();
+		if (!lo || (client && lo == client))
+			to_delete.push_back(i);
+	}
+
+	for (auto j = to_delete.rbegin(); j != to_delete.rend(); j++)
+		node->client_refs.erase(*j);
+}
+
+void ctrl_ctx::delete_inode(unsigned long node_id, shared_ptr<inode> node)
+{
+	/* Unallocate ranges */
+	while (node->allocations.size() > 0)
+	{
+		auto& a = node->allocations.back();
+
+		if (
+				a.offset % data_map.allocation_granularity != 0 ||
+				a.size % data_map.allocation_granularity != 0)
+		{
+			throw runtime_error("allocation's offset or size is not a multiple "
+					"of the allocation granularity");
+		}
+
+		unallocate_blocks(
+				a.offset / data_map.allocation_granularity,
+				a.size / data_map.allocation_granularity);
+
+		node->allocations.pop_back();
+	}
+
+	/* Unallocate inode */
+	mark_inode_unallocated(node_id);
+
+	/* Evict cache entry */
+	auto i = inode_directory.cached_inodes.find(node_id);
+	if (i != inode_directory.cached_inodes.end())
+		inode_directory.cached_inodes.erase(i);
+
 }
 
 
@@ -2965,4 +3355,127 @@ void ctrl_ctx::shutdown_wait_metadata()
 	/* Stop the main loop */
 	printf("  stopping.\n");
 	quit_main_loop = true;
+}
+
+
+void ctrl_ctx::purge_unreferenced_inodes()
+{
+	if (purge_unreferenced_inodes_witness.lock())
+		return;
+
+	/* Find potential inodes to purge - will be examined further when locked */
+	auto rctx = make_shared<ctx_m_purge_inodes>();
+	purge_unreferenced_inodes_witness = rctx;
+
+	for (auto [id, node] : inode_directory.cached_inodes)
+	{
+		if (node->nlink == 0)
+			rctx->to_examine.push_back(id);
+	}
+
+	if (!purge_unreferenced_inodes_all_scanned)
+	{
+		for (unsigned long i = 0; i < data_map.total_inode_count; i++)
+		{
+			if ((inode_directory.allocator_bitmap[i / 8] & (1 << (i % 8))) != 0)
+				rctx->to_examine.push_back(i + 1);
+		}
+
+		purge_unreferenced_inodes_all_scanned = true;
+	}
+
+	/* For each inode, the following locks are required: inode allocator, inode,
+	 * block allocator. */
+	purge_inodes_next(rctx);
+}
+
+void ctrl_ctx::purge_inodes_next(shared_ptr<ctx_m_purge_inodes> rctx)
+{
+	rctx->ialck = inode_allocator_lock_witness();
+	rctx->ilck = inode_lock_witness();
+	rctx->blck = block_allocator_lock_witness();
+	rctx->node = nullptr;
+
+	if (rctx->to_examine.size() > 0)
+	{
+		rctx->node_id = rctx->to_examine.back();
+		rctx->to_examine.pop_back();
+
+		inode_allocator_lock_request_t req;
+		req.cb_acquired = bind_front(&ctrl_ctx::cb_m_purge_inodes_ialck, this, rctx);
+
+		lock_inode_allocator(req);
+	}
+}
+
+void ctrl_ctx::cb_m_purge_inodes_ialck(
+		shared_ptr<ctx_m_purge_inodes> rctx, inode_allocator_lock_request_t& ialck)
+{
+	rctx->ialck = inode_allocator_lock_witness(
+			bind_front(&ctrl_ctx::unlock_inode_allocator, this), ialck);
+
+	/* Lock inode w */
+	inode_lock_request_t req;
+
+	req.node_id = rctx->node_id;
+	req.write = true;
+	req.cb_acquired = bind_front(&ctrl_ctx::cb_m_purge_inodes_ilck, this, rctx);
+
+	lock_inode(req);
+}
+
+void ctrl_ctx::cb_m_purge_inodes_ilck(
+		shared_ptr<ctx_m_purge_inodes> rctx, inode_lock_request_t& ilck)
+{
+	rctx->ilck = inode_lock_witness(bind_front(&ctrl_ctx::unlock_inode, this), ilck);
+
+	/* Retrieve inode */
+	get_inode_request_t req;
+
+	req.node_id = rctx->node_id;
+	req.cb_finished = bind_front(&ctrl_ctx::cb_m_purge_inodes_getnode, this, rctx);
+
+	get_inode(move(req));
+}
+
+void ctrl_ctx::cb_m_purge_inodes_getnode(
+		shared_ptr<ctx_m_purge_inodes> rctx, get_inode_request_t&& node_req)
+{
+	/* Cleanup leftover references of disconnected clients */
+	if (node_req.result == err::SUCCESS)
+		inode_remove_client_ref(node_req.node, nullptr);
+
+	if (node_req.result != err::SUCCESS ||
+			node_req.node->nlink > 0 || node_req.node->client_refs.size() > 0)
+	{
+		/* Evict inode if it was not in the cache before and is not referenced
+		 * by a client. This is possible because we own a write-lock on it. */
+		if (!node_req.was_in_cache && node_req.node->client_refs.empty())
+		{
+			auto i = inode_directory.cached_inodes.find(rctx->node_id);
+			if (i != inode_directory.cached_inodes.end())
+				inode_directory.cached_inodes.erase(i);
+		}
+
+		/* Continue with next node */
+		purge_inodes_next(rctx);
+		return;
+	}
+
+	rctx->node = node_req.node;
+
+	/* Lock block allocator */
+	block_allocator_lock_request_t req;
+	req.cb_acquired = bind_front(&ctrl_ctx::cb_m_purge_inodes_blck, this, rctx);
+	lock_block_allocator(req);
+}
+
+void ctrl_ctx::cb_m_purge_inodes_blck(
+		shared_ptr<ctx_m_purge_inodes> rctx, block_allocator_lock_request_t blck)
+{
+	rctx->blck = block_allocator_lock_witness(
+			bind_front(&ctrl_ctx::unlock_block_allocator, this), blck);
+
+	delete_inode(rctx->node_id, rctx->node);
+	purge_inodes_next(rctx);
 }

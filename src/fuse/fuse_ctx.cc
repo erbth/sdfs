@@ -129,6 +129,8 @@ sdfs_fuse_ctx::sdfs_fuse_ctx(int argc, char** argv)
 
 sdfs_fuse_ctx::~sdfs_fuse_ctx()
 {
+	unique_lock lk(m_open_files);
+
 	/* Clear open file list */
 	while (auto fn = open_files.get_head())
 	{
@@ -218,11 +220,52 @@ void sdfs_fuse_ctx::op_lookup(fuse_req_t req, fuse_ino_t parent,
 				req, parent, name));
 }
 
+void sdfs_fuse_ctx::op_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
+{
+	{
+		unique_lock lk(m_lookup_counts);
+
+		auto i = lookup_counts.find(ino);
+		if (i == lookup_counts.end())
+		{
+			fprintf(stderr, "forget for unknown inode\n");
+			fuse_reply_none(req);
+			return;
+		}
+
+		if (nlookup > i->second)
+		{
+			fprintf(stderr, "nlookup of forget larger than lookup count\n");
+			fuse_reply_none(req);
+			return;
+		}
+
+		i->second -= nlookup;
+		if (i->second == 0)
+		{
+			lookup_counts.erase(i);
+		}
+		else
+		{
+			fuse_reply_none(req);
+			return;
+		}
+	}
+
+	cctx.request_forget(ino, bind_front(&sdfs_fuse_ctx::cb_forget, this, req));
+}
+
 void sdfs_fuse_ctx::op_getattr(fuse_req_t req, fuse_ino_t ino,
 		struct fuse_file_info* fi)
 {
 	cctx.request_getfattr(ino, bind_front(&sdfs_fuse_ctx::cb_getfattr, this,
 				req, ino));
+}
+
+void sdfs_fuse_ctx::op_unlink(fuse_req_t req, fuse_ino_t parent, const char* name)
+{
+	cctx.request_unlink(parent, name,
+			bind_front(&sdfs_fuse_ctx::cb_unlink, this, req));
 }
 
 void sdfs_fuse_ctx::op_readdir(fuse_req_t req, fuse_ino_t ino,
@@ -287,6 +330,8 @@ void sdfs_fuse_ctx::op_write(fuse_req_t req, fuse_ino_t ino, const char* buf,
 void sdfs_fuse_ctx::op_release(fuse_req_t req, fuse_ino_t ino,
 		struct fuse_file_info* fi)
 {
+	unique_lock lk(m_open_files);
+
 	auto fn = get_file_ctx_node(fi, ino);
 
 	/* Remove file ctx */
@@ -305,10 +350,20 @@ void sdfs_fuse_ctx::_op_lookup(fuse_req_t req, fuse_ino_t parent,
 	global_sdfs_fuse_ctx->op_lookup(req, parent, name);
 }
 
+void sdfs_fuse_ctx::_op_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
+{
+	global_sdfs_fuse_ctx->op_forget(req, ino, nlookup);
+}
+
 void sdfs_fuse_ctx::_op_getattr(fuse_req_t req, fuse_ino_t ino,
 		struct fuse_file_info* fi)
 {
 	global_sdfs_fuse_ctx->op_getattr(req, ino, fi);
+}
+
+void sdfs_fuse_ctx::_op_unlink(fuse_req_t req, fuse_ino_t parent, const char* name)
+{
+	global_sdfs_fuse_ctx->op_unlink(req, parent, name);
 }
 
 void sdfs_fuse_ctx::_op_readdir(fuse_req_t req, fuse_ino_t ino,
@@ -401,7 +456,16 @@ void sdfs_fuse_ctx::cb_lookup2(fuse_req_t req, fuse_ino_t parent,
 		.entry_timeout = 0,
 	};
 
+	increase_lookup_count(ino);
 	check_call(fuse_reply_entry(req, &ep), "fuse_reply_entry");
+}
+
+void sdfs_fuse_ctx::cb_forget(fuse_req_t req, prot::client::reply::forget& msg)
+{
+	if (msg.res != err::SUCCESS)
+		fprintf(stderr, "'forget' failed on a controller.\n");
+
+	fuse_reply_none(req);
 }
 
 void sdfs_fuse_ctx::cb_getattr(fuse_req_t req, req_getattr_result res)
@@ -443,6 +507,11 @@ void sdfs_fuse_ctx::cb_getfattr(fuse_req_t req, fuse_ino_t ino,
 	s.st_ino = ino;
 
 	check_call(fuse_reply_attr(req, &s, 0), "fuse_reply_attr");
+}
+
+void sdfs_fuse_ctx::cb_unlink(fuse_req_t req, prot::client::reply::unlink& msg)
+{
+	check_call(fuse_reply_err(req, convert_error_code(msg.res)), "fuse_reply_err");
 }
 
 void sdfs_fuse_ctx::cb_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
@@ -562,6 +631,8 @@ void sdfs_fuse_ctx::cb_open(fuse_req_t req, fuse_ino_t ino, int flags,
 		return;
 	}
 
+	unique_lock lk(m_open_files);
+
 	auto fn = setup_file_struct(flags, fi, ino);
 	if (check_call(fuse_reply_open(req, &fi), "fuse_reply_open") < 0)
 	{
@@ -595,7 +666,11 @@ void sdfs_fuse_ctx::cb_create(fuse_req_t req, int flags,
 		.entry_timeout = 0,
 	};
 
+	unique_lock lk(m_open_files);
+
 	auto fn = setup_file_struct(flags, fi, ino);
+	increase_lookup_count(ino);
+
 	if (check_call(fuse_reply_create(req, &ep, &fi), "fuse_reply_create") < 0)
 	{
 		open_files.remove(fn);
@@ -636,4 +711,13 @@ void sdfs_fuse_ctx::cb_write(fuse_req_t req, fuse_ino_t ino, size_t size,
 
 	/* Either the entire write operation succeeds or fails */
 	check_call(fuse_reply_write(req, size), "fuse_reply_write");
+}
+
+
+void sdfs_fuse_ctx::increase_lookup_count(fuse_ino_t ino)
+{
+	unique_lock lk(m_lookup_counts);
+
+	auto [i, inserted] = lookup_counts.emplace(ino, 0);
+	i->second += 1;
 }

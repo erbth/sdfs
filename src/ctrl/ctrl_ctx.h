@@ -159,6 +159,10 @@ struct inode
 	/* The buffer needs to be 4096 bytes long */
 	void serialize(char* buf) const;
 	void parse(const char* buf);
+
+
+	/* References by clients ('open files') */
+	std::vector<std::weak_ptr<ctrl_client>> client_refs;
 };
 
 
@@ -204,6 +208,7 @@ struct get_inode_request_t final
 	/* Will be filled by get_inode */
 	int result = -1;
 	std::shared_ptr<inode> node;
+	bool was_in_cache = false;
 
 	/* Data for use by caller of get_inode */
 	std::vector<inode_lock_witness> ilocks;
@@ -310,6 +315,44 @@ struct ctx_c_r_create
 	/* msg cannot be copy-assigned; and move-assignment difficult because of
 	 * unique_ptr-to-parent-class source */
 	inline ctx_c_r_create(const prot::client::req::create& msg)
+		: msg(msg)
+	{
+	}
+};
+
+struct ctx_c_r_unlink
+{
+	std::shared_ptr<ctrl_client> client;
+	prot::client::req::unlink msg;
+
+	inode_lock_witness p_ilck;
+	inode_lock_witness e_ilck;
+	std::shared_ptr<inode> parent_node;
+
+	unsigned long entry_node_id{};
+
+	inline ctx_c_r_unlink(const prot::client::req::unlink& msg)
+		: msg(msg)
+	{
+	}
+};
+
+struct ctx_c_r_forget
+{
+	std::shared_ptr<ctrl_client> client;
+	prot::client::req::forget msg;
+
+	/* Keep the lock on the block allocator longest (basic idea: In case of
+	 * unclean shutdown, inodes should not reference unallocated block ranges.
+	 * However to guarantee this, a lot more effort woudl be requried.) */
+	block_allocator_lock_witness blck;
+
+	inode_allocator_lock_witness ialck;
+	inode_lock_witness ilck;
+
+	std::shared_ptr<inode> node;
+
+	inline ctx_c_r_forget(const prot::client::req::forget& msg)
 		: msg(msg)
 	{
 	}
@@ -481,6 +524,20 @@ struct ctx_m_g_inode
 };
 
 
+struct ctx_m_purge_inodes
+{
+	std::vector<unsigned long> to_examine;
+
+	unsigned long node_id{};
+
+	inode_allocator_lock_witness ialck;
+	inode_lock_witness ilck;
+	block_allocator_lock_witness blck;
+
+	std::shared_ptr<inode> node;
+};
+
+
 struct ctrl_queued_msg final
 {
 	std::variant<dynamic_buffer, dynamic_aligned_buffer> vbuf;
@@ -649,10 +706,11 @@ protected:
 	void unlock_block_allocator(block_allocator_lock_request_t&);
 
 	/* Blocks */
-	/* Returns -1 if not that many consecutive blocks are available, or the
-	 * index to the region. Must be called with a lock on the block allocator.
-	 * */
+	/* get_free_blocks returns -1 if not that many consecutive blocks are
+	 * available, or the index to the region.
+	 * Both functions Must be called with a lock on the block allocator. */
 	ssize_t get_free_blocks(size_t count);
+	void unallocate_blocks(size_t start, size_t count);
 
 	/* Inodes */
 	/* Must be called with a lock (read or write) on the inode */
@@ -667,6 +725,11 @@ protected:
 
 	/* Returns < 0 if no free inode is available */
 	long get_free_inode();
+
+	void inode_add_client_ref(std::shared_ptr<inode> node, std::shared_ptr<ctrl_client> client);
+	void inode_remove_client_ref(std::shared_ptr<inode> node, std::shared_ptr<ctrl_client> client);
+
+	void delete_inode(unsigned long node_id, std::shared_ptr<inode> node);
 
 
 	/* Returns [(offset, size, file_offset)] */
@@ -728,6 +791,8 @@ protected:
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::getfattr& msg);
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::readdir& msg);
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::create& msg);
+	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::unlink& msg);
+	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::forget& msg);
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::read& msg);
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::write& msg,
 			dynamic_buffer&& buf);
@@ -751,6 +816,16 @@ protected:
 	void cb_c_r_create_ilockp(std::shared_ptr<ctx_c_r_create>, inode_lock_request_t&);
 	void cb_c_r_create_ialloc(std::shared_ptr<ctx_c_r_create>, inode_allocator_lock_request_t&);
 	void cb_c_r_create_getp(std::shared_ptr<ctx_c_r_create>, get_inode_request_t&&);
+
+	void cb_c_r_unlink_ilock(std::shared_ptr<ctx_c_r_unlink> rctx, inode_lock_request_t& ilck);
+	void cb_c_r_unlink_getnode(std::shared_ptr<ctx_c_r_unlink> rctx, get_inode_request_t&& ireq);
+	void cb_c_r_unlink_lock_entry(std::shared_ptr<ctx_c_r_unlink> rctx, inode_lock_request_t& ilck);
+	void cb_c_r_unlink_get_entry(std::shared_ptr<ctx_c_r_unlink> rctx, get_inode_request_t&& req);
+
+	void cb_c_r_forget_ialck(std::shared_ptr<ctx_c_r_forget> rctx, inode_allocator_lock_request_t& ialck);
+	void cb_c_r_forget_ilck(std::shared_ptr<ctx_c_r_forget> rctx, inode_lock_request_t& ilck);
+	void cb_c_r_forget_getnode(std::shared_ptr<ctx_c_r_forget> rctx, get_inode_request_t&& node_req);
+	void cb_c_r_forget_blck(std::shared_ptr<ctx_c_r_forget> rctx, block_allocator_lock_request_t blck);
 
 	void cb_c_r_read_ilock(std::shared_ptr<ctx_c_r_read> rctx, inode_lock_request_t& ilck);
 	void cb_c_r_read_getnode(std::shared_ptr<ctx_c_r_read> rctx, get_inode_request_t&& ireq);
@@ -779,6 +854,21 @@ protected:
 	void store_inodes_node(std::shared_ptr<ctx_m_s_inodes> rctx);
 	void cb_m_s_inodes_ilock(std::shared_ptr<ctx_m_s_inodes> rctx, inode_lock_request_t& ilck);
 	void cb_m_s_inodes_dd(std::shared_ptr<ctx_m_s_inodes> rctx, size_t bi, dd_write_request_t&& req);
+
+
+	/* Deleting unreferenced inodes */
+	/* This is usually done in response to a FORGET request of a client. However
+	 * sometimes clients do not send forget requests - hence scan periodically
+	 * for unreferenced inodes and delete them. */
+	std::weak_ptr<ctx_m_purge_inodes> purge_unreferenced_inodes_witness;
+	bool purge_unreferenced_inodes_all_scanned = false;
+
+	void purge_unreferenced_inodes();
+	void purge_inodes_next(std::shared_ptr<ctx_m_purge_inodes> rctx);
+	void cb_m_purge_inodes_ialck(std::shared_ptr<ctx_m_purge_inodes> rctx, inode_allocator_lock_request_t& ialck);
+	void cb_m_purge_inodes_ilck(std::shared_ptr<ctx_m_purge_inodes> rctx, inode_lock_request_t& ilck);
+	void cb_m_purge_inodes_getnode(std::shared_ptr<ctx_m_purge_inodes> rctx, get_inode_request_t&& node_req);
+	void cb_m_purge_inodes_blck(std::shared_ptr<ctx_m_purge_inodes> rctx, block_allocator_lock_request_t blck);
 
 
 	/* Shutdown procedure */
