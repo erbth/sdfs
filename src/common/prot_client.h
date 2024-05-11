@@ -29,7 +29,8 @@ namespace req
 	 * preceeded by a request of GETFATTR (or CREATE), otherwise the file might
 	 * be deleted in between. */
 	enum msg_nums : unsigned {
-		GETATTR = 1,
+		CONNECT = 1,
+		GETATTR,
 		GETFATTR,
 		READDIR,
 		CREATE,
@@ -38,6 +39,20 @@ namespace req
 		FORGET,
 		READ,
 		WRITE
+	};
+
+	struct connect : public msg
+	{
+		/* Zero indicates that this is a new client, which did not get an id
+		 * yet. */
+		uint64_t client_id{};
+
+		connect();
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size = 8;
 	};
 
 	struct getattr : public msg
@@ -147,13 +162,14 @@ namespace req
 		static constexpr size_t msg_size_base = 8*3;
 	};
 
-	std::unique_ptr<msg> parse(const char* buf, size_t size);
+	std::unique_ptr<prot::msg> parse(const char* buf, size_t size);
 };
 
 namespace reply
 {
 	enum msg_nums : unsigned {
-		GETATTR = 1,
+		CONNECT = 1,
+		GETATTR,
 		GETFATTR,
 		READDIR,
 		CREATE,
@@ -168,6 +184,20 @@ namespace reply
 	{
 		FT_FILE = 1,
 		FT_DIRECTORY
+	};
+
+	struct connect : public msg
+	{
+		uint64_t client_id{};
+
+		connect();
+		connect(uint64_t req_id);
+
+		size_t serialize(char* buf) const override;
+		void parse(const char* buf, size_t size);
+
+	protected:
+		static constexpr size_t msg_size = 8;
 	};
 
 	struct getattr : public msg
@@ -313,7 +343,7 @@ namespace reply
 		static constexpr size_t msg_size = 4;
 	};
 
-	std::unique_ptr<msg> parse(const char* buf, size_t size);
+	std::unique_ptr<prot::msg> parse(const char* buf, size_t size);
 };
 
 };

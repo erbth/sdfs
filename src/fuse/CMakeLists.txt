@@ -8,6 +8,7 @@ add_executable(sdfs-fuse
 	../common/file_config.cc
 	../common/prot_common.cc
 	../common/prot_client.cc
+	../common/utils.cc
 )
 
 target_include_directories(sdfs-fuse PRIVATE ${LIBFUSE_INCLUDE_DIRS})

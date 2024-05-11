@@ -3,6 +3,7 @@
 #include <regex>
 #include "common/exceptions.h"
 #include "common/serialization.h"
+#include "common/msg_utils.h"
 #include "com_ctx.h"
 #include "config.h"
 
@@ -85,21 +86,27 @@ void com_ctx::initialize_connect()
 	/* Connect to controller */
 	auto& desc = *cfg.controller;
 
+	for (auto& addr_str : desc.addr_strs)
+		initialize_connect_path(addr_str);
+}
+
+void com_ctx::initialize_connect_path(const string& addr_str)
+{
 	com_ctrl c;
 
 	/* Resolve address */
-	if (regex_match(desc.addr_str, regex("^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$")))
+	if (regex_match(addr_str, regex("^[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}\\.[0-9]{1,3}$")))
 	{
 		struct sockaddr_in6 addr = {
 			.sin6_family = AF_INET6,
 			.sin6_port = htons(SDFS_CTRL_PORT)
 		};
 
-		if (inet_pton(AF_INET6, ("::FFFF:" + desc.addr_str).c_str(),
+		if (inet_pton(AF_INET6, ("::FFFF:" + addr_str).c_str(),
 					&addr.sin6_addr) != 1)
 		{
 			throw runtime_error("Failed to resolve controller address `" +
-					desc.addr_str + "'");
+					addr_str + "'");
 		}
 
 		c.wfd.set_errno(
@@ -108,7 +115,7 @@ void com_ctx::initialize_connect()
 
 		check_syscall(
 				connect(c.get_fd(), (const struct sockaddr*) &addr, sizeof(addr)),
-				("connect to controller `" + desc.addr_str + "'").c_str());
+				("connect to controller `" + addr_str + "'").c_str());
 	}
 	else
 	{
@@ -121,14 +128,14 @@ void com_ctx::initialize_connect()
 
 		struct addrinfo* addrs = nullptr;
 
-		auto gai_ret = getaddrinfo(desc.addr_str.c_str(),
+		auto gai_ret = getaddrinfo(addr_str.c_str(),
 				nullptr, &hints, &addrs);
 
 		if (gai_ret != 0)
 		{
 			throw gai_exception(gai_ret,
 					"Failed to resolve controller address `" +
-					desc.addr_str + "': ");
+					addr_str + "': ");
 		}
 
 		struct sockaddr_in6 addr = {
@@ -167,9 +174,37 @@ void com_ctx::initialize_connect()
 		if (!connected)
 		{
 			throw runtime_error("Failed to connect to controller `" +
-					desc.addr_str + "'");
+					addr_str + "'");
 		}
 	}
+
+
+	/* Send CONNECT message */
+	{
+		prot::client::req::connect msg_conn;
+		msg_conn.req_id = c.next_req_id++;
+		msg_conn.client_id = client_id;
+
+		send_stream_msg(c.get_fd(), msg_conn);
+		auto reply = receive_stream_msg<
+			prot::client::reply::connect,
+			prot::client::reply::parse>
+				(c.get_fd(), 30000);
+
+		if (
+				(client_id == 0 && reply->client_id == 0) ||
+				(client_id != 0 && reply->client_id != client_id)
+		   )
+		{
+			throw runtime_error("Error during CONNECT");
+		}
+
+		if (client_id == 0)
+			printf("Client id: %lu\n", (unsigned long) reply->client_id);
+
+		client_id = reply->client_id;
+	}
+
 
 	ctrls.push_back(move(c));
 
@@ -184,7 +219,7 @@ void com_ctx::initialize_connect()
 		throw;
 	}
 
-	printf("Connected to controller %s\n", desc.addr_str.c_str());
+	printf("Connected to controller via portal %s\n", addr_str.c_str());
 }
 
 void com_ctx::initialize()
@@ -540,7 +575,15 @@ com_ctrl* com_ctx::choose_ctrl()
 	if (ctrls.size() == 0)
 		throw runtime_error("No controllers available");
 
-	return &ctrls.front();
+	next_path = next_path % ctrls.size();
+
+	auto li = ctrls.begin();
+	for (size_t i = 0; i < next_path; i++)
+		li++;
+
+	next_path++;
+
+	return &(*li);
 }
 
 

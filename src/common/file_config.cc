@@ -73,16 +73,20 @@ FileConfig read_sdfs_config_file()
 			if (!regex_match(line, m2, regex("^(\\S+)$")))
 			{
 				throw invalid_cfg_file_line(line_no,
-						"invalid controller specification");
+						"invalid controller portal specification");
 			}
 
-			FileConfig::Controller desc;
-			desc.addr_str = m2[1];
-
 			if (cfg.controller)
-				throw invalid_cfg_file_line(line_no,
-						"only one controller may be specified");
-			cfg.controller = desc;
+			{
+				cfg.controller->addr_strs.push_back(m2[1]);
+			}
+			else
+			{
+				FileConfig::Controller desc;
+				desc.addr_strs.push_back(m2[1]);
+
+				cfg.controller = desc;
+			}
 		}
 		else if (state == 2)
 		{

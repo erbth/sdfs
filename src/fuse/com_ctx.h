@@ -96,6 +96,8 @@ protected:
 	std::recursive_mutex m;
 
 	std::list<com_ctrl> ctrls;
+	uint64_t client_id = 0;
+
 	std::thread worker_thread;
 	bool thread_started = false;
 
@@ -110,10 +112,12 @@ protected:
 
 	dynamic_aligned_buffer_pool buf_pool{4096, 8};
 
+	size_t next_path{};
 	com_ctrl* choose_ctrl();
 
 	void initialize_cfg();
 	void initialize_connect();
+	void initialize_connect_path(const std::string& addr_str);
 
 	void worker_thread_func();
 

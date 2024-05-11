@@ -33,7 +33,7 @@ std::unique_ptr<prot::msg> receive_packet_msg(int fd, int timeout,
 		};
 
 		auto ret = check_syscall(poll(&pfd, 1, timeout), "poll");
-		if (ret == 0 || !(pfd.revents & EPOLLIN))
+		if (ret == 0 || !(pfd.revents & POLLIN))
 			return nullptr;
 	}
 

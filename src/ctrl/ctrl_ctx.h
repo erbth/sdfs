@@ -33,6 +33,7 @@ static_assert(sizeof(long) >= 8);
 
 /* Prototypes */
 class ctrl_dd;
+class ctrl_mp_client;
 class ctrl_client;
 
 
@@ -162,7 +163,7 @@ struct inode
 
 
 	/* References by clients ('open files') */
-	std::vector<std::weak_ptr<ctrl_client>> client_refs;
+	std::vector<std::weak_ptr<ctrl_mp_client>> client_refs;
 };
 
 
@@ -605,6 +606,19 @@ struct ctrl_dd final
 };
 
 
+/* For multipathing */
+struct ctrl_mp_client
+{
+	/* 0 means invalid */
+	const uint64_t id;
+
+	ctrl_mp_client(uint64_t id)
+		: id(id)
+	{
+	}
+};
+
+
 struct ctrl_client final
 {
 	/* After a client was removed from the list but is still kept alive through
@@ -612,6 +626,9 @@ struct ctrl_client final
 	bool invalid = false;
 
 	WrappedFD wfd;
+
+	/* Multipathing */
+	std::shared_ptr<ctrl_mp_client> mp_client;
 
 	/* Receive messages */
 	dynamic_buffer rd_buf;
@@ -663,6 +680,7 @@ protected:
 	/* clients */
 	WrappedFD client_lfd;
 	std::vector<std::shared_ptr<ctrl_client>> clients;
+	std::vector<std::weak_ptr<ctrl_mp_client>> mp_clients;
 
 	/* data map */
 	data_map_t data_map;
@@ -747,6 +765,10 @@ protected:
 	void remove_client(decltype(clients)::iterator i);
 	void remove_client(std::shared_ptr<ctrl_client> client);
 
+	/* Client-size multipathing */
+	std::shared_ptr<ctrl_mp_client> create_mp_client();
+	std::shared_ptr<ctrl_mp_client> find_mp_client(uint64_t id);
+
 	void print_cfg();
 
 	std::pair<WrappedFD, struct sockaddr_in6> initialize_dd_host(const std::string& addr_str);
@@ -785,6 +807,7 @@ protected:
 
 
 	bool process_client_message(std::shared_ptr<ctrl_client> client, dynamic_buffer&& buf, size_t msg_len);
+	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::connect& msg);
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::getattr& msg);
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::getfattr& msg);
 	bool process_client_message(std::shared_ptr<ctrl_client> client, prot::client::req::readdir& msg);

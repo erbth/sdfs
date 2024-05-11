@@ -23,6 +23,37 @@ msg::msg(int num, uint64_t req_id)
 
 namespace req
 {
+	connect::connect()
+		: msg(CONNECT)
+	{
+	}
+
+	size_t connect::serialize(char* buf) const
+	{
+		size_t size = 16 + msg_size;
+
+		if (buf)
+		{
+			swrite_u32(buf, size - 4);
+			swrite_u32(buf, num);
+
+			swrite_u64(buf, req_id);
+			swrite_u64(buf, client_id);
+		}
+
+		return size;
+	}
+
+	void connect::parse(const char* buf, size_t size)
+	{
+		if (size != 12 + msg_size)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(buf);
+		client_id = sread_u64(buf);
+	}
+
+
 	getattr::getattr()
 		: msg(GETATTR)
 	{
@@ -313,7 +344,7 @@ namespace req
 	}
 
 
-	unique_ptr<msg> parse(const char* buf, size_t size)
+	unique_ptr<prot::msg> parse(const char* buf, size_t size)
 	{
 		if (size < 4)
 			throw invalid_msg_size(0, size);
@@ -321,6 +352,13 @@ namespace req
 		auto n = sread_u32(buf);
 		switch (n)
 		{
+			case CONNECT:
+			{
+				auto msg = make_unique<connect>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
 			case GETATTR:
 			{
 				auto msg = make_unique<getattr>();
@@ -385,6 +423,42 @@ namespace req
 
 namespace reply
 {
+	connect::connect()
+		: msg(CONNECT)
+	{
+	}
+
+	connect::connect(uint64_t req_id)
+		: msg(CONNECT, req_id)
+	{
+	}
+
+	size_t connect::serialize(char* buf) const
+	{
+		size_t size = 16 + msg_size;
+
+		if (buf)
+		{
+			swrite_u32(buf, size - 4);
+			swrite_u32(buf, num);
+
+			swrite_u64(buf, req_id);
+			swrite_u64(buf, client_id);
+		}
+
+		return size;
+	}
+
+	void connect::parse(const char* buf, size_t size)
+	{
+		if (size != 12 + msg_size)
+			throw invalid_msg_size(num, size);
+
+		req_id = sread_u64(buf);
+		client_id = sread_u64(buf);
+	}
+
+
 	getattr::getattr()
 		: msg(GETATTR)
 	{
@@ -745,7 +819,7 @@ namespace reply
 	}
 
 
-	unique_ptr<msg> parse(const char* buf, size_t size)
+	unique_ptr<prot::msg> parse(const char* buf, size_t size)
 	{
 		if (size < 4)
 			throw invalid_msg_size(0, size);
@@ -753,6 +827,13 @@ namespace reply
 		auto n = sread_u32(buf);
 		switch (n)
 		{
+			case CONNECT:
+			{
+				auto msg = make_unique<connect>();
+				msg->parse(buf, size);
+				return msg;
+			}
+
 			case GETATTR:
 			{
 				auto msg = make_unique<getattr>();

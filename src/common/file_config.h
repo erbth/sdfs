@@ -9,7 +9,7 @@ struct FileConfig
 {
 	struct Controller
 	{
-		std::string addr_str;
+		std::vector<std::string> addr_strs;
 	};
 
 	struct DD

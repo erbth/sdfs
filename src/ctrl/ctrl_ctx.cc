@@ -1089,8 +1089,8 @@ void ctrl_ctx::on_client_writev_finished(shared_ptr<ctrl_client> client, int res
 	while (client->send_msg_pos >= qmsg->msg_len)
 	{
 		qmsg->return_buffer(buf_pool_req);
-		client->send_queue.pop_front();
 		client->send_msg_pos -= qmsg->msg_len;
+		client->send_queue.pop_front();
 
 		if (client->send_queue.empty())
 		{
@@ -1155,8 +1155,19 @@ bool ctrl_ctx::process_client_message(
 		return true;
 	}
 
+	if (!client->mp_client && msg->num != prot::client::req::CONNECT)
+	{
+		fprintf(stderr, "Protocol violation by client.\n");
+		return true;
+	}
+
 	switch (msg->num)
 	{
+		case prot::client::req::CONNECT:
+			return process_client_message(
+					client,
+					static_cast<prot::client::req::connect&>(*msg));
+
 		case prot::client::req::GETATTR:
 			return process_client_message(
 					client,
@@ -1202,6 +1213,40 @@ bool ctrl_ctx::process_client_message(
 			fprintf(stderr, "client io: protocol violation\n");
 			return true;
 	}
+}
+
+bool ctrl_ctx::process_client_message(
+		shared_ptr<ctrl_client> client, prot::client::req::connect& msg)
+{
+	prot::client::reply::connect reply(msg.req_id);
+
+	/* Ensure that the client is not connected already */
+	if (client->mp_client)
+	{
+		fprintf(stderr, "duplicate CONNECT message from client\n");
+		return true;
+	}
+
+	if (msg.client_id == 0)
+	{
+		/* New client; allocate a client id */
+		client->mp_client = create_mp_client();
+		reply.client_id = client->mp_client->id;
+	}
+	else
+	{
+		/* New path for exisiting client; find client */
+		client->mp_client = find_mp_client(msg.client_id);
+		if (!client->mp_client)
+		{
+			fprintf(stderr, "new path references invalid client during CONNECT\n");
+			return true;
+		}
+
+		reply.client_id = msg.client_id;
+	}
+
+	return send_message_to_client(client, reply);
 }
 
 bool ctrl_ctx::process_client_message(
@@ -2289,6 +2334,75 @@ bool ctrl_ctx::send_message_to_client(shared_ptr<ctrl_client> client,
 }
 
 
+shared_ptr<ctrl_mp_client> ctrl_ctx::create_mp_client()
+{
+	uint64_t id = 1;
+
+	/* Remove deleted mp_clients from the list in this function */
+	while (id != 0)
+	{
+		bool used = false;
+
+		auto i = mp_clients.end();
+		if (i != mp_clients.begin())
+		{
+			i--;
+
+			for (;;)
+			{
+				auto l = i->lock();
+				if (l)
+				{
+					if (l->id == id)
+						used = true;
+
+					if (i == mp_clients.begin())
+						break;
+
+					i--;
+				}
+				else
+				{
+					if (i == mp_clients.begin())
+					{
+						mp_clients.erase(i);
+						break;
+					}
+					else
+					{
+						auto tmp = i--;
+						mp_clients.erase(tmp);
+					}
+				}
+			}
+		}
+
+		if (!used)
+		{
+			auto mpc = make_shared<ctrl_mp_client>(id);
+			mp_clients.push_back(mpc);
+			return mpc;
+		}
+
+		id++;
+	}
+
+	throw runtime_error("client id space exhausted");
+}
+
+shared_ptr<ctrl_mp_client> ctrl_ctx::find_mp_client(uint64_t id)
+{
+	for (auto w : mp_clients)
+	{
+		auto l = w.lock();
+		if (l && l->id == id)
+			return l;
+	}
+
+	return nullptr;
+}
+
+
 void ctrl_ctx::main()
 {
 	io_uring.submit_poll(epoll.get_fd(), POLLIN,
@@ -2727,6 +2841,10 @@ void ctrl_ctx::inode_add_client_ref(shared_ptr<inode> node, shared_ptr<ctrl_clie
 	/* Check if client is on list and cleanup destroyed clients */
 	bool found = false;
 
+	auto mp_client = client->mp_client;
+	if (!mp_client)
+		throw runtime_error("client without mp_client performs IO");
+
 	vector<decltype(node->client_refs)::iterator> to_delete;
 
 	for (auto i = node->client_refs.begin(); i != node->client_refs.end(); i++)
@@ -2734,7 +2852,7 @@ void ctrl_ctx::inode_add_client_ref(shared_ptr<inode> node, shared_ptr<ctrl_clie
 		auto lo = i->lock();
 		if (lo)
 		{
-			if (lo == client)
+			if (lo == mp_client)
 				found = true;
 		}
 		else
@@ -2747,18 +2865,27 @@ void ctrl_ctx::inode_add_client_ref(shared_ptr<inode> node, shared_ptr<ctrl_clie
 		node->client_refs.erase(*j);
 
 	if (!found)
-		node->client_refs.push_back(client);
+		node->client_refs.push_back(mp_client);
 }
 
 void ctrl_ctx::inode_remove_client_ref(shared_ptr<inode> node, shared_ptr<ctrl_client> client)
 {
+	shared_ptr<ctrl_mp_client> mp_client;
+
+	if (client)
+	{
+		mp_client = client->mp_client;
+		if (!mp_client)
+			throw runtime_error("client without mp_client performs IO");
+	}
+
 	/* Remove client if it is on the list and cleanup destroyed clients */
 	vector<decltype(node->client_refs)::iterator> to_delete;
 
 	for (auto i = node->client_refs.begin(); i != node->client_refs.end(); i++)
 	{
 		auto lo = i->lock();
-		if (!lo || (client && lo == client))
+		if (!lo || (mp_client && lo == mp_client))
 			to_delete.push_back(i);
 	}
 
