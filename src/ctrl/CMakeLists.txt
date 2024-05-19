@@ -15,3 +15,5 @@ add_executable(sdfs-ctrl
 	../common/io_uring.cc
 	../common/timerfd.cc
 )
+
+install(TARGETS sdfs-ctrl DESTINATION bin)

@@ -28,3 +28,5 @@ add_executable(sdfs-ddinfo
 	../common/exceptions.cc
 	../common/strformat.cc
 )
+
+install(TARGETS sdfs-dd sdfs-mkdd sdfs-ddinfo DESTINATION bin)

@@ -8,3 +8,5 @@ add_executable(sdfs-dd-mgr
 	../common/prot_common.cc
 	../common/prot_dd_mgr.cc
 )
+
+install(TARGETS sdfs-dd-mgr DESTINATION bin)

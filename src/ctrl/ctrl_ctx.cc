@@ -275,7 +275,7 @@ pair<WrappedFD, struct sockaddr_in6> ctrl_ctx::initialize_dd_host(const string& 
 			{
 				wfd.set_errno(socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0), "socket");
 
-				addr.sin6_addr = ((const struct sockaddr_in6&) ai->ai_addr).sin6_addr;
+				addr.sin6_addr = ((const struct sockaddr_in6*) ai->ai_addr)->sin6_addr;
 
 				auto ret = connect(wfd.get_fd(), (const struct sockaddr*) &addr, sizeof(addr));
 				if (ret == 0)
@@ -1129,7 +1129,7 @@ void ctrl_ctx::on_client_writev_finished(shared_ptr<ctrl_client> client, int res
 
 	io_uring.queue_writev(
 			client->get_fd(),
-			client->send_iovs, cnt_msgs, -1,
+			client->send_iovs, cnt_msgs, 0,
 			0,
 			bind_front(&ctrl_ctx::on_client_writev_finished, this, client));
 
@@ -2322,7 +2322,7 @@ bool ctrl_ctx::send_message_to_client(shared_ptr<ctrl_client> client,
 
 		io_uring.queue_writev(
 				client->get_fd(),
-				client->send_iovs, 1, -1,
+				client->send_iovs, 1, 0,
 				0,
 				bind_front(&ctrl_ctx::on_client_writev_finished, this, client));
 

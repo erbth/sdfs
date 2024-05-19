@@ -13,3 +13,5 @@ add_executable(sdfs-fuse
 
 target_include_directories(sdfs-fuse PRIVATE ${LIBFUSE_INCLUDE_DIRS})
 target_link_libraries(sdfs-fuse PRIVATE ${LIBFUSE_LIBRARIES})
+
+install(TARGETS sdfs-fuse DESTINATION bin)
