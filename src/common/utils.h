@@ -173,6 +173,11 @@ public:
 	{
 	}
 
+	inline buffer_pool_returner(buffer_pool_returner&& o)
+		: pool(o.pool), buf(std::move(o.buf))
+	{
+	}
+
 	inline ~buffer_pool_returner()
 	{
 		if (buf)

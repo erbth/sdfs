@@ -2,6 +2,7 @@ add_executable(sdfs-fuse
 	fuse.cc
 	fuse_ctx.cc
 	com_ctx.cc
+	cache.cc
 	../common/exceptions.cc
 	../common/epoll.cc
 	../common/eventfd.cc

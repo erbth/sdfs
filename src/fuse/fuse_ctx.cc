@@ -314,7 +314,7 @@ void sdfs_fuse_ctx::op_create(fuse_req_t req, fuse_ino_t parent,
 void sdfs_fuse_ctx::op_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 		off_t off, struct fuse_file_info* fi)
 {
-	cctx.request_read(ino, off, size,
+	cache.read(ino, off, size,
 			bind_front(&sdfs_fuse_ctx::cb_read, this, req, ino,
 				reinterpret_cast<open_list<file_ctx>::node*>(fi->fh)));
 }
@@ -683,17 +683,17 @@ void sdfs_fuse_ctx::cb_create(fuse_req_t req, int flags,
 
 
 void sdfs_fuse_ctx::cb_read(fuse_req_t req, fuse_ino_t ino, open_list<file_ctx>::node* fn,
-		prot::client::reply::read& msg)
+		int res, size_t size, const char* data)
 {
-	if (msg.res != err::SUCCESS)
+	if (res != err::SUCCESS)
 	{
 		check_call(
-				fuse_reply_err(req, convert_error_code(msg.res)),
+				fuse_reply_err(req, convert_error_code(res)),
 				"fuse_reply_err");
 		return;
 	}
 
-	check_call(fuse_reply_buf(req, msg.data, msg.size), "fuse_reply_data");
+	check_call(fuse_reply_buf(req, data, size), "fuse_reply_data");
 	//printf("read(%u)\n", (unsigned) ino);
 }
 

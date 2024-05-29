@@ -38,6 +38,8 @@ void finish_req(com_ctrl* ctrl, const request_t& req)
 /* req will be copied */
 void add_req(com_ctrl* ctrl, const request_t& req)
 {
+	//printf("reqs in flight: %d\n", (int) ctrl->reqs.size());
+
 	auto [i,ins] = ctrl->reqs.insert({req.id, req});
 	if (!ins)
 		throw runtime_error("request id conflict");
@@ -449,7 +451,8 @@ bool com_ctx::process_message(
 		case prot::client::reply::READ:
 			return process_message(
 					ctrl,
-					static_cast<prot::client::reply::read&>(*msg));
+					static_cast<prot::client::reply::read&>(*msg),
+					move(bp_ret.buf));
 
 		case prot::client::reply::WRITE:
 			return process_message(
@@ -526,11 +529,12 @@ bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::create& msg)
 	return false;
 }
 
-bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::read& msg)
+bool com_ctx::process_message(com_ctrl* ctrl, prot::client::reply::read& msg,
+		dynamic_aligned_buffer&& buf)
 {
 	/* Find corresponding request */
 	auto& req = find_req_for_reply(ctrl, msg);
-	req.cb_read(msg);
+	req.cb_read(msg, buf_pool, move(buf));
 	finish_req(ctrl, req);
 	return false;
 }

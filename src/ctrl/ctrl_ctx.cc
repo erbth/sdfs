@@ -1342,6 +1342,7 @@ void ctrl_ctx::cb_c_r_getfattr_inode(
 	req.ilocks.clear();
 
 	/* Return information */
+	reply.size = 1024 * 1024 * 1024 * 1024UL;
 	send_message_to_client(client, reply);
 }
 
@@ -1873,6 +1874,23 @@ void ctrl_ctx::cb_c_r_forget_blck(
 bool ctrl_ctx::process_client_message(
 		shared_ptr<ctrl_client> client, prot::client::req::read& msg)
 {
+	prot::client::reply::read reply(msg.req_id, err::SUCCESS);
+	auto hdr_size = reply.serialize(nullptr);
+
+	auto buf = buf_pool_req.get_buffer(max(
+				(size_t) 4096,
+				hdr_size + msg.size));
+
+	memset(buf.ptr() + hdr_size, 1, msg.size);
+
+	/* Add message header */
+	reply.size = msg.size;
+	auto reply_size = reply.serialize(buf.ptr()) + reply.size;
+
+	/* Return data to client */
+	return send_message_to_client(client, move(buf), reply_size);
+
+
 	// auto prof = profiler_get("process_client_message(read)");
 
 	/* READ */

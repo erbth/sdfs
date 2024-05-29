@@ -46,7 +46,8 @@ typedef std::function<void(prot::client::reply::create&)> req_cb_create_t;
 /* If the message contains data, it has a pointer to a memory region. This
  * memory region lives inside the dynamic_buffer. Hence the dynamic_buffer must
  * be kept allocated as long as the data is processed. */
-typedef std::function<void(prot::client::reply::read&)> req_cb_read_t;
+typedef std::function<void(prot::client::reply::read&,
+		dynamic_aligned_buffer_pool&, dynamic_aligned_buffer&&)> req_cb_read_t;
 
 typedef std::function<void(prot::client::reply::write&)> req_cb_write_t;
 
@@ -137,7 +138,9 @@ protected:
 	bool process_message(com_ctrl* ctrl, prot::client::reply::unlink& msg);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::readdir& msg);
 	bool process_message(com_ctrl* ctrl, prot::client::reply::create& msg);
-	bool process_message(com_ctrl* ctrl, prot::client::reply::read& msg);
+	bool process_message(com_ctrl* ctrl, prot::client::reply::read& msg,
+			dynamic_aligned_buffer&& buf);
+
 	bool process_message(com_ctrl* ctrl, prot::client::reply::write& msg);
 
 	bool send_message(com_ctrl* ctrl, const prot::msg& msg,

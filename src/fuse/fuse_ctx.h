@@ -6,6 +6,7 @@
 #include <mutex>
 #include <fuse_lowlevel.h>
 #include "com_ctx.h"
+#include "cache.h"
 #include "common/open_list.h"
 
 struct file_ctx final
@@ -25,6 +26,7 @@ protected:
 	bool session_mounted = false;
 
 	com_ctx cctx;
+	Cache cache{cctx};
 
 	/* Operations */
 
@@ -99,7 +101,7 @@ protected:
 
 
 	void cb_read(fuse_req_t req, fuse_ino_t ino, open_list<file_ctx>::node* fn,
-			prot::client::reply::read& msg);
+			int res, size_t size, const char* data);
 
 	void cb_write(fuse_req_t req, fuse_ino_t ino, size_t size, open_list<file_ctx>::node* fn,
 			prot::client::reply::write& msg);
