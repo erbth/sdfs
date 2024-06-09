@@ -48,7 +48,7 @@ FileConfig read_sdfs_config_file()
 
 		if (state == 0)
 		{
-			if (line == "ctrl:")
+			if (line == "portals:")
 			{
 				state = 1;
 			}
@@ -73,20 +73,10 @@ FileConfig read_sdfs_config_file()
 			if (!regex_match(line, m2, regex("^(\\S+)$")))
 			{
 				throw invalid_cfg_file_line(line_no,
-						"invalid controller portal specification");
+						"invalid portal specification");
 			}
 
-			if (cfg.controller)
-			{
-				cfg.controller->addr_strs.push_back(m2[1]);
-			}
-			else
-			{
-				FileConfig::Controller desc;
-				desc.addr_strs.push_back(m2[1]);
-
-				cfg.controller = desc;
-			}
+			cfg.portals.push_back(m2[1]);
 		}
 		else if (state == 2)
 		{
@@ -115,7 +105,7 @@ FileConfig read_sdfs_config_file()
 			if (id < 1)
 			{
 				throw invalid_cfg_file_line(line_no,
-						"controller ids must be >= 1");
+						"dd ids must be >= 1");
 			}
 
 			FileConfig::DD desc;

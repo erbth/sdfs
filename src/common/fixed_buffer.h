@@ -13,6 +13,11 @@ protected:
 	size_t size;
 
 public:
+	fixed_buffer()
+		: size(0)
+	{
+	}
+
 	fixed_buffer(size_t size)
 		: size(size)
 	{

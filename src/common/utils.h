@@ -11,6 +11,7 @@
 
 extern "C" {
 #include <unistd.h>
+#include <netinet/in.h>
 }
 
 /* Primitive types */
@@ -45,7 +46,7 @@ public:
 		o.fd = -1;
 	}
 
-	inline WrappedFD& operator=(WrappedFD&& o)
+	inline WrappedFD& operator=(WrappedFD&& o) noexcept
 	{
 		if (fd >= 0)
 			::close(fd);
@@ -56,7 +57,18 @@ public:
 		return *this;
 	}
 
-	/* If value is < 0, throw system_error */
+	inline int operator=(int nfd) noexcept
+	{
+		if (fd >= 0)
+			::close(fd);
+
+		fd = nfd;
+
+		return fd;
+	}
+
+	/* If value is < 0, throw system_error
+	 * It is guaranteed that this will not throw if new_fd >= 0. */
 	inline void set_errno(int new_fd, const char* msg)
 	{
 		if (new_fd < 0)
@@ -184,6 +196,11 @@ public:
 			pool.return_buffer(std::move(buf));
 	}
 };
+
+
+std::string in_addr_str(const struct sockaddr_in6& addr);
+std::string errno_str(int code);
+std::string gai_error_str(int code);
 
 
 #endif /* __COMMON_UTILS_H */

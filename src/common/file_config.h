@@ -7,11 +7,6 @@
 
 struct FileConfig
 {
-	struct Controller
-	{
-		std::vector<std::string> addr_strs;
-	};
-
 	struct DD
 	{
 		unsigned id;
@@ -23,7 +18,7 @@ struct FileConfig
 		std::string addr_str;
 	};
 
-	std::optional<Controller> controller;
+	std::vector<std::string> portals;
 	std::vector<DD> dds;
 	std::vector<DDHost> dd_hosts;
 };

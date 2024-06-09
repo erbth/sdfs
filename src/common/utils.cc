@@ -11,6 +11,8 @@ extern "C" {
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <poll.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 }
 
 using namespace std;
@@ -220,4 +222,29 @@ unsigned long long get_monotonic_time()
 	check_syscall(clock_gettime(CLOCK_MONOTONIC, &ts), "clock_gettime");
 
 	return (ts.tv_sec * 1000000000ULL) + ts.tv_nsec;
+}
+
+
+string in_addr_str(const struct sockaddr_in6& addr)
+{
+	/* An IPv6 address can have at most 4*8 + 1*7 + 1 = 40 bytes.
+	 * An IPv4 address (mapped) can have at most 3*4 + 1*3 + 1 = 16 bytes. */
+	char buf[64];
+
+	if (!inet_ntop(AF_INET6, &addr.sin6_addr, buf, sizeof(buf)))
+		throw runtime_error("Failed to convert address to string");
+
+	buf[sizeof(buf) - 1] = '\0';
+	return string(buf) + ":"s + to_string(ntohs(addr.sin6_port));
+}
+
+string errno_str(int code)
+{
+	char buf[1024];
+	return string(strerror_r(code, buf, sizeof(buf)));
+}
+
+string gai_error_str(int code)
+{
+	return string(gai_strerror(code));
 }
