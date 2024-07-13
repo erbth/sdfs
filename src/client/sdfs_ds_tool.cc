@@ -293,7 +293,7 @@ void op_read(sdfs::DSClient& ds, const args_t& args)
 	while (req_size > 0 || q.size())
 	{
 		/* Issue requests */
-		while (req_size && q.size() < 1)
+		while (req_size && q.size() < 128)
 		{
 			auto to_read = min(block_size, req_size);
 			auto& e = q.emplace_back(m, cv, received, to_read);

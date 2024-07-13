@@ -12,7 +12,12 @@
 #include <utility>
 #include <vector>
 #include <variant>
+#include <deque>
 #include <functional>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
 #include "common/fixed_buffer.h"
 #include "common/utils.h"
 #include "common/epoll.h"
@@ -22,8 +27,9 @@
 #include "common/prot_client.h"
 #include "common/prot_dd.h"
 #include "common/open_list.h"
-#include "common/io_uring.h"
 #include "common/timerfd.h"
+#include "common/semaphore.h"
+#include "common/eventfd.h"
 
 extern "C" {
 #include <netinet/in.h>
@@ -41,20 +47,41 @@ static_assert(sizeof(unsigned) >= 4);
 /* Prototypes */
 class ctrl_dd;
 class client_path_t;
+class send_thread_t;
+class ctrl_ctx;
 
 
 using cb_send_on_path_finished_t = std::function<void()>;
+
+
+struct dd_request_t
+{
+	using cb_completed_t = void(*)(void*);
+
+	ctrl_dd* dd{};
+	size_t offset{};
+	size_t size{};
+	char* data{};
+	bool dir_write = false;
+
+	cb_completed_t cb_completed{};
+	void* cb_arg{};
+
+	/* Will be filled by dd_req */
+	int result = -1;
+};
 
 
 struct io_request_t
 {
 	io_request_t& operator=(io_request_t&&) = delete;
 
+	ctrl_ctx* ctrl_ptr{};      // For use by IO callbacks
 	client_path_t* path{};
 	unsigned long seq{};
 
 	/* A buffer for the message header etc. */
-	size_t static_buf_size = 0;
+	//size_t static_buf_size = 0;
 	char static_buf[SEND_STATIC_BUF_SIZE];
 
 	/* Receiving the request */
@@ -65,20 +92,13 @@ struct io_request_t
 	size_t offset{};
 	size_t count{};
 
+	/* 32 chunks + one extra chunk if IO is not aligned */
+	std::array<dd_request_t, 33> dd_reqs;
+	size_t cnt_dd_reqs;
+	size_t cnt_completed_dd_reqs;
+
 	/* Buffer */
 	fixed_buffer buf;
-};
-
-struct send_queue_element_t
-{
-	send_queue_element_t& operator=(send_queue_element_t&&) = delete;
-
-	char static_buf[SEND_STATIC_BUF_SIZE];
-
-	int iov_cnt = 0;
-	struct iovec iov[8]{};
-
-	cb_send_on_path_finished_t cb_finished;
 };
 
 
@@ -103,6 +123,37 @@ struct client_t
 	std::vector<client_path_t*> paths;
 };
 
+
+struct send_queue_element_t final
+{
+	send_queue_element_t() = default;
+	send_queue_element_t(send_queue_element_t&) = delete;
+	send_queue_element_t& operator=(send_queue_element_t&) = delete;
+
+	inline send_queue_element_t(send_queue_element_t&& o)
+		:
+			iov_cnt(o.iov_cnt), iov(o.iov), cb_finished(o.cb_finished),
+			buf(o.buf), iio_req(move(o.iio_req))
+	{
+		o.buf = nullptr;
+	}
+
+	inline ~send_queue_element_t()
+	{
+		if (buf)
+			free(buf);
+	}
+
+
+	int iov_cnt = 0;
+	struct iovec iov[8]{};
+
+	cb_send_on_path_finished_t cb_finished;
+	char* buf = nullptr;
+
+	std::optional<std::list<io_request_t>::iterator> iio_req;
+};
+
 struct client_path_t
 {
 	client_path_t& operator=(client_path_t&&) = delete;
@@ -110,20 +161,23 @@ struct client_path_t
 	struct sockaddr_in6 remote_addr{};
 	client_t* client = nullptr;
 
+	/* MUST NOT be changed after initialization */
 	WrappedFD wfd;
+	send_thread_t* send_thread = nullptr;
 
 	uint64_t requires_probe = 0;
 	uint64_t wait_for_probe = 0;
-
-	/* Sending data */
-	bool sender_enabled = false;
-	std::queue<send_queue_element_t> send_queue;
 
 	/* Receiving data */
 	char rcv_buf[1024];
 	size_t rcv_buf_size = 0;
 
-	client_request_t* rcv_req = nullptr;
+	/* Sending data */
+	bool sender_enabled = false;
+	std::queue<send_queue_element_t> send_queue;
+
+
+	client_request_t* req = nullptr;
 };
 
 
@@ -139,35 +193,12 @@ struct data_map_t
 
 
 /* Contexts for dd IO */
-struct dd_read_request_t
+struct dd_send_queue_element_t final
 {
-	using cb_completed_t = std::function<void(dd_read_request_t&&)>;
+	int iov_cnt = 0;
+	struct iovec iov[2]{};
 
-	ctrl_dd* dd;
-	size_t offset;
-	size_t size;
-	cb_completed_t cb_completed;
-
-	/* Will be filled by dd_read */
-	int result = -1;
-	const char* data = nullptr;
-
-	/* The data is stored somewhere in this buffer */
-	dynamic_aligned_buffer _buf;
-};
-
-struct dd_write_request_t
-{
-	using cb_completed_t = std::function<void(dd_write_request_t&&)>;
-
-	ctrl_dd* dd;
-	size_t offset;
-	size_t size;
-	const char* data = nullptr;
-	cb_completed_t cb_completed;
-
-	/* Will be filled by dd_write */
-	int result = -1;
+	char static_buf[32];
 };
 
 
@@ -186,16 +217,23 @@ struct ctrl_dd final
 
 
 	/* Receiving messages from the dd */
-	dynamic_aligned_buffer rd_buf;
-	size_t rd_buf_pos = 0;
+	char rcv_buf[1024];
+	size_t rcv_buf_size = 0;
+
+	char* rcv_ext_ptr = nullptr;
+	size_t rcv_ext_cnt = 0;
+
 
 	/* Sending messages to the dd */
-	//std::queue<ctrl_queued_msg> send_queue;
+	std::queue<dd_send_queue_element_t> send_queue;
 	size_t send_msg_pos = 0;
 
+
 	/* Outstanding requests */
-	std::map<uint64_t, dd_read_request_t> read_reqs;
-	std::map<uint64_t, dd_write_request_t> write_reqs;
+	std::map<uint64_t, dd_request_t*> active_reqs;
+
+
+	decltype(active_reqs)::iterator rcv_req;
 
 
 	inline int get_fd()
@@ -205,8 +243,109 @@ struct ctrl_dd final
 };
 
 
+struct thread_msg_t final
+{
+	enum : unsigned {
+		TYPE_QUIT = 1,
+		TYPE_ADD_CLIENT_PATH,
+		TYPE_REMOVE_CLIENT_PATH,
+		TYPE_SEND
+	};
+	unsigned type;
+
+	inline thread_msg_t(unsigned type)
+		: type(type)
+	{
+	}
+
+
+	client_path_t* client_path = nullptr;
+	send_queue_element_t sqe;
+
+
+	/* Some messages can be acknowledged as processed */
+	std::shared_ptr<sync_point> sp;
+
+	inline void acknowledge()
+	{
+		if (sp)
+			sp->flag();
+	}
+};
+
+
+class worker_thread_base_t
+{
+protected:
+	Epoll ep;
+	EventFD efd{ep, std::bind(&worker_thread_base_t::on_efd, this)};
+
+
+	/* Message box for IPC */
+	semaphore mb_sema_free{128 * 1024};
+	semaphore mb_sema_avail{0};
+	std::mutex m_mb_queue;
+	std::deque<thread_msg_t> mb_queue;
+
+	void on_efd();
+
+public:
+	virtual ~worker_thread_base_t() = 0;
+
+	/* Functions below this comment may be called from different threads */
+	void msg(thread_msg_t&& msg);
+};
+
+
+class recv_thread_t final : public worker_thread_base_t
+{
+public:
+};
+
+
+class send_thread_t final : public worker_thread_base_t
+{
+protected:
+	ctrl_ctx& cctx;
+
+	bool running{true};
+
+	void process_inbox();
+
+	/* Client paths */
+	std::vector<client_path_t*> client_paths;
+
+	/* Receivers of IPC calls */
+	void _add_client_path(client_path_t*);
+
+
+	/* Maintaining client paths */
+	void _remove_client_path(client_path_t*);
+
+
+	/* Send handlers */
+	void on_client_fd(client_path_t* path, int fd, uint32_t events);
+
+public:
+	send_thread_t(ctrl_ctx& cctx);
+
+	/* IMPORTANT NOTE: Not all of the public functions can be used directly by
+	 * other threads; some may only be used during initialization. See comments
+	 * below. */
+	std::vector<ctrl_dd*> dds;
+
+	void main();
+
+	/* Functions below this comment may be called from different threads */
+	std::list<client_path_t*> get_client_paths();
+	void add_client_path(client_path_t*);
+};
+
+
 class ctrl_ctx final
 {
+	friend send_thread_t;
+
 protected:
 	FileConfig cfg;
 
@@ -241,13 +380,19 @@ protected:
 	bool parse_client_message_getattr(client_path_t* p, const char* buf, size_t size, uint64_t seq);
 	bool parse_client_message_read(client_path_t* p, const char* buf, size_t size, uint64_t seq);
 
-	void send_io_req_read_finished(std::list<io_request_t>::iterator i);
+	/* Callbacks for client message processing */
+	static void _dd_io_complete_client_read(void*);
+	void dd_io_complete_client_read(std::list<io_request_t>::iterator);
 
+	/* Slow */
 	void send_on_client_path_static(
-			client_path_t* p,
-			const char* static_buf, size_t static_size,
-			const char* user_ptr = nullptr, size_t user_size = 0,
-			cb_send_on_path_finished_t cb_finished = nullptr);
+			client_path_t* p, const char* static_buf, size_t static_size);
+
+	void send_on_client_path_req(
+			std::list<io_request_t>::iterator iio_req,
+			char* ptr1, size_t size1,
+			char* ptr2 = nullptr, size_t size2 = 0);
+
 
 	uint64_t next_probe_token = 1;
 	std::set<uint64_t> active_probe_tokens;
@@ -268,12 +413,25 @@ protected:
 	/* Data map */
 	data_map_t data_map;
 
+	size_t split_io(size_t offset, size_t size,
+			dd_request_t* reqs, size_t max_req_count);
+
+	/* IO requests */
+	/* Must only be used by functions below */
+	std::mutex m_io_requests;
 	std::list<io_request_t> io_requests;
+
+	decltype(io_requests)::iterator add_io_request();
+	void remove_io_request(decltype(io_requests)::iterator);
 
 
 	/* dd IO interface */
-	void dd_read(dd_read_request_t&& req);
-	void dd_write(dd_write_request_t&& req);
+	void dd_req(dd_request_t* req);
+
+
+	/* Worker threads */
+	std::list<send_thread_t> send_threads;
+	std::vector<std::thread> send_thread_tobjs;
 
 
 	void print_cfg();
@@ -285,6 +443,7 @@ protected:
 	void initialize_connect_dds();
 	void initialize_data_map();
 	void initialize_client_listener();
+	void initialize_start_threads();
 
 	void on_signal(int s);
 
@@ -294,15 +453,13 @@ protected:
 	void on_dd_fd(ctrl_dd* dd, int fd, uint32_t events);
 
 
-	bool process_dd_message(ctrl_dd& dd, dynamic_aligned_buffer&& buf, size_t msg_len);
-	bool process_dd_message(ctrl_dd& dd, prot::dd::reply::read& msg, dynamic_aligned_buffer&& buf);
-	bool process_dd_message(ctrl_dd& dd, prot::dd::reply::write& msg);
+	bool parse_dd_message_simple(ctrl_dd* dd, const char* buf, size_t size, uint32_t msg_num);
+	bool parse_dd_message_read(ctrl_dd* dd, const char* ptr, size_t size, size_t data_len);
+	bool parse_dd_message_write(ctrl_dd* dd, const char* ptr, size_t size);
 
-	bool send_message_to_dd(ctrl_dd& dd, const prot::msg& msg,
-			const char* data = nullptr, size_t data_length = 0);
+	void complete_dd_read_request(ctrl_dd* dd);
 
-	bool send_message_to_dd(ctrl_dd& dd,
-			std::variant<dynamic_buffer, dynamic_aligned_buffer>&& buf, size_t msg_len);
+	void send_to_dd(ctrl_dd* dd, const char* static_buf, size_t static_size);
 
 
 public:

@@ -23,7 +23,189 @@ extern "C" {
 #include <netdb.h>
 }
 
+#define DEBUG
+#include "common/logging.h"
+
 using namespace std;
+
+
+worker_thread_base_t::~worker_thread_base_t()
+{
+}
+
+
+void worker_thread_base_t::on_efd()
+{
+}
+
+void worker_thread_base_t::msg(thread_msg_t&& msg)
+{
+	mb_sema_free.down();
+
+	{
+		unique_lock lk(m_mb_queue);
+		mb_queue.emplace_back(move(msg));
+	}
+
+	mb_sema_avail.up();
+	efd.signal();
+}
+
+
+send_thread_t::send_thread_t(ctrl_ctx& cctx)
+	: cctx(cctx)
+{
+}
+
+
+void send_thread_t::process_inbox()
+{
+	while (mb_sema_avail.try_down())
+	{
+		unique_lock lk(m_mb_queue);
+		auto& msg = mb_queue.front();
+		lk.unlock();
+
+		/* Process IPC message */
+		switch (msg.type)
+		{
+		case thread_msg_t::TYPE_QUIT:
+			running = false;
+			break;
+
+		case thread_msg_t::TYPE_ADD_CLIENT_PATH:
+			_add_client_path(msg.client_path);
+			break;
+
+		case thread_msg_t::TYPE_SEND:
+			msg.client_path->send_queue.emplace(move(msg.sqe));
+			if (!msg.client_path->sender_enabled)
+			{
+				msg.client_path->sender_enabled = true;
+				ep.change_events(msg.client_path->wfd.get_fd(), EPOLLOUT);
+			}
+			break;
+
+		case thread_msg_t::TYPE_REMOVE_CLIENT_PATH:
+			_remove_client_path(msg.client_path);
+			msg.acknowledge();
+			break;
+
+		default:
+			break;
+		};
+
+		lk.lock();
+		mb_queue.pop_front();
+		lk.unlock();
+
+		mb_sema_free.up();
+	}
+}
+
+void send_thread_t::_add_client_path(client_path_t* p)
+{
+	client_paths.push_back(p);
+
+	ep.add_fd(p->wfd.get_fd(), 0,
+			bind_front(&send_thread_t::on_client_fd, this, p));
+}
+
+void send_thread_t::_remove_client_path(client_path_t* p)
+{
+	auto i = client_paths.begin();
+	for (; i != client_paths.end(); i++)
+	{
+		if (*i == p)
+			break;
+	}
+
+	if (i == client_paths.end())
+		return;
+
+	ep.remove_fd(p->wfd.get_fd());
+	client_paths.erase(i);
+}
+
+
+void send_thread_t::on_client_fd(client_path_t* path, int fd, uint32_t events)
+{
+	if (!(events & EPOLLOUT))
+		return;
+
+	bool error = false;
+
+	if (path->send_queue.size() > 0)
+	{
+		auto& elem = path->send_queue.front();
+
+		auto ret = writev(fd, elem.iov, elem.iov_cnt);
+		if (ret > 0)
+		{
+			while (ret > 0 && elem.iov_cnt > 0)
+			{
+				auto cnt = min((size_t) ret, elem.iov[0].iov_len);
+				ret -= cnt;
+				elem.iov[0].iov_len -= cnt;
+
+				if (elem.iov[0].iov_len == 0)
+				{
+					elem.iov_cnt--;
+					for (int i = 0; i < elem.iov_cnt; i++)
+						elem.iov[i] = elem.iov[i+1];
+				}
+			}
+
+			if (elem.iov_cnt == 0)
+			{
+				if (elem.cb_finished)
+					elem.cb_finished();
+
+				if (elem.iio_req)
+					cctx.remove_io_request(*elem.iio_req);
+
+				path->send_queue.pop();
+			}
+		}
+		else if (errno != EAGAIN && errno != EWOULDBLOCK)
+		{
+			error = true;
+		}
+	}
+
+	if (path->send_queue.empty())
+	{
+		path->sender_enabled = false;
+		ep.change_events(fd, 0);
+	}
+
+	if (error)
+		_remove_client_path(path);
+}
+
+
+void send_thread_t::main()
+{
+	pthread_setname_np(pthread_self(), "sdfs-ctrl-send");
+
+	debug("send thread %p started\n", this);
+
+	while (running)
+	{
+		ep.process_events(-1);
+		process_inbox();
+	}
+
+	debug("send thread %p stopped\n", this);
+}
+
+
+void send_thread_t::add_client_path(client_path_t* p)
+{
+	thread_msg_t m(thread_msg_t::TYPE_ADD_CLIENT_PATH);
+	m.client_path = p;
+	msg(move(m));
+}
 
 
 ctrl_ctx::ctrl_ctx()
@@ -32,6 +214,14 @@ ctrl_ctx::ctrl_ctx()
 
 ctrl_ctx::~ctrl_ctx()
 {
+	/* Stop threads */
+	for (auto& t : send_threads)
+		t.msg(thread_msg_t::TYPE_QUIT);
+
+	for (auto& t : send_thread_tobjs)
+		t.join();
+
+
 	if (client_lfd)
 		ep.remove_fd_ignore_unknown(client_lfd.get_fd());
 
@@ -327,6 +517,39 @@ void ctrl_ctx::initialize_client_listener()
 			EPOLLIN, bind_front(&ctrl_ctx::on_client_lfd, this));
 }
 
+void ctrl_ctx::initialize_start_threads()
+{
+	constexpr unsigned cnt_send_threads = 2;
+
+	/* Compute how dds will be distributed */
+	auto dds_per_send_thread = (dds.size() + cnt_send_threads - 1) / cnt_send_threads;
+
+
+	/* Send threads */
+	auto i_dd = dds.begin();
+	for (unsigned i = 0; i < cnt_send_threads; i++)
+	{
+		send_threads.emplace_back(*this);
+		auto& sth = send_threads.back();
+
+		/* Distribute dds to threads */
+		for (unsigned j = 0; j < dds_per_send_thread && i_dd != dds.end(); j++, i_dd++)
+			sth.dds.push_back(&(*i_dd));
+
+		/* Start threads */
+		try
+		{
+			send_thread_tobjs.emplace_back(
+					bind(&send_thread_t::main, &send_threads.back()));
+		}
+		catch (...)
+		{
+			send_threads.pop_back();
+			throw;
+		}
+	}
+}
+
 void ctrl_ctx::initialize()
 {
 	/* Read config file and check values */
@@ -340,6 +563,9 @@ void ctrl_ctx::initialize()
 
 	/* Create listening socket for client */
 	initialize_client_listener();
+
+	/* Start threads */
+	initialize_start_threads();
 }
 
 
@@ -347,6 +573,54 @@ uint64_t ctrl_ctx::get_request_id()
 {
 	return next_request_id++;
 }
+
+
+list<io_request_t>::iterator ctrl_ctx::add_io_request()
+{
+	unique_lock lk(m_io_requests);
+	io_requests.emplace(io_requests.end());
+	return --io_requests.end();
+}
+
+void ctrl_ctx::remove_io_request(std::list<io_request_t>::iterator iio_req)
+{
+	unique_lock lk(m_io_requests);
+	io_requests.erase(iio_req);
+}
+
+
+size_t ctrl_ctx::split_io(size_t offset, size_t size,
+		dd_request_t* reqs, size_t max_req_count)
+{
+	auto ptr = offset;
+	auto end_ptr = offset + size;
+
+	size_t i;
+
+	for (i = 0; i < max_req_count && ptr < end_ptr; i++)
+	{
+		auto chunk_size = min(data_map.block_size, end_ptr - ptr);
+
+		/* Next full block */
+		chunk_size = min(
+				chunk_size,
+				((ptr + 1 + data_map.block_size - 1) / data_map.block_size) *
+					data_map.block_size);
+
+		auto block_num = ptr / data_map.block_size;
+
+		/* Add chunk */
+		reqs[i].offset = block_num / data_map.dd_order.size() + ptr % data_map.block_size;
+		reqs[i].size = chunk_size;
+		reqs[i].dd = data_map.dd_order[block_num % data_map.dd_order.size()];
+		reqs[i].data = (char*) (intptr_t) ptr - offset;
+
+		ptr += chunk_size;
+	}
+
+	return i;
+}
+
 
 void ctrl_ctx::on_signal(int s)
 {
@@ -362,7 +636,7 @@ void ctrl_ctx::on_client_lfd(int fd, uint32_t events)
 
 	WrappedFD wfd;
 	wfd.set_errno(
-			accept4(fd, (struct sockaddr*) &addr, &addrlen, SOCK_CLOEXEC),
+			accept4(fd, (struct sockaddr*) &addr, &addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC),
 			"accept");
 
 	printf("New client-connection from %s\n", in_addr_str(addr).c_str());
@@ -374,6 +648,16 @@ void ctrl_ctx::on_client_lfd(int fd, uint32_t events)
 
 	ep.add_fd(p.wfd.get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP,
 			bind_front(&ctrl_ctx::on_client_path_fd, this, &p));
+
+	/* Assign path to send thread */
+	static unsigned next_send_thread = 0;
+	next_send_thread = (next_send_thread + 1) % send_threads.size();
+
+	auto ith = send_threads.begin();
+	for (unsigned i = 0; i < next_send_thread; i++, ith++);
+
+	p.send_thread = &(*ith);
+	ith->add_client_path(&p);
 }
 
 
@@ -386,60 +670,12 @@ void ctrl_ctx::on_client_path_fd(client_path_t* path, int fd, uint32_t events)
 	bool disconnect = false;
 
 
-	/* Send data */
-	if (events & EPOLLOUT)
-	{
-		if (path->send_queue.size() > 0)
-		{
-			auto& elem = path->send_queue.front();
-
-			auto ret = writev(fd, elem.iov, elem.iov_cnt);
-			if (ret > 0)
-			{
-				while (ret > 0 && elem.iov_cnt > 0)
-				{
-					auto cnt = min((size_t) ret, elem.iov[0].iov_len);
-					ret -= cnt;
-					elem.iov[0].iov_len -= cnt;
-
-					if (elem.iov[0].iov_len == 0)
-					{
-						elem.iov_cnt--;
-						for (int i = 0; i < elem.iov_cnt; i++)
-							elem.iov[i] = elem.iov[i+1];
-					}
-				}
-
-				if (elem.iov_cnt == 0)
-				{
-					if (elem.cb_finished)
-						elem.cb_finished();
-
-					path->send_queue.pop();
-				}
-			}
-			else if (errno != EAGAIN && errno != EWOULDBLOCK)
-			{
-				fprintf(stderr, "Write error on path: %s; disconnecting\n",
-						errno_str(errno).c_str());
-				disconnect = true;
-			}
-		}
-
-		if (path->send_queue.empty())
-		{
-			path->sender_enabled = false;
-			ep.change_events(fd, EPOLLIN | EPOLLHUP | EPOLLRDHUP);
-		}
-	}
-
-
 	/* Receive data */
 	if (events & EPOLLIN)
 	{
-		if (path->rcv_req)
+		if (path->req)
 		{
-			auto req = path->rcv_req;
+			auto req = path->req;
 
 			auto ret = read(fd, req->rcv_ptr, req->rcv_rem_size);
 			if (ret > 0)
@@ -473,12 +709,15 @@ void ctrl_ctx::on_client_path_fd(client_path_t* path, int fd, uint32_t events)
 			if (ret > 0)
 			{
 				path->rcv_buf_size += ret;
+				bool handled = true;
 
 				/* Parse message header */
-				while (path->rcv_buf_size >= 8)
+				while (path->rcv_buf_size >= 8 && handled)
 				{
 					auto msg_len = ser::read_u32(path->rcv_buf) + 4UL;
 					auto msg_num = ser::read_u32(path->rcv_buf + 4);
+
+					handled = false;
 
 					switch (msg_num)
 					{
@@ -499,6 +738,8 @@ void ctrl_ctx::on_client_path_fd(client_path_t* path, int fd, uint32_t events)
 							path->rcv_buf_size -= msg_len;
 							memmove(path->rcv_buf, path->rcv_buf + msg_len,
 									path->rcv_buf_size);
+
+							handled = true;
 						}
 						break;
 					};
@@ -528,7 +769,6 @@ void ctrl_ctx::on_client_path_fd(client_path_t* path, int fd, uint32_t events)
 	if (disconnect)
 	{
 		ep.remove_fd(fd);
-		path->wfd.close();
 
 		/* Put path on removal list */
 		auto i = client_paths.begin();
@@ -604,6 +844,8 @@ bool ctrl_ctx::parse_client_message_connect(client_path_t* p, const char* buf, s
 	}
 
 	auto client_id = ser::sread_u32(buf);
+
+	debug("recv client message CONNECT from %u\n", (unsigned) client_id);
 
 	if (client_id == 0)
 	{
@@ -839,87 +1081,160 @@ bool ctrl_ctx::parse_client_message_read(
 	}
 
 	auto ptr = buf;
-	auto io_req = io_requests.emplace(io_requests.end());
+	auto iio_req = add_io_request();
+	auto& io_req = *iio_req;
 
 	try
 	{
-		io_req->path = p;
-		io_req->seq = seq;
-		io_req->offset = ser::sread_u64(ptr);
-		io_req->count = ser::sread_u64(ptr);
+		io_req.ctrl_ptr = this;
+		io_req.path = p;
+		io_req.seq = seq;
+		io_req.offset = ser::sread_u64(ptr);
+		io_req.count = ser::sread_u64(ptr);
+
+		/* Check that the request stays inside the data boundary, carries data,
+		 * and is not larger than 32MiB */
+		if (
+				io_req.count == 0 ||
+				io_req.count > 32 * 1024 * 1024 ||
+				io_req.offset + io_req.count > data_map.size)
+		{
+			auto ptr = io_req.static_buf;
+			prot::serialize_hdr(ptr,
+					16 + 4,
+					prot::client::RESP_READ,
+					seq);
+
+			ser::swrite_i32(ptr, err::IO);
+			send_on_client_path_req(iio_req, io_req.static_buf, 20);
+			return false;
+		}
 
 		/* Allocate a buffer */
-		io_req->buf = fixed_buffer(io_req->count);
+		io_req.buf = fixed_buffer(io_req.count);
 
-		memset(io_req->buf.ptr(), 0, io_req->count);
+		/* Split request into chunks */
+		io_req.cnt_dd_reqs = split_io(
+				io_req.offset, io_req.count,
+				io_req.dd_reqs.data(), io_req.dd_reqs.size());
 
-		/* Send response */
-		char msg_buf[32];
-		auto ptr = msg_buf;
+		/* Perform dd IO */
+		for (size_t i = 0; i < io_req.cnt_dd_reqs; i++)
+		{
+			auto& req = io_req.dd_reqs[i];
 
-		prot::serialize_hdr(ptr,
-				16 + 4 + io_req->count,
-				prot::client::RESP_READ,
-				seq);
+			req.data += (intptr_t) io_req.buf.ptr();
+			req.cb_completed = ctrl_ctx::_dd_io_complete_client_read;
 
-		ser::swrite_i32(ptr, err::SUCCESS);
+			/* In terms of C++, and typesafety, this is an awful hack; but it
+			 * works... */
+			static_assert(sizeof(iio_req) == sizeof(void*));
+			memcpy((char*) &req.cb_arg, (char*) &iio_req, 8);
 
-		send_on_client_path_static(
-				p,
-				msg_buf, 20,
-				io_req->buf.ptr(), io_req->count,
-				bind_front(&ctrl_ctx::send_io_req_read_finished, this, io_req));
+			dd_req(&req);
+		}
 	}
 	catch (...)
 	{
-		io_requests.erase(io_req);
+		remove_io_request(iio_req);
 		throw;
 	}
 
 	return false;
 }
 
-
-void ctrl_ctx::send_io_req_read_finished(list<io_request_t>::iterator i)
+void ctrl_ctx::_dd_io_complete_client_read(void* arg)
 {
-	io_requests.erase(i);
+	list<io_request_t>::iterator io_req;
+	memcpy((char*) &io_req, (char*) &arg, 8);
+
+	io_req->ctrl_ptr->dd_io_complete_client_read(io_req);
+}
+
+void ctrl_ctx::dd_io_complete_client_read(list<io_request_t>::iterator io_req)
+{
+	io_req->cnt_completed_dd_reqs++;
+
+	/* Check if all requests have been completed */
+	if (io_req->cnt_completed_dd_reqs < io_req->cnt_dd_reqs)
+		return;
+
+	/* Check return status and potentially return error */
+	for (size_t i = 0; i < io_req->cnt_dd_reqs; i++)
+	{
+		auto& r = io_req->dd_reqs[i];
+		if (r.result != err::SUCCESS)
+		{
+			auto ptr = io_req->static_buf;
+			prot::serialize_hdr(ptr,
+					16 + 4,
+					prot::client::RESP_READ,
+					io_req->seq);
+
+			ser::swrite_i32(ptr, r.result);
+			send_on_client_path_req(io_req, io_req->static_buf, 20);
+			return;
+		}
+	}
+
+	/* Send data to the client */
+	auto ptr = io_req->static_buf;
+
+	prot::serialize_hdr(ptr,
+			16 + 4 + io_req->count,
+			prot::client::RESP_READ,
+			io_req->seq);
+
+	ser::swrite_i32(ptr, err::SUCCESS);
+
+	send_on_client_path_req(io_req,
+			io_req->static_buf, 20,
+			io_req->buf.ptr(), io_req->count);
 }
 
 
 void ctrl_ctx::send_on_client_path_static(
-		client_path_t* p,
-		const char* buf, size_t size,
-		const char* user_ptr, size_t user_size,
-		cb_send_on_path_finished_t cb_finished)
+		client_path_t* p, const char* buf, size_t size)
 {
-	if (!p->wfd)
-		return;
+	thread_msg_t msg(thread_msg_t::TYPE_SEND);
+	msg.client_path = p;
 
-	if (size > SEND_STATIC_BUF_SIZE)
-		throw invalid_argument("size too large for static sending");
+	msg.sqe.buf = (char*) malloc(size);
+	if (!msg.sqe.buf)
+		throw system_error(errno, generic_category());
 
-	auto& elem = p->send_queue.emplace();
-	memcpy(elem.static_buf, buf, size);
+	memcpy(msg.sqe.buf, buf, size);
 
-	elem.iov_cnt = 1;
-	elem.iov[0].iov_base = elem.static_buf;
-	elem.iov[0].iov_len = size;
+	msg.sqe.iov_cnt = 1;
+	msg.sqe.iov[0].iov_base = msg.sqe.buf;
+	msg.sqe.iov[0].iov_len = size;
 
-	if (user_ptr)
+	p->send_thread->msg(move(msg));
+}
+
+
+void ctrl_ctx::send_on_client_path_req(
+		list<io_request_t>::iterator iio_req,
+		char* ptr1, size_t size1,
+		char* ptr2, size_t size2)
+{
+	thread_msg_t msg(thread_msg_t::TYPE_SEND);
+	msg.client_path = iio_req->path;
+
+	msg.sqe.iio_req = iio_req;
+
+	msg.sqe.iov_cnt = 1;
+	msg.sqe.iov[0].iov_base = ptr1;
+	msg.sqe.iov[0].iov_len = size1;
+
+	if (ptr2 && size2)
 	{
-		elem.iov_cnt = 2;
-		elem.iov[1].iov_base = (void*) user_ptr;
-		elem.iov[1].iov_len = user_size;
+		msg.sqe.iov_cnt = 2;
+		msg.sqe.iov[1].iov_base = ptr2;
+		msg.sqe.iov[1].iov_len = size2;
 	}
 
-	elem.cb_finished = cb_finished;
-
-	/* Enable sender if required */
-	if (!p->sender_enabled)
-	{
-		ep.change_events(p->wfd.get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP | EPOLLOUT);
-		p->sender_enabled = true;
-	}
+	iio_req->path->send_thread->msg(move(msg));
 }
 
 
@@ -969,6 +1284,19 @@ void ctrl_ctx::cleanup_clients()
 		auto& p = client_paths_to_remove.front();
 		printf("Removing disconnected path from %s\n", in_addr_str(p.remote_addr).c_str());
 
+		/* Remove the path from the sender thread */
+		auto msg_sp = make_shared<sync_point>();
+
+		thread_msg_t msg(thread_msg_t::TYPE_REMOVE_CLIENT_PATH);
+		msg.client_path = &p;
+		msg.sp = msg_sp;
+		p.send_thread->msg(move(msg));
+
+		msg_sp->wait();
+
+
+		/* Remove path from client if the path is associated with a client; and
+		 * remove the client if this was the client's last path */
 		if (p.client)
 		{
 			for (auto i = p.client->paths.begin(); i != p.client->paths.end(); i++)
@@ -1009,230 +1337,288 @@ void ctrl_ctx::on_dd_fd(ctrl_dd* dd, int fd, uint32_t events)
 	bool disconnect = false;
 
 	/* Send data */
-	//if (events & EPOLLOUT)
-	//{
-	//	// auto prof = profiler_get("on_dd_fd(send)");
+	if (events & EPOLLOUT)
+	{
+		if (dd->send_queue.size() > 0)
+		{
+			auto& sqe = dd->send_queue.front();
 
-	//	bool disable_sender = false;
-	//	if (dd->send_queue.size() > 0)
-	//	{
-	//		auto& qmsg = dd->send_queue.front();
+			auto ret = writev(dd->get_fd(), sqe.iov, sqe.iov_cnt);
+			if (ret > 0)
+			{
+				while (ret > 0 && sqe.iov_cnt > 0)
+				{
+					auto cnt = min((size_t) ret, sqe.iov[0].iov_len);
+					ret -= cnt;
+					sqe.iov[0].iov_len -= cnt;
 
-	//		size_t to_write = min(
-	//				2 * 1024UL * 1024,
-	//				qmsg.msg_len - dd->send_msg_pos);
+					if (sqe.iov[0].iov_len == 0)
+					{
+						sqe.iov_cnt--;
+						for (int i = 0; i < sqe.iov_cnt; i++)
+							sqe.iov[i] = sqe.iov[i+1];
+					}
+				}
 
-	//		auto ret = write(
-	//				dd->get_fd(),
-	//				qmsg.buf_ptr() + dd->send_msg_pos,
-	//				to_write);
+				if (sqe.iov_cnt == 0)
+				{
+					dd->send_queue.pop();
+				}
+			}
+			else if (errno != EAGAIN && errno != EWOULDBLOCK)
+			{
+				fprintf(stderr, "Write error on connection to dd %u: %s; disconecting\n",
+						(unsigned) dd->id, errno_str(errno).c_str());
+				disconnect = true;
+			}
+		}
 
-	//		if (ret >= 0)
-	//		{
-	//			dd->send_msg_pos += ret;
-	//			if (dd->send_msg_pos == qmsg.msg_len)
-	//			{
-	//				qmsg.return_buffer(buf_pool_dd_io);
-	//				dd->send_queue.pop();
-	//				dd->send_msg_pos = 0;
-
-	//				if (dd->send_queue.empty())
-	//					disable_sender = true;
-	//			}
-	//		}
-	//		else
-	//		{
-	//			disconnect = true;
-	//		}
-	//	}
-	//	else
-	//	{
-	//		disable_sender = true;
-	//	}
-
-	//	if (disable_sender)
-	//		ep.change_events(dd->get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP);
-	//}
+		if (dd->send_queue.empty())
+		{
+			ep.change_events(dd->get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP);
+		}
+	}
 
 	/* Read data */
 	if (events & EPOLLIN)
 	{
-		// auto prof = profiler_get("on_dd_fd(recv)");
-
-		const size_t read_chunk = 2 * 1024 * 1024ULL;
-
-		if (!dd->rd_buf)
-			dd->rd_buf = buf_pool_dd_io.get_buffer(dd->rd_buf_pos + read_chunk);
-		else
-			dd->rd_buf.ensure_size(dd->rd_buf_pos + read_chunk);
-
-		auto ret = read(
-				dd->get_fd(),
-				dd->rd_buf.ptr() + dd->rd_buf_pos,
-				read_chunk);
-
-		if (ret > 0)
+		if (dd->rcv_ext_ptr)
 		{
-			dd->rd_buf_pos += ret;
-
-			/* Check if the message has been completely received */
-			while (dd->rd_buf_pos >= 4)
+			auto ret = read(dd->get_fd(), dd->rcv_ext_ptr, dd->rcv_ext_cnt);
+			if (ret > 0)
 			{
-				size_t msg_len = ser::read_u32(dd->rd_buf.ptr());
+				dd->rcv_ext_ptr += ret;
+				dd->rcv_ext_cnt -= ret;
 
-				if (dd->rd_buf_pos >= msg_len + 4)
+				if (dd->rcv_ext_cnt == 0)
 				{
-					/* Move the message buffer out */
-					dynamic_aligned_buffer msg_buf(move(dd->rd_buf));
-
-					dd->rd_buf_pos -= msg_len + 4;
-					dd->rd_buf = buf_pool_dd_io.get_buffer(dd->rd_buf_pos);
-					memcpy(
-							dd->rd_buf.ptr(),
-							msg_buf.ptr() + (msg_len + 4),
-							dd->rd_buf_pos);
-
-					/* Process the message */
-					if (process_dd_message(*dd, move(msg_buf), msg_len))
-					{
-						disconnect = true;
-						break;
-					}
+					dd->rcv_ext_ptr = nullptr;
+					complete_dd_read_request(dd);
 				}
-				else
-				{
-					break;
-				}
+			}
+			else
+			{
+				disconnect = true;
 			}
 		}
 		else
 		{
-			disconnect = true;
+			auto ret = read(
+					dd->get_fd(),
+					dd->rcv_buf + dd->rcv_buf_size,
+					sizeof(dd->rcv_buf) - dd->rcv_buf_size);
+
+			if (ret > 0)
+			{
+				dd->rcv_buf_size += ret;
+				bool handled = true;
+
+				/* Parse message header */
+				while (dd->rcv_buf_size >= 8 && handled)
+				{
+					auto msg_len = ser::read_u32(dd->rcv_buf) + 4UL;
+					auto msg_num = ser::read_u32(dd->rcv_buf + 4);
+
+					handled = false;
+
+					switch (msg_num)
+					{
+					case prot::dd::reply::READ:
+						if (dd->rcv_buf_size >= 12)
+						{
+							auto data_len = min(dd->rcv_buf_size - 8, msg_len - 8);
+							if (parse_dd_message_read(
+									dd, dd->rcv_buf + 8, msg_len - 8, data_len))
+							{
+								disconnect = true;
+							}
+
+							dd->rcv_buf_size -= data_len + 8;
+							memmove(dd->rcv_buf, dd->rcv_buf + data_len,
+									dd->rcv_buf_size);
+
+							handled = true;
+						}
+						break;
+
+					default:
+						if (msg_len > sizeof(dd->rcv_buf))
+						{
+							fprintf(stderr, "Message from dd too long; disconnecting\n");
+							disconnect = true;
+						}
+						else if (dd->rcv_buf_size >= msg_len)
+						{
+							if (parse_dd_message_simple(
+									dd, dd->rcv_buf + 8, msg_len - 8, msg_num))
+							{
+								disconnect = true;
+							}
+
+							dd->rcv_buf_size -= msg_len;
+							memmove(dd->rcv_buf, dd->rcv_buf + msg_len,
+									dd->rcv_buf_size);
+
+							handled = true;
+						}
+						break;
+					};
+				}
+			}
+			else if (ret == 0)
+			{
+				fprintf(stderr, "dd %u disconnected.\n", (unsigned) dd->id);
+				disconnect = true;
+			}
+			else if (errno != EAGAIN && errno != EWOULDBLOCK)
+			{
+				fprintf(stderr, "Read error on connection to dd %u: %s; disconecting\n",
+						(unsigned) dd->id, errno_str(errno).c_str());
+				disconnect = true;
+			}
 		}
 	}
 
 	if (events & (EPOLLHUP | EPOLLRDHUP))
+	{
+		fprintf(stderr, "dd %u disconnected.\n", (unsigned) dd->id);
 		disconnect = true;
+	}
 
 	if (disconnect)
 		throw runtime_error("Error reading data form dd.\n");
 }
 
-bool ctrl_ctx::process_dd_message(
-		ctrl_dd& dd, dynamic_aligned_buffer&& _buf, size_t msg_len)
+bool ctrl_ctx::parse_dd_message_simple(
+		ctrl_dd* dd, const char* buf, size_t size, uint32_t msg_num)
 {
-	buffer_pool_returner bp_ret(buf_pool_dd_io, move(_buf));
-	unique_ptr<prot::msg> msg;
-
-	try
+	if (size < 8)
 	{
-		msg = prot::dd::reply::parse(bp_ret.buf.ptr() + 4, msg_len);
-	}
-	catch (const prot::exception& e)
-	{
-		fprintf(stderr, "Invalid message from dd: %s\n", e.what());
+		fprintf(stderr, "Invalid message size\n");
 		return true;
 	}
 
-	switch (msg->num)
+	switch (msg_num)
 	{
-		case prot::dd::reply::READ:
-			return process_dd_message(
-					dd,
-					static_cast<prot::dd::reply::read&>(*msg),
-					move(bp_ret.buf));
+	case prot::dd::reply::WRITE:
+		return parse_dd_message_write(dd, buf, size);
 
-		case prot::dd::reply::WRITE:
-			return process_dd_message(
-					dd,
-					static_cast<prot::dd::reply::write&>(*msg));
-
-		default:
-			fprintf(stderr, "dd io: protocol violation\n");
-			return true;
-	}
+	default:
+		fprintf(stderr, "Unknown dd message number: %u\n", (unsigned) msg_num);
+		return true;
+	};
 }
 
-bool ctrl_ctx::process_dd_message(ctrl_dd& dd, prot::dd::reply::read& msg, dynamic_aligned_buffer&& buf)
+bool ctrl_ctx::parse_dd_message_read(
+		ctrl_dd* dd, const char* ptr, size_t size, size_t data_len)
 {
-	/* Find request */
-	auto i_req = dd.read_reqs.find(msg.request_id);
-	if (i_req == dd.read_reqs.end())
+	if (size < 12)
 	{
-		fprintf(stderr, "dd io: received invalid request id\n");
-		buf_pool_dd_io.return_buffer(move(buf));
+		fprintf(stderr, "dd io: Invalid READ reply\n");
+		return true;
+	}
+
+	auto request_id = ser::sread_u64(ptr);
+	auto result = ser::sread_i32(ptr);
+
+	size -= 12;
+	data_len -= 12;
+	ptr += 12;
+
+	/* Find request */
+	auto i_req = dd->active_reqs.find(request_id);
+	if (i_req == dd->active_reqs.end())
+	{
+		fprintf(stderr, "dd io: Received invalid request id\n");
+		return true;
+	}
+
+	auto req = i_req->second;
+	req->result = result;
+
+	/* Copy data if any */
+	if (data_len > 0)
+		memcpy(req->data, ptr, data_len);
+
+	/* Setup read of remaining data if required, or complete request */
+	dd->rcv_req = i_req;
+
+	if (size > data_len)
+	{
+		dd->rcv_ext_ptr = req->data + data_len;
+		dd->rcv_ext_cnt = size - data_len;
+	}
+	else
+	{
+		complete_dd_read_request(dd);
+	}
+
+	return false;
+}
+
+void ctrl_ctx::complete_dd_read_request(ctrl_dd* dd)
+{
+	auto req = dd->rcv_req->second;
+	dd->active_reqs.erase(dd->rcv_req);
+	dd->rcv_req = decltype(dd->active_reqs)::iterator();
+
+	auto cb = req->cb_completed;
+	auto arg = req->cb_arg;
+	cb(arg);
+}
+
+bool ctrl_ctx::parse_dd_message_write(
+		ctrl_dd* dd, const char* ptr, size_t size)
+{
+	if (size != 12)
+	{
+		fprintf(stderr, "dd io: Invalid WRITE reply\n");
+		return true;
+	}
+
+	auto request_id = ser::sread_u64(ptr);
+	auto result = ser::sread_i32(ptr);
+
+	/* Find request */
+	auto i_req = dd->active_reqs.find(request_id);
+	if (i_req == dd->active_reqs.end())
+	{
+		fprintf(stderr, "dd io: Received invalid request id\n");
 		return true;
 	}
 
 	/* Complete request */
-	auto req = move(i_req->second);
-	dd.read_reqs.erase(i_req);
+	auto req = i_req->second;
+	dd->active_reqs.erase(i_req);
 
-	req.result = msg.res;
-	if (msg.data_length != req.size)
-		req.result = err::IO;
+	req->result = result;
 
-	req.data = msg.data;
-	req._buf = move(buf);
-
-	auto cb = req.cb_completed;
-	cb(move(req));
-
-	return false;
-}
-
-bool ctrl_ctx::process_dd_message(ctrl_dd& dd, prot::dd::reply::write& msg)
-{
-	/* Find request */
-	auto i_req = dd.write_reqs.find(msg.request_id);
-	if (i_req == dd.write_reqs.end())
-	{
-		fprintf(stderr, "dd io: received invalid request id\n");
-		return true;
-	}
-
-	/* Complete request */
-	auto req = move(i_req->second);
-	dd.write_reqs.erase(i_req);
-
-	req.result = msg.res;
-
-	auto cb = req.cb_completed;
-	cb(move(req));
+	auto cb = req->cb_completed;
+	auto arg = req->cb_arg;
+	cb(arg);
 
 	return false;
 }
 
 
-bool ctrl_ctx::send_message_to_dd(ctrl_dd& dd, const prot::msg& msg,
-		const char* data, size_t data_length)
+void ctrl_ctx::send_to_dd(
+		ctrl_dd* dd, const char* static_buf, size_t static_size)
 {
-	dynamic_buffer buf;
-	buf.ensure_size(msg.serialize(nullptr) + data_length);
-	auto hdr_len = msg.serialize(buf.ptr());
+	auto was_empty = dd->send_queue.empty();
+	dd->send_queue.emplace();
+	auto& sqe = dd->send_queue.back();
 
-	if (data_length > 0)
-		memcpy(buf.ptr() + hdr_len, data, data_length);
+	if (static_size > sizeof(sqe.static_buf))
+		throw invalid_argument("static_size too large");
 
-	return send_message_to_dd(dd, move(buf), hdr_len + data_length);
-}
+	memcpy(sqe.static_buf, static_buf, static_size);
 
-bool ctrl_ctx::send_message_to_dd(ctrl_dd& dd,
-		variant<dynamic_buffer, dynamic_aligned_buffer>&& buf, size_t msg_len)
-{
-	if (!dd.connected)
-	{
-		fprintf(stderr, "attempted to send message to disconnected dd\n");
-		return true;
-	}
+	sqe.iov_cnt = 1;
+	sqe.iov[0].iov_base = sqe.static_buf;
+	sqe.iov[0].iov_len = static_size;
 
-	//auto was_empty = dd.send_queue.empty();
-	//dd.send_queue.emplace(move(buf), msg_len);
-
-	// if (was_empty)
-	// 	ep.change_events(dd.get_fd(), EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP);
-
-	return false;
+	if (was_empty)
+		ep.change_events(dd->get_fd(), EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP);
 }
 
 
@@ -1246,58 +1632,64 @@ void ctrl_ctx::main()
 }
 
 
-void ctrl_ctx::dd_read(dd_read_request_t&& req)
+void ctrl_ctx::dd_req(dd_request_t* req)
 {
-	auto& dd = *req.dd;
+	auto dd = req->dd;
 
-	prot::dd::req::read msg;
-	msg.request_id = get_request_id();
-	msg.offset = req.offset;
-	msg.length = req.size;
-
-	/* Register request */
-	auto [i,created] = dd.read_reqs.emplace(msg.request_id, move(req));
-	if (!created)
-		throw runtime_error("dd io: request id conflict");
-
-	/* Send message to dd */
-	try
+	if (req->dir_write)
 	{
-		if (send_message_to_dd(dd, msg))
-			throw runtime_error("failed to send message to dd\n");
+		prot::dd::req::write msg;
+		msg.request_id = get_request_id();
+		msg.offset = req->offset;
+		msg.length = req->size;
+
+		/* Register request */
+		/* TODO: handle conflict */
+		auto [i,created] = dd->active_reqs.emplace(msg.request_id, req);
+		if (!created)
+			throw runtime_error("dd io: request id conflict");
+
+		/* Send message to dd */
+		try
+		{
+			char buf[msg.serialize(nullptr)];
+			auto len = msg.serialize(buf);
+
+			send_to_dd(dd, buf, len);
+		}
+		catch (...)
+		{
+			/* Unregister request */
+			dd->active_reqs.erase(i);
+			throw;
+		}
 	}
-	catch (...)
+	else
 	{
-		/* Unregister request */
-		dd.read_reqs.erase(i);
-		throw;
-	}
-}
+		prot::dd::req::read msg;
+		msg.request_id = get_request_id();
+		msg.offset = req->offset;
+		msg.length = req->size;
 
-void ctrl_ctx::dd_write(dd_write_request_t&& req)
-{
-	auto& dd = *req.dd;
+		/* Register request */
+		/* TODO: handle conflict */
+		auto [i,created] = dd->active_reqs.emplace(msg.request_id, req);
+		if (!created)
+			throw runtime_error("dd io: request id conflict");
 
-	prot::dd::req::write msg;
-	msg.request_id = get_request_id();
-	msg.offset = req.offset;
-	msg.length = req.size;
+		/* Send message to dd */
+		try
+		{
+			char buf[msg.serialize(nullptr)];
+			auto len = msg.serialize(buf);
 
-	/* Register request */
-	auto [i,created] = dd.write_reqs.emplace(msg.request_id, move(req));
-	if (!created)
-		throw runtime_error("dd io: request id conflict");
-
-	/* Send message to dd */
-	try
-	{
-		if (send_message_to_dd(dd, msg, req.data, req.size))
-			throw runtime_error("failed to send message to dd\n");
-	}
-	catch (...)
-	{
-		/* Unregister request */
-		dd.write_reqs.erase(i);
-		throw;
+			send_to_dd(dd, buf, len);
+		}
+		catch (...)
+		{
+			/* Unregister request */
+			dd->active_reqs.erase(i);
+			throw;
+		}
 	}
 }

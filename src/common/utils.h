@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <limits>
 #include <mutex>
+#include <condition_variable>
 #include <string>
 #include <stdexcept>
 #include <system_error>
@@ -201,6 +202,42 @@ public:
 std::string in_addr_str(const struct sockaddr_in6& addr);
 std::string errno_str(int code);
 std::string gai_error_str(int code);
+
+
+class sync_point final
+{
+protected:
+	std::mutex m;
+	std::condition_variable cv;
+
+	bool flagged = false;
+
+public:
+	inline void flag()
+	{
+		{
+			std::unique_lock lk(m);
+			flagged = true;
+		}
+		cv.notify_one();
+	}
+
+	inline void wait()
+	{
+		std::unique_lock lk(m);
+		while (!flagged)
+			cv.wait(lk);
+	}
+};
+
+
+/* A cealing function for alignment - round up to the next multiple of @param
+ * alignment. @param alignment MUST BE a power of two. */
+template<typename T>
+inline T align_up(T alignment, T value)
+{
+	return (value + alignment - 1) & ~(alignment - 1);
+}
 
 
 #endif /* __COMMON_UTILS_H */

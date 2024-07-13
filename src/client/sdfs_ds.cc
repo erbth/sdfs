@@ -133,16 +133,32 @@ void DSClient::init_paths(const vector<string>& srv_portals)
 
 void DSClient::init_start_threads()
 {
-	unsigned cnt_threads = 1;
+	unsigned cnt_threads = paths.size();
 
 	auto ipath = paths.begin();
 	auto paths_per_thread = paths.size() / cnt_threads;
 
-	/* For now, stick to one thread */
 	for (unsigned i = 0; i < cnt_threads; i++)
 	{
-		per_thread_ctx.emplace_back(i, &wt_quit);
-		auto& tctx = per_thread_ctx.back();
+		auto& tctx = per_thread_ctx.emplace_back(i, &wt_quit);
+		/* Build this vector before starting the threads s.t. it is not modified
+		 * after the first thread has been started. This way, no synchronization
+		 * is required to access it read-only from the threads (starting a
+		 * threads contains a memory barrier) */
+		wt_efds.push_back(&tctx.efd);
+	}
+
+	for (auto ictx = per_thread_ctx.begin(); ictx != per_thread_ctx.end(); ictx++)
+	{
+		auto& tctx = *ictx;
+		auto inctx = ictx;
+
+		if (++inctx != per_thread_ctx.end())
+		{
+			auto& next_tctx = *inctx;
+			tctx.next_connect_paths = &next_tctx.connect_paths;
+			tctx.next_efd = &next_tctx.efd;
+		}
 
 		tctx.ds_client = this;
 		tctx.client_id = &client_id;
@@ -156,7 +172,6 @@ void DSClient::init_start_threads()
 			ipath->thread_efd = &tctx.efd;
 		}
 
-		wt_efds.push_back(&tctx.efd);
 		worker_threads.emplace_back();
 
 		try
@@ -293,6 +308,15 @@ void DSClient::wt_signal_all()
 		efd->signal();
 }
 
+void DSClient::wt_signal_all_except(unsigned thread_id)
+{
+	for (size_t i = 0; i < wt_efds.size(); i++)
+	{
+		if (i != thread_id)
+			wt_efds[i]->signal();
+	}
+}
+
 void worker_thread_ctx::on_eventfd()
 {
 	if (wt_quit->load(memory_order_release))
@@ -307,6 +331,51 @@ void worker_thread_ctx::on_eventfd()
 			ep.change_events(p->wfd.get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP | EPOLLOUT);
 			p->sender_enabled = true;
 		}
+	}
+
+	/* Connect paths if required */
+	if (connect_paths.load(memory_order_acquire))
+	{
+		connect_paths.store(false, memory_order_release);
+
+		auto ip = paths.begin();
+		for (; ip != paths.end() && (*ip)->accepted; ip++);
+
+		if (ip != paths.end())
+		{
+			/* Send connect on first unconnected path */
+			char buf[32];
+			auto ptr = buf;
+
+			prot::serialize_hdr(ptr,
+					16 + 4,
+					prot::client::REQ_CONNECT,
+					next_seq->fetch_add(1, memory_order_acq_rel));
+
+			ser::swrite_u32(ptr, client_id->load(memory_order_acquire));
+
+			send_on_path_static(*ip, buf, 20);
+		}
+	}
+
+	/* Reflect probe token if required */
+	auto next_probe_round = ds_client->probe_round.load(memory_order_acquire);
+	if (next_probe_round != completed_probe_round)
+	{
+		completed_probe_round = next_probe_round;
+
+		char msg_buf[32];
+		auto ptr = msg_buf;
+
+		prot::serialize_hdr(ptr,
+				16 + 8,
+				prot::client::RESP_PROBE,
+				ds_client->probe_seq);
+
+		ser::swrite_u64(ptr, ds_client->probe_token);
+
+		for (auto p : paths)
+			send_on_path_static(p, msg_buf, 24);
 	}
 }
 
@@ -404,12 +473,15 @@ void worker_thread_ctx::on_path_fd(path_t* path, int fd, uint32_t events)
 			if (ret > 0)
 			{
 				path->rcv_buf_size += ret;
+				bool handled = true;
 
 				/* Parse message header */
-				while (path->rcv_buf_size >= 8)
+				while (path->rcv_buf_size >= 8 && handled)
 				{
 					auto msg_len = ser::read_u32(path->rcv_buf) + 4UL;
 					auto msg_num = ser::read_u32(path->rcv_buf + 4);
+
+					handled = false;
 
 					switch (msg_num)
 					{
@@ -418,6 +490,7 @@ void worker_thread_ctx::on_path_fd(path_t* path, int fd, uint32_t events)
 						{
 							fprintf(stderr, "Invalid READ reply size; disconnecting\n");
 							disconnect = true;
+							handled = true;
 						}
 						else if (path->rcv_buf_size >= 20)
 						{
@@ -432,6 +505,8 @@ void worker_thread_ctx::on_path_fd(path_t* path, int fd, uint32_t events)
 							path->rcv_buf_size -= to_remove;
 							memmove(path->rcv_buf, path->rcv_buf + to_remove,
 									path->rcv_buf_size);
+
+							handled = true;
 						}
 						break;
 
@@ -440,6 +515,7 @@ void worker_thread_ctx::on_path_fd(path_t* path, int fd, uint32_t events)
 						{
 							fprintf(stderr, "Message from client too long; disconnecting\n");
 							disconnect = true;
+							handled = true;
 						}
 						else if (path->rcv_buf_size >= msg_len)
 						{
@@ -452,6 +528,8 @@ void worker_thread_ctx::on_path_fd(path_t* path, int fd, uint32_t events)
 							path->rcv_buf_size -= msg_len;
 							memmove(path->rcv_buf, path->rcv_buf + msg_len,
 									path->rcv_buf_size);
+
+							handled = true;
 						}
 						break;
 					};
@@ -623,6 +701,15 @@ bool worker_thread_ctx::parse_message_accept(
 
 		send_on_path_static_no_lock(next_p, buf, 20);
 	}
+	else
+	{
+		/* Notify next thread s.t. it connects its paths */
+		if (next_efd)
+		{
+			next_connect_paths->store(true, memory_order_release);
+			next_efd->signal();
+		}
+	}
 
 	path_status_changed = true;
 
@@ -640,7 +727,7 @@ bool worker_thread_ctx::parse_message_req_probe(
 
 	auto token = ser::sread_u64(buf);
 
-	/* Reflect probe to all active paths */
+	/* Reflect probe to all active paths of this thread */
 	char msg_buf[32];
 	auto ptr = msg_buf;
 
@@ -656,6 +743,12 @@ bool worker_thread_ctx::parse_message_req_probe(
 		if (p2 != p && p2->accepted)
 			send_on_path_static_no_lock(p2, msg_buf, 24);
 	}
+
+	/* Instruct other threads to reflect the probe */
+	ds_client->probe_token = token;
+	ds_client->probe_seq = seq;
+	completed_probe_round = ds_client->probe_round.fetch_add(1, memory_order_acq_rel) + 1;
+	ds_client->wt_signal_all_except(thread_id);
 
 	return false;
 }

@@ -107,6 +107,11 @@ struct worker_thread_ctx final
 	Epoll ep;
 	EventFD efd{ep, std::bind(&worker_thread_ctx::on_eventfd, this)};
 
+	std::atomic<bool>* next_connect_paths = nullptr;
+	EventFD* next_efd = nullptr;
+
+	std::atomic<bool> connect_paths = false;
+
 	/* Called from the main thread, as is the destructor */
 	inline worker_thread_ctx(const unsigned thread_id, std::atomic<bool>* wt_quit)
 		: thread_id(thread_id), wt_quit(wt_quit)
@@ -123,6 +128,8 @@ struct worker_thread_ctx final
 	std::atomic<unsigned long>* next_seq = nullptr;
 
 	bool path_status_changed = false;
+
+	uint64_t completed_probe_round{};
 
 
 	std::unique_ptr<io_request_t> remove_io_request(path_t* p, uint64_t seq);
@@ -146,6 +153,8 @@ struct worker_thread_ctx final
 
 class DSClient final
 {
+	friend worker_thread_ctx;
+
 protected:
 	/* Guards everything not guarded by a separate mutex.
 	 * Do not use any of the guarded fields in threads (atomics do not fulfill
@@ -170,9 +179,14 @@ protected:
 
 	std::vector<EventFD*> wt_efds;
 	void wt_signal_all();
+	void wt_signal_all_except(unsigned thread_id);
 
 	std::atomic<uint32_t> client_id{0};
 	std::atomic<unsigned long> next_seq{0};
+
+	uint64_t probe_token{};
+	uint64_t probe_seq{};
+	std::atomic<uint64_t> probe_round{};
 
 	/* Returns nullptr if no path is available */
 	std::pair<path_t*, std::unique_lock<std::mutex>> choose_path(unsigned long seq);
