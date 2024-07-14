@@ -51,6 +51,7 @@ public:
 	bool help = false;
 	unsigned id;
 	string device;
+	bool force = false;
 
 	void parse(int argc, char** argv)
 	{
@@ -75,13 +76,20 @@ public:
 			else if (strcmp(arg, "-i") == 0)
 			{
 				if (have_id)
-					throw invalid_cmd_args("`-i' might be specified only once");
+					throw invalid_cmd_args("`-i' may be specified only once");
 
 				id = arg_unsigned("-i", i);
 				if (id < 1)
 					throw invalid_cmd_args("A dd id must be >= 1");
 
 				have_id = true;
+			}
+			else if (strcmp(arg, "--force") == 0)
+			{
+				if (force)
+					throw invalid_cmd_args("`--force' may be specified only once");
+
+				force = true;
 			}
 			else if (strcmp(arg, "--help") == 0)
 			{
@@ -111,6 +119,8 @@ Usage: sdfs-mkdd [options] -i <id> <path to device>
 Options:
     -i          The new dd's unique numeric id
 
+    --force     Overwrite an existing dd
+
     --help      Show this help text
 )ARGS",
 				(int) SDFS_VERSION_MAJOR, (int) SDFS_VERSION_MINOR,
@@ -138,7 +148,16 @@ void main_exc(const Args& args)
 	simple_pread(wfd.get_fd(), buf, 512, dev_size - 4096);
 
 	if (memcmp(buf, SDFS_DD_MAGIC, sizeof(SDFS_DD_MAGIC)) == 0)
-		throw runtime_error("This device/file is already a dd");
+	{
+		if (args.force)
+		{
+			printf("This device/file is already a dd; overwriting due to --force\n");
+		}
+		else
+		{
+			throw runtime_error("This device/file is already a dd");
+		}
+	}
 
 	/* Write header */
 	printf("Creating sdfs-dd with id %u\n", args.id);
