@@ -1000,10 +1000,7 @@ void ctrl_ctx::on_client_path_fd(client_path_t* path, int fd, uint32_t events)
 
 	/* Disconnect if required */
 	if (events & (EPOLLHUP | EPOLLRDHUP))
-	{
-		fprintf(stderr, "Path disconnected by remote\n");
 		disconnect = true;
-	}
 
 	if (disconnect)
 	{
