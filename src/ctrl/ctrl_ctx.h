@@ -95,7 +95,7 @@ struct io_request_t
 	/* 32 chunks + one extra chunk if IO is not aligned */
 	std::array<dd_request_t, 33> dd_reqs;
 	size_t cnt_dd_reqs;
-	size_t cnt_completed_dd_reqs;
+	std::atomic<size_t> cnt_completed_dd_reqs;
 
 	/* Buffer */
 	fixed_buffer buf;
@@ -220,6 +220,7 @@ struct ctrl_dd final
 
 
 	/* Outstanding requests */
+	std::mutex m_active_reqs;
 	std::map<uint64_t, dd_request_t*> active_reqs;
 
 
@@ -289,7 +290,21 @@ public:
 
 class recv_thread_t final : public worker_thread_base_t
 {
+protected:
+	ctrl_ctx& cctx;
+	std::vector<ctrl_dd*> dds;
+
+	bool running{true};
+
+	void process_inbox();
+
+	void on_dd_fd_read(ctrl_dd* dd, int fd, uint32_t events);
+
 public:
+	recv_thread_t(ctrl_ctx& cctx, std::vector<ctrl_dd*>&& dds);
+	~recv_thread_t();
+
+	void main();
 };
 
 
@@ -334,6 +349,7 @@ public:
 
 class ctrl_ctx final
 {
+	friend recv_thread_t;
 	friend send_thread_t;
 
 protected:
@@ -426,6 +442,9 @@ protected:
 
 
 	/* Worker threads */
+	std::list<recv_thread_t> recv_threads;
+	std::vector<std::thread> recv_thread_tobjs;
+
 	std::list<send_thread_t> send_threads;
 	std::vector<std::thread> send_thread_tobjs;
 
@@ -439,7 +458,8 @@ protected:
 	void initialize_connect_dds();
 	void initialize_data_map();
 	void initialize_client_listener();
-	void initialize_start_threads();
+	void initialize_start_recv_threads();
+	void initialize_start_send_threads();
 
 	void on_signal(int s);
 

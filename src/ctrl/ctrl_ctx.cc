@@ -208,6 +208,186 @@ void send_thread_t::add_client_path(client_path_t* p)
 }
 
 
+recv_thread_t::recv_thread_t(ctrl_ctx& cctx, vector<ctrl_dd*>&& dds)
+	: cctx(cctx), dds(move(dds))
+{
+	/* Add dds to epoll instance */
+	for (auto dd : this->dds)
+	{
+		ep.add_fd(dd->get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP,
+				bind_front(&recv_thread_t::on_dd_fd_read, this, dd));
+	}
+}
+
+recv_thread_t::~recv_thread_t()
+{
+	/* Remove dds from epoll instance */
+	for (auto dd : dds)
+		ep.remove_fd_ignore_unknown(dd->get_fd());
+}
+
+
+void recv_thread_t::process_inbox()
+{
+	while (mb_sema_avail.try_down())
+	{
+		unique_lock lk(m_mb_queue);
+		auto& msg = mb_queue.front();
+		lk.unlock();
+
+		/* Process IPC message */
+		switch (msg.type)
+		{
+		case thread_msg_t::TYPE_QUIT:
+			running = false;
+			break;
+
+		default:
+			break;
+		};
+
+		lk.lock();
+		mb_queue.pop_front();
+		lk.unlock();
+
+		mb_sema_free.up();
+	}
+}
+
+
+void recv_thread_t::on_dd_fd_read(ctrl_dd* dd, int fd, uint32_t events)
+{
+	if (fd != dd->get_fd())
+		throw runtime_error("Got epoll event for invalid dd fd");
+
+	bool disconnect = false;
+
+	/* Read data */
+	if (events & EPOLLIN)
+	{
+		if (dd->rcv_ext_ptr)
+		{
+			auto ret = read(dd->get_fd(), dd->rcv_ext_ptr, dd->rcv_ext_cnt);
+			if (ret > 0)
+			{
+				dd->rcv_ext_ptr += ret;
+				dd->rcv_ext_cnt -= ret;
+
+				if (dd->rcv_ext_cnt == 0)
+				{
+					dd->rcv_ext_ptr = nullptr;
+					cctx.complete_dd_read_request(dd);
+				}
+			}
+			else
+			{
+				disconnect = true;
+			}
+		}
+		else
+		{
+			auto ret = read(
+					dd->get_fd(),
+					dd->rcv_buf + dd->rcv_buf_size,
+					sizeof(dd->rcv_buf) - dd->rcv_buf_size);
+
+			if (ret > 0)
+			{
+				dd->rcv_buf_size += ret;
+				bool handled = true;
+
+				/* Parse message header */
+				while (dd->rcv_buf_size >= 8 && handled)
+				{
+					auto msg_len = ser::read_u32(dd->rcv_buf) + 4UL;
+					auto msg_num = ser::read_u32(dd->rcv_buf + 4);
+
+					handled = false;
+
+					switch (msg_num)
+					{
+					case prot::dd::reply::READ:
+						if (dd->rcv_buf_size >= 12)
+						{
+							auto data_len = min(dd->rcv_buf_size - 8, msg_len - 8);
+							if (cctx.parse_dd_message_read(
+									dd, dd->rcv_buf + 8, msg_len - 8, data_len))
+							{
+								disconnect = true;
+							}
+
+							dd->rcv_buf_size -= data_len + 8;
+							memmove(dd->rcv_buf, dd->rcv_buf + data_len + 8,
+									dd->rcv_buf_size);
+
+							handled = true;
+						}
+						break;
+
+					default:
+						if (msg_len > sizeof(dd->rcv_buf))
+						{
+							fprintf(stderr, "Message from dd too long; disconnecting\n");
+							disconnect = true;
+						}
+						else if (dd->rcv_buf_size >= msg_len)
+						{
+							if (cctx.parse_dd_message_simple(
+									dd, dd->rcv_buf + 8, msg_len - 8, msg_num))
+							{
+								disconnect = true;
+							}
+
+							dd->rcv_buf_size -= msg_len;
+							memmove(dd->rcv_buf, dd->rcv_buf + msg_len,
+									dd->rcv_buf_size);
+
+							handled = true;
+						}
+						break;
+					};
+				}
+			}
+			else if (ret == 0)
+			{
+				fprintf(stderr, "dd %u disconnected.\n", (unsigned) dd->id);
+				disconnect = true;
+			}
+			else if (errno != EAGAIN && errno != EWOULDBLOCK)
+			{
+				fprintf(stderr, "Read error on connection to dd %u: %s; disconecting\n",
+						(unsigned) dd->id, errno_str(errno).c_str());
+				disconnect = true;
+			}
+		}
+	}
+
+	if (events & (EPOLLHUP | EPOLLRDHUP))
+		disconnect = true;
+
+	/* Cannot disconnect dd from recv thread yet, hence simply remove the epoll
+	 * handler for now */
+	if (disconnect)
+		ep.remove_fd_ignore_unknown(fd);
+}
+
+
+void recv_thread_t::main()
+{
+	pthread_setname_np(pthread_self(), "sdfs-ctrl-recv");
+
+	debug("recv thread %p started\n", this);
+
+	while (running)
+	{
+		ep.process_events(-1);
+		process_inbox();
+	}
+
+	debug("recv thread %p stopped\n", this);
+}
+
+
 ctrl_ctx::ctrl_ctx()
 {
 }
@@ -215,6 +395,13 @@ ctrl_ctx::ctrl_ctx()
 ctrl_ctx::~ctrl_ctx()
 {
 	/* Stop threads */
+	for (auto& t : recv_threads)
+		t.msg(thread_msg_t::TYPE_QUIT);
+
+	for (auto& t : recv_thread_tobjs)
+		t.join();
+
+
 	for (auto& t : send_threads)
 		t.msg(thread_msg_t::TYPE_QUIT);
 
@@ -365,7 +552,7 @@ void ctrl_ctx::initialize_connect_dd(const struct in6_addr& addr, ctrl_dd& dd)
 			format_size_bin(reply->size).c_str(), (long unsigned) reply->size,
 			format_size_bin(reply->raw_size).c_str(), (long unsigned) reply->raw_size);
 
-	ep.add_fd(wfd.get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP,
+	ep.add_fd(wfd.get_fd(), EPOLLHUP | EPOLLRDHUP,
 			bind_front(&ctrl_ctx::on_dd_fd, this, &dd));
 
 	dd.wfd = move(wfd);
@@ -517,7 +704,41 @@ void ctrl_ctx::initialize_client_listener()
 			EPOLLIN, bind_front(&ctrl_ctx::on_client_lfd, this));
 }
 
-void ctrl_ctx::initialize_start_threads()
+void ctrl_ctx::initialize_start_recv_threads()
+{
+	constexpr unsigned cnt_recv_threads = 2;
+
+	/* Compute how dds will be distributed */
+	auto dds_per_thread = (dds.size() + cnt_recv_threads - 1) / cnt_recv_threads;
+
+	/* Recv threads */
+	auto i_dd = dds.begin();
+	for (unsigned i = 0; i < cnt_recv_threads; i++)
+	{
+		/* Distribute dds to threads */
+		vector<ctrl_dd*> th_dds;
+		for (unsigned j = 0; j < dds_per_thread && i_dd != dds.end(); j++, i_dd++)
+			th_dds.push_back(&(*i_dd));
+
+		/* Instantiate thread context */
+		recv_threads.emplace_back(*this, move(th_dds));
+		auto& rth = recv_threads.back();
+
+		/* Start threads */
+		try
+		{
+			recv_thread_tobjs.emplace_back(
+					bind(&recv_thread_t::main, &rth));
+		}
+		catch (...)
+		{
+			recv_threads.pop_back();
+			throw;
+		}
+	}
+}
+
+void ctrl_ctx::initialize_start_send_threads()
 {
 	constexpr unsigned cnt_send_threads = 2;
 
@@ -565,7 +786,8 @@ void ctrl_ctx::initialize()
 	initialize_client_listener();
 
 	/* Start threads */
-	initialize_start_threads();
+	initialize_start_send_threads();
+	initialize_start_recv_threads();
 }
 
 
@@ -1142,6 +1364,8 @@ bool ctrl_ctx::parse_client_message_read(
 			auto& req = io_req.dd_reqs[i];
 
 			req.data += (intptr_t) io_req.buf.ptr();
+
+			/* Will be called from a different thread */
 			req.cb_completed = ctrl_ctx::_dd_io_complete_client_read;
 
 			/* In terms of C++, and typesafety, this is an awful hack; but it
@@ -1172,10 +1396,10 @@ void ctrl_ctx::_dd_io_complete_client_read(void* arg)
 
 void ctrl_ctx::dd_io_complete_client_read(list<io_request_t>::iterator io_req)
 {
-	io_req->cnt_completed_dd_reqs++;
+	auto cnt_completed = io_req->cnt_completed_dd_reqs.fetch_add(1, memory_order_acq_rel) + 1;
 
 	/* Check if all requests have been completed */
-	if (io_req->cnt_completed_dd_reqs < io_req->cnt_dd_reqs)
+	if (cnt_completed < io_req->cnt_dd_reqs)
 		return;
 
 	/* Check return status and potentially return error */
@@ -1304,6 +1528,7 @@ void ctrl_ctx::complete_parse_client_write_request(client_path_t* p)
 		req.data += (intptr_t) io_req->buf.ptr();
 		req.dir_write = true;
 
+		/* Will be called from a different thread */
 		req.cb_completed = ctrl_ctx::_dd_io_complete_client_write;
 
 		/* In terms of C++, and typesafety, this is another awful hack; but it
@@ -1326,10 +1551,10 @@ void ctrl_ctx::_dd_io_complete_client_write(void* arg)
 
 void ctrl_ctx::dd_io_complete_client_write(list<io_request_t>::iterator io_req)
 {
-	io_req->cnt_completed_dd_reqs++;
+	auto cnt_completed = io_req->cnt_completed_dd_reqs.fetch_add(1, memory_order_acq_rel) + 1;
 
 	/* Check if all requests have been completed */
-	if (io_req->cnt_completed_dd_reqs < io_req->cnt_dd_reqs)
+	if (cnt_completed < io_req->cnt_dd_reqs)
 		return;
 
 	/* Check return status */
@@ -1539,107 +1764,7 @@ void ctrl_ctx::on_dd_fd(ctrl_dd* dd, int fd, uint32_t events)
 
 		if (dd->send_queue.empty())
 		{
-			ep.change_events(dd->get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP);
-		}
-	}
-
-	/* Read data */
-	if (events & EPOLLIN)
-	{
-		if (dd->rcv_ext_ptr)
-		{
-			auto ret = read(dd->get_fd(), dd->rcv_ext_ptr, dd->rcv_ext_cnt);
-			if (ret > 0)
-			{
-				dd->rcv_ext_ptr += ret;
-				dd->rcv_ext_cnt -= ret;
-
-				if (dd->rcv_ext_cnt == 0)
-				{
-					dd->rcv_ext_ptr = nullptr;
-					complete_dd_read_request(dd);
-				}
-			}
-			else
-			{
-				disconnect = true;
-			}
-		}
-		else
-		{
-			auto ret = read(
-					dd->get_fd(),
-					dd->rcv_buf + dd->rcv_buf_size,
-					sizeof(dd->rcv_buf) - dd->rcv_buf_size);
-
-			if (ret > 0)
-			{
-				dd->rcv_buf_size += ret;
-				bool handled = true;
-
-				/* Parse message header */
-				while (dd->rcv_buf_size >= 8 && handled)
-				{
-					auto msg_len = ser::read_u32(dd->rcv_buf) + 4UL;
-					auto msg_num = ser::read_u32(dd->rcv_buf + 4);
-
-					handled = false;
-
-					switch (msg_num)
-					{
-					case prot::dd::reply::READ:
-						if (dd->rcv_buf_size >= 12)
-						{
-							auto data_len = min(dd->rcv_buf_size - 8, msg_len - 8);
-							if (parse_dd_message_read(
-									dd, dd->rcv_buf + 8, msg_len - 8, data_len))
-							{
-								disconnect = true;
-							}
-
-							dd->rcv_buf_size -= data_len + 8;
-							memmove(dd->rcv_buf, dd->rcv_buf + data_len + 8,
-									dd->rcv_buf_size);
-
-							handled = true;
-						}
-						break;
-
-					default:
-						if (msg_len > sizeof(dd->rcv_buf))
-						{
-							fprintf(stderr, "Message from dd too long; disconnecting\n");
-							disconnect = true;
-						}
-						else if (dd->rcv_buf_size >= msg_len)
-						{
-							if (parse_dd_message_simple(
-									dd, dd->rcv_buf + 8, msg_len - 8, msg_num))
-							{
-								disconnect = true;
-							}
-
-							dd->rcv_buf_size -= msg_len;
-							memmove(dd->rcv_buf, dd->rcv_buf + msg_len,
-									dd->rcv_buf_size);
-
-							handled = true;
-						}
-						break;
-					};
-				}
-			}
-			else if (ret == 0)
-			{
-				fprintf(stderr, "dd %u disconnected.\n", (unsigned) dd->id);
-				disconnect = true;
-			}
-			else if (errno != EAGAIN && errno != EWOULDBLOCK)
-			{
-				fprintf(stderr, "Read error on connection to dd %u: %s; disconecting\n",
-						(unsigned) dd->id, errno_str(errno).c_str());
-				disconnect = true;
-			}
+			ep.change_events(dd->get_fd(), EPOLLHUP | EPOLLRDHUP);
 		}
 	}
 
@@ -1689,6 +1814,8 @@ bool ctrl_ctx::parse_dd_message_read(
 	data_len -= 12;
 
 	/* Find request */
+	unique_lock lkr(dd->m_active_reqs);
+
 	auto i_req = dd->active_reqs.find(request_id);
 	if (i_req == dd->active_reqs.end())
 	{
@@ -1698,6 +1825,8 @@ bool ctrl_ctx::parse_dd_message_read(
 
 	auto req = i_req->second;
 	req->result = result;
+
+	lkr.unlock();
 
 	/* Copy data if any */
 	if (data_len > 0)
@@ -1721,9 +1850,13 @@ bool ctrl_ctx::parse_dd_message_read(
 
 void ctrl_ctx::complete_dd_read_request(ctrl_dd* dd)
 {
+	unique_lock lkr(dd->m_active_reqs);
+
 	auto req = dd->rcv_req->second;
 	dd->active_reqs.erase(dd->rcv_req);
 	dd->rcv_req = decltype(dd->active_reqs)::iterator();
+
+	lkr.unlock();
 
 	auto cb = req->cb_completed;
 	auto arg = req->cb_arg;
@@ -1743,6 +1876,7 @@ bool ctrl_ctx::parse_dd_message_write(
 	auto result = ser::sread_i32(ptr);
 
 	/* Find request */
+	unique_lock lkr(dd->m_active_reqs);
 	auto i_req = dd->active_reqs.find(request_id);
 	if (i_req == dd->active_reqs.end())
 	{
@@ -1753,6 +1887,7 @@ bool ctrl_ctx::parse_dd_message_write(
 	/* Complete request */
 	auto req = i_req->second;
 	dd->active_reqs.erase(i_req);
+	lkr.unlock();
 
 	req->result = result;
 
@@ -1789,7 +1924,7 @@ void ctrl_ctx::send_to_dd(
 	}
 
 	if (was_empty)
-		ep.change_events(dd->get_fd(), EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP);
+		ep.change_events(dd->get_fd(), EPOLLOUT | EPOLLHUP | EPOLLRDHUP);
 }
 
 
@@ -1815,6 +1950,8 @@ void ctrl_ctx::dd_req(dd_request_t* req)
 		msg.length = req->size;
 
 		/* Register request */
+		unique_lock lkr(dd->m_active_reqs);
+
 		/* TODO: handle conflict */
 		auto [i,created] = dd->active_reqs.emplace(msg.request_id, req);
 		if (!created)
@@ -1843,6 +1980,8 @@ void ctrl_ctx::dd_req(dd_request_t* req)
 		msg.length = req->size;
 
 		/* Register request */
+		unique_lock lkr(dd->m_active_reqs);
+
 		/* TODO: handle conflict */
 		auto [i,created] = dd->active_reqs.emplace(msg.request_id, req);
 		if (!created)
