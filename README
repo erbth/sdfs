@@ -4,3 +4,7 @@ A simple distributed filesystem for sequential data.
 
 libsdfs_ds:  block data storage client library
 libsdfs_fs:  filesystem client library; builds on top of libsdfs-ds
+
+Restrictions:
+  * parallel unaligned writes can overwrite each other (race condition on the
+	unaltered bytes)

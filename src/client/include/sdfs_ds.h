@@ -24,7 +24,8 @@ enum error_code : int
 };
 };
 
-typedef void(*cb_async_finished_t)(size_t handle, int status, void* arg);
+typedef size_t async_handle_t;
+typedef void(*cb_async_finished_t)(async_handle_t handle, int status, void* arg);
 
 struct ds_attr_t
 {
@@ -42,10 +43,13 @@ public:
 	DSClient(const std::vector<std::string>& portals);
 	~DSClient();
 
-	size_t getattr(sdfs::ds_attr_t* dst,
+	async_handle_t getattr(sdfs::ds_attr_t* dst,
 			sdfs::cb_async_finished_t cb_finished, void* arg);
 
-	size_t read(void* buf, size_t offset, size_t count,
+	async_handle_t read(void* buf, size_t offset, size_t count,
+			sdfs::cb_async_finished_t cb_finished, void* arg);
+
+	async_handle_t write(const void* buf, size_t offset, size_t count,
 			sdfs::cb_async_finished_t cb_finished, void* arg);
 };
 

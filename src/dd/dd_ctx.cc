@@ -451,6 +451,8 @@ bool dd_ctx::process_client_message(shared_ptr<dd_client> client,
 	}
 
 	/* If this is an unaligned write, read the corresponding region first */
+	/* TODO: This requires a lock s.t. two parallel unaligned writes, which
+	 * touch the same block, do not overwrite each other */
 	auto qe = get_free_io_queue_entry();
 	if (!qe)
 		throw runtime_error("IO queue full");

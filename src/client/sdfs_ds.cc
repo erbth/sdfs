@@ -244,6 +244,7 @@ bool DSClient::schedule_io_request(unique_ptr<io_request_t>&& io_req)
 	{
 		/* Move to request map */
 		auto p_req = io_req.get();
+		/* Maybe TODO: handle conflict */
 		auto [mi, inserted] = p->io_requests.emplace(p_req->seq, move(io_req));
 		if (!inserted)
 			throw runtime_error("seq number conflict");
@@ -255,9 +256,16 @@ bool DSClient::schedule_io_request(unique_ptr<io_request_t>&& io_req)
 		{
 			memcpy(entry.static_buf, p_req->static_buf, p_req->static_buf_size);
 
-			entry.iov_cnt = 1;
-			entry.iov[0].iov_base = entry.static_buf;
-			entry.iov[0].iov_len = p_req->static_buf_size;
+			entry.iov[entry.iov_cnt].iov_base = entry.static_buf;
+			entry.iov[entry.iov_cnt].iov_len = p_req->static_buf_size;
+			entry.iov_cnt++;
+		}
+
+		if (p_req->send_data)
+		{
+			entry.iov[entry.iov_cnt].iov_base = p_req->data_ptr;
+			entry.iov[entry.iov_cnt].iov_len = p_req->data_size;
+			entry.iov_cnt++;
 		}
 
 		bool enable_sender = !p->sender_enabled;
@@ -635,6 +643,9 @@ bool worker_thread_ctx::parse_message_simple(
 	case prot::client::RESP_GETATTR:
 		return parse_message_getattr(p, buf, size, seq);
 
+	case prot::client::RESP_WRITE:
+		return parse_message_write(p, buf, size, seq);
+
 	default:
 		fprintf(stderr, "Unknown message number %u\n", (unsigned) msg_num);
 		return true;
@@ -823,6 +834,26 @@ bool worker_thread_ctx::parse_message_read(
 	return false;
 }
 
+bool worker_thread_ctx::parse_message_write(
+		path_t* p, const char* buf, size_t size, uint64_t seq)
+{
+	if (size != 4)
+	{
+		fprintf(stderr, "Invalid WRITE message size\n");
+		return true;
+	}
+
+	auto io_req = remove_io_request(p, seq);
+	if (!io_req)
+		return true;
+
+	auto res = ser::sread_i32(buf);
+
+	io_req->cb_finished(seq, res, io_req->user_arg);
+
+	return false;
+}
+
 bool worker_thread_ctx::finish_message_read(path_t* p)
 {
 	auto io_req = move(p->rcv_req->second);
@@ -931,6 +962,38 @@ size_t DSClient::read(void* buf, size_t offset, size_t count,
 	ser::swrite_u64(ptr, io_req->data_size);
 
 	io_req->static_buf_size = 32;
+
+	/* Submit request */
+	submit_io_request(move(io_req));
+
+	return seq;
+}
+
+size_t DSClient::write(const void* buf, size_t offset, size_t count,
+		sdfs::cb_async_finished_t cb_finished, void* arg)
+{
+	auto io_req = make_unique<io_request_t>();
+
+	io_req->cb_finished = cb_finished;
+	io_req->user_arg = arg;
+	io_req->data_ptr = (char*) buf;
+	io_req->offset = offset;
+	io_req->data_size = count;
+
+	auto seq = next_seq.fetch_add(1, memory_order_acq_rel);
+	io_req->seq = seq;
+
+	/* Prepare message */
+	auto ptr = io_req->static_buf;
+	prot::serialize_hdr(ptr,
+			16 + 8 + count,
+			prot::client::REQ_WRITE,
+			seq);
+
+	ser::swrite_u64(ptr, io_req->offset);
+
+	io_req->static_buf_size = 24;
+	io_req->send_data = true;
 
 	/* Submit request */
 	submit_io_request(move(io_req));

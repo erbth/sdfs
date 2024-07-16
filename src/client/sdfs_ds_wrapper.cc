@@ -37,6 +37,12 @@ size_t SHLIB_EXPORTED DSClient::read(void* buf, size_t offset, size_t count,
 	return DSCLIENT(client)->read(buf, offset, count, cb_finished, arg);
 }
 
+size_t SHLIB_EXPORTED DSClient::write(const void* buf, size_t offset, size_t count,
+		sdfs::cb_async_finished_t cb_finished, void* arg)
+{
+	return DSCLIENT(client)->write(buf, offset, count, cb_finished, arg);
+}
+
 
 std::string SHLIB_EXPORTED error_to_str(int code)
 {

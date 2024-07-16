@@ -6,6 +6,7 @@
 #include <system_error>
 #include <regex>
 #include <deque>
+#include <condition_variable>
 #include "common/exceptions.h"
 #include "common/file_config.h"
 #include "common/utils.h"
@@ -341,8 +342,103 @@ void op_read(sdfs::DSClient& ds, const args_t& args)
 }
 
 
+struct write_queue_entry final
+{
+	mutex m;
+	condition_variable cv;
+	size_t count{};
+
+	bool finished = false;
+	int result = -1;
+};
+
+void _cb_write_finished(sdfs::async_handle_t handle, int status, void* arg)
+{
+	auto wqe = reinterpret_cast<write_queue_entry*>(arg);
+
+	{
+		unique_lock lk(wqe->m);
+		wqe->result = status;
+		wqe->finished = true;
+	}
+
+	wqe->cv.notify_one();
+}
+
 void op_write(sdfs::DSClient& ds, const args_t& args)
 {
+	bool eof = false;
+	const size_t block_size = 1024 * 1024;
+
+	/* Ring buffer */
+	const size_t buf_size = block_size * 129;
+	fixed_aligned_buffer buf(4096, buf_size);
+	auto buf_ptr = buf.ptr();
+	size_t buf_start = 0;
+	size_t buf_end = 0;
+
+	/* Request queue */
+	deque<write_queue_entry> q;
+
+	size_t offset = args.offset;
+
+	while (!eof)
+	{
+		/* Read a block from stdin */
+		size_t pos = 0;
+		while (block_size - pos > 0)
+		{
+			auto ret = read(STDIN_FILENO, buf_ptr + buf_end + pos, block_size - pos);
+			if (ret < 0)
+				throw system_error(errno, generic_category(), "read(stdin)");
+
+			if (ret == 0)
+			{
+				eof = true;
+				break;
+			}
+
+			pos += ret;
+		}
+
+
+		/* Write block asynchronously */
+		if (pos > 0)
+		{
+			auto& wqe = q.emplace_back();
+			wqe.count = pos;
+
+			ds.write(buf_ptr + buf_end, offset, pos, _cb_write_finished, &wqe);
+
+			buf_end = (buf_end + pos) % buf_size;
+			offset += pos;
+		}
+
+
+		/* Check results; wait until:
+		 *   * ring buffer has at least one free entry
+		 *   * ring buffer is empty in case of eof */
+		for (;;)
+		{
+			auto used = buf_start >= buf_end ?
+				buf_start - buf_end :
+				(buf_size - buf_end) + buf_start;
+
+			if ((used > block_size + 1 && !eof) || used == 0)
+				break;
+
+			auto& wqe = q.front();
+			unique_lock lk(wqe.m);
+			while (!wqe.finished)
+				wqe.cv.wait(lk);
+
+			if (wqe.result != sdfs::err::SUCCESS)
+				throw runtime_error("write failed: "s + sdfs::error_to_str(wqe.result));
+
+			buf_start = (buf_start + wqe.count) % buf_size;
+			q.pop_front();
+		}
+	}
 }
 
 

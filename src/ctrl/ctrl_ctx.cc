@@ -602,15 +602,16 @@ size_t ctrl_ctx::split_io(size_t offset, size_t size,
 		auto chunk_size = min(data_map.block_size, end_ptr - ptr);
 
 		/* Next full block */
-		chunk_size = min(
-				chunk_size,
-				((ptr + 1 + data_map.block_size - 1) / data_map.block_size) *
-					data_map.block_size);
+		auto next_block = ((ptr + data_map.block_size) / data_map.block_size);
+		chunk_size = min(chunk_size, next_block * data_map.block_size - ptr);
 
 		auto block_num = ptr / data_map.block_size;
 
 		/* Add chunk */
-		reqs[i].offset = block_num / data_map.dd_order.size() + ptr % data_map.block_size;
+		reqs[i].offset =
+			(block_num / data_map.dd_order.size()) * data_map.block_size
+			+ ptr % data_map.block_size;
+
 		reqs[i].size = chunk_size;
 		reqs[i].dd = data_map.dd_order[block_num % data_map.dd_order.size()];
 		reqs[i].data = (char*) (intptr_t) ptr - offset;
@@ -684,9 +685,7 @@ void ctrl_ctx::on_client_path_fd(client_path_t* path, int fd, uint32_t events)
 				req->rcv_ptr += ret;
 
 				if (req->rcv_rem_size == 0)
-				{
-					/* TODO */
-				}
+					complete_parse_client_write_request(path);
 			}
 			else if (ret == 0)
 			{
@@ -721,6 +720,24 @@ void ctrl_ctx::on_client_path_fd(client_path_t* path, int fd, uint32_t events)
 
 					switch (msg_num)
 					{
+					case prot::client::REQ_WRITE:
+						if (path->rcv_buf_size >= 24)
+						{
+							auto data_len = min(path->rcv_buf_size - 8, msg_len - 8);
+							if (parse_client_message_write(
+									path, path->rcv_buf + 8, msg_len - 8, data_len))
+							{
+								disconnect = true;
+							}
+
+							path->rcv_buf_size -= data_len + 8;
+							memmove(path->rcv_buf, path->rcv_buf + data_len + 8,
+									path->rcv_buf_size);
+
+							handled = true;
+						}
+						break;
+
 					default:
 						if (msg_len > sizeof(path->rcv_buf))
 						{
@@ -1107,6 +1124,7 @@ bool ctrl_ctx::parse_client_message_read(
 
 			ser::swrite_i32(ptr, err::IO);
 			send_on_client_path_req(iio_req, io_req.static_buf, 20);
+
 			return false;
 		}
 
@@ -1129,7 +1147,7 @@ bool ctrl_ctx::parse_client_message_read(
 			/* In terms of C++, and typesafety, this is an awful hack; but it
 			 * works... */
 			static_assert(sizeof(iio_req) == sizeof(void*));
-			memcpy((char*) &req.cb_arg, (char*) &iio_req, 8);
+			memcpy((char*) &req.cb_arg, (char*) &iio_req, sizeof(void*));
 
 			dd_req(&req);
 		}
@@ -1146,9 +1164,10 @@ bool ctrl_ctx::parse_client_message_read(
 void ctrl_ctx::_dd_io_complete_client_read(void* arg)
 {
 	list<io_request_t>::iterator io_req;
-	memcpy((char*) &io_req, (char*) &arg, 8);
+	memcpy((char*) &io_req, (char*) &arg, sizeof(void*));
 
-	io_req->ctrl_ptr->dd_io_complete_client_read(io_req);
+	auto ctrl_ptr = io_req->ctrl_ptr;
+	ctrl_ptr->dd_io_complete_client_read(io_req);
 }
 
 void ctrl_ctx::dd_io_complete_client_read(list<io_request_t>::iterator io_req)
@@ -1190,6 +1209,151 @@ void ctrl_ctx::dd_io_complete_client_read(list<io_request_t>::iterator io_req)
 	send_on_client_path_req(io_req,
 			io_req->static_buf, 20,
 			io_req->buf.ptr(), io_req->count);
+}
+
+
+bool ctrl_ctx::parse_client_message_write(client_path_t* path,
+		const char* ptr, size_t size, size_t data_len)
+{
+	if (size < 16)
+	{
+		fprintf(stderr, "Invalid WRITE message size\n");
+		return true;
+	}
+
+	/* Allocate IO request */
+	auto iio_req = add_io_request();
+	auto& io_req = *iio_req;
+
+	try
+	{
+		io_req.ctrl_ptr = this;
+		io_req.path = path;
+		io_req.seq = ser::sread_u64(ptr);
+		io_req.offset = ser::sread_u64(ptr);
+
+		size -= 16;
+		data_len -= 16;
+		io_req.count = size;
+
+		/* Check that the request stays inside the data bounday, carries data,
+		 * and is not larger than 32MiB */
+		if (
+				io_req.count == 0 ||
+				io_req.count > 32 * 1024 * 1024 ||
+				io_req.offset + io_req.count > data_map.size)
+		{
+			auto ptr = io_req.static_buf;
+			prot::serialize_hdr(ptr,
+					16 + 4,
+					prot::client::RESP_WRITE,
+					io_req.seq);
+
+			ser::swrite_i32(ptr, err::IO);
+			send_on_client_path_req(iio_req, io_req.static_buf, 20);
+
+			return false;
+		}
+
+		/* Allocate buffer */
+		io_req.buf = fixed_buffer(io_req.count);
+
+		/* Copy data if any */
+		if (data_len > 0)
+			memcpy(io_req.buf.ptr(), ptr, data_len);
+
+		/* Setup reading of remaining data if required, or complete reading
+		 * request */
+		path->req = &io_req;
+		path->i_req = iio_req;
+
+		if (size > data_len)
+		{
+			io_req.rcv_ptr = io_req.buf.ptr() + data_len;
+			io_req.rcv_rem_size = size - data_len;
+		}
+		else
+		{
+			complete_parse_client_write_request(path);
+		}
+	}
+	catch (...)
+	{
+		remove_io_request(iio_req);
+		throw;
+	}
+
+	return false;
+}
+
+void ctrl_ctx::complete_parse_client_write_request(client_path_t* p)
+{
+	auto io_req = p->req;
+	p->req = nullptr;
+
+	/* Split request into chunks */
+	io_req->cnt_dd_reqs = split_io(
+			io_req->offset, io_req->count,
+			io_req->dd_reqs.data(), io_req->dd_reqs.size());
+
+	/* Perform dd IO */
+	for (size_t i = 0; i < io_req->cnt_dd_reqs; i++)
+	{
+		auto& req = io_req->dd_reqs[i];
+
+		req.data += (intptr_t) io_req->buf.ptr();
+		req.dir_write = true;
+
+		req.cb_completed = ctrl_ctx::_dd_io_complete_client_write;
+
+		/* In terms of C++, and typesafety, this is another awful hack; but it
+		 * works... */
+		static_assert(sizeof(p->i_req) == sizeof(void*));
+		memcpy((char*) &req.cb_arg, (char*) &p->i_req, sizeof(void*));
+
+		dd_req(&req);
+	}
+}
+
+void ctrl_ctx::_dd_io_complete_client_write(void* arg)
+{
+	list<io_request_t>::iterator io_req;
+	memcpy((char*) &io_req, (char*) &arg, sizeof(void*));
+
+	auto ctrl_ptr = io_req->ctrl_ptr;
+	ctrl_ptr->dd_io_complete_client_write(io_req);
+}
+
+void ctrl_ctx::dd_io_complete_client_write(list<io_request_t>::iterator io_req)
+{
+	io_req->cnt_completed_dd_reqs++;
+
+	/* Check if all requests have been completed */
+	if (io_req->cnt_completed_dd_reqs < io_req->cnt_dd_reqs)
+		return;
+
+	/* Check return status */
+	int res = err::SUCCESS;
+
+	for (size_t i = 0; i < io_req->cnt_dd_reqs; i++)
+	{
+		auto& r = io_req->dd_reqs[i];
+		if (r.result != err::SUCCESS)
+		{
+			res = r.result;
+			break;
+		}
+	}
+
+	/* Send response to the client */
+	auto ptr = io_req->static_buf;
+	prot::serialize_hdr(ptr,
+			16 + 4,
+			prot::client::RESP_WRITE,
+			io_req->seq);
+
+	ser::swrite_i32(ptr, res);
+	send_on_client_path_req(io_req, io_req->static_buf, 20);
 }
 
 
@@ -1434,7 +1598,7 @@ void ctrl_ctx::on_dd_fd(ctrl_dd* dd, int fd, uint32_t events)
 							}
 
 							dd->rcv_buf_size -= data_len + 8;
-							memmove(dd->rcv_buf, dd->rcv_buf + data_len,
+							memmove(dd->rcv_buf, dd->rcv_buf + data_len + 8,
 									dd->rcv_buf_size);
 
 							handled = true;
@@ -1523,7 +1687,6 @@ bool ctrl_ctx::parse_dd_message_read(
 
 	size -= 12;
 	data_len -= 12;
-	ptr += 12;
 
 	/* Find request */
 	auto i_req = dd->active_reqs.find(request_id);
@@ -1602,7 +1765,8 @@ bool ctrl_ctx::parse_dd_message_write(
 
 
 void ctrl_ctx::send_to_dd(
-		ctrl_dd* dd, const char* static_buf, size_t static_size)
+		ctrl_dd* dd, const char* static_buf, size_t static_size,
+		const char* data, size_t data_size)
 {
 	auto was_empty = dd->send_queue.empty();
 	dd->send_queue.emplace();
@@ -1616,6 +1780,13 @@ void ctrl_ctx::send_to_dd(
 	sqe.iov_cnt = 1;
 	sqe.iov[0].iov_base = sqe.static_buf;
 	sqe.iov[0].iov_len = static_size;
+
+	if (data)
+	{
+		sqe.iov_cnt = 2;
+		sqe.iov[1].iov_base = (void*) data;
+		sqe.iov[1].iov_len = data_size;
+	}
 
 	if (was_empty)
 		ep.change_events(dd->get_fd(), EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP);
@@ -1655,7 +1826,7 @@ void ctrl_ctx::dd_req(dd_request_t* req)
 			char buf[msg.serialize(nullptr)];
 			auto len = msg.serialize(buf);
 
-			send_to_dd(dd, buf, len);
+			send_to_dd(dd, buf, len, req->data, req->size);
 		}
 		catch (...)
 		{

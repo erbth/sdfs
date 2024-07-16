@@ -48,6 +48,11 @@ struct io_request_t
 	void* user_arg = nullptr;
 	size_t data_size = 0;
 	char* data_ptr = nullptr;
+
+	/* TODO: Account send data to io_request; i.e. if io_request is aborted or
+	 * 'finished' by a wrong reply from the server while the data is still sent
+	 * */
+	bool send_data = false;
 };
 
 struct send_queue_element_t
@@ -144,6 +149,7 @@ struct worker_thread_ctx final
 	bool parse_message_req_probe(path_t* p, const char* buf, size_t size, uint64_t seq);
 	bool parse_message_getattr(path_t* p, const char* buf, size_t size, uint64_t seq);
 	bool parse_message_read(path_t* p, const char* buf, size_t buf_size, size_t size);
+	bool parse_message_write(path_t* p, const char* buf, size_t size, uint64_t seq);
 	bool finish_message_read(path_t* p);
 
 
@@ -217,6 +223,10 @@ public:
 
 	/* Read either the entire block or nothing */
 	size_t read(void* buf, size_t offset, size_t count,
+			sdfs::cb_async_finished_t cb_finished, void* arg);
+
+	/* Write either the entire block or nothing */
+	size_t write(const void* buf, size_t offset, size_t count,
 			sdfs::cb_async_finished_t cb_finished, void* arg);
 };
 

@@ -103,17 +103,6 @@ struct io_request_t
 
 
 /* Client interface */
-struct client_request_t
-{
-	/* Receiving the request */
-	char* rcv_ptr = nullptr;
-	size_t rcv_rem_size = 0;
-
-	/* Responding to the request */
-
-	/* Buffers */
-};
-
 struct client_t
 {
 	client_t& operator=(client_t&&) = delete;
@@ -177,7 +166,8 @@ struct client_path_t
 	std::queue<send_queue_element_t> send_queue;
 
 
-	client_request_t* req = nullptr;
+	io_request_t* req = nullptr;
+	std::list<io_request_t>::iterator i_req;
 };
 
 
@@ -379,10 +369,16 @@ protected:
 	bool parse_client_message_resp_probe(client_path_t* p, const char* buf, size_t size, uint64_t seq);
 	bool parse_client_message_getattr(client_path_t* p, const char* buf, size_t size, uint64_t seq);
 	bool parse_client_message_read(client_path_t* p, const char* buf, size_t size, uint64_t seq);
+	bool parse_client_message_write(client_path_t* p, const char* ptr, size_t size, size_t data_len);
+
+	void complete_parse_client_write_request(client_path_t*);
 
 	/* Callbacks for client message processing */
 	static void _dd_io_complete_client_read(void*);
 	void dd_io_complete_client_read(std::list<io_request_t>::iterator);
+
+	static void _dd_io_complete_client_write(void* arg);
+	void dd_io_complete_client_write(std::list<io_request_t>::iterator io_req);
 
 	/* Slow */
 	void send_on_client_path_static(
@@ -459,7 +455,8 @@ protected:
 
 	void complete_dd_read_request(ctrl_dd* dd);
 
-	void send_to_dd(ctrl_dd* dd, const char* static_buf, size_t static_size);
+	void send_to_dd(ctrl_dd* dd, const char* static_buf, size_t static_size,
+			const char* data = nullptr, size_t data_size = 0);
 
 
 public:
