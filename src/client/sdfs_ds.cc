@@ -383,7 +383,10 @@ void worker_thread_ctx::on_eventfd()
 		ser::swrite_u64(ptr, ds_client->probe_token);
 
 		for (auto p : paths)
-			send_on_path_static(p, msg_buf, 24);
+		{
+			if (p->accepted)
+				send_on_path_static(p, msg_buf, 24);
+		}
 	}
 }
 
