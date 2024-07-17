@@ -240,104 +240,95 @@ void op_info(sdfs::DSClient& ds, const args_t& args)
 }
 
 
-struct read_queue_entry
+struct read_queue_entry final
 {
-	mutex& main_m;
-	condition_variable& main_cv;
-	bool& main_received;
+	mutex m;
+	condition_variable cv;
+	size_t count{};
 
-	size_t size;
-	fixed_buffer buf;
-	int status = -1;
-	atomic<bool> finished = false;
-
-	inline read_queue_entry(
-			mutex& main_m, condition_variable& main_cv, bool& main_received,
-			size_t size)
-		:
-			main_m(main_m), main_cv(main_cv), main_received(main_received),
-			size(size), buf(size)
-	{
-	}
+	bool finished = false;
+	int result = -1;
 };
 
-void cb_read_finished(size_t handle, int status, void* arg)
+void _cb_read_finished(sdfs::async_handle_t handle, int status, void* arg)
 {
-	auto qe = reinterpret_cast<read_queue_entry*>(arg);
+	auto rqe = reinterpret_cast<read_queue_entry*>(arg);
 
-	qe->status = status;
-	qe->finished.store(true, memory_order_release);
-
-	/* Signal read loop */
 	{
-		unique_lock lk(qe->main_m);
-		qe->main_received = true;
+		unique_lock lk(rqe->m);
+		rqe->result = status;
+		rqe->finished = true;
 	}
-	qe->main_cv.notify_one();
+
+	rqe->cv.notify_one();
 }
 
 void op_read(sdfs::DSClient& ds, const args_t& args)
 {
-	const size_t block_size = 1024 * 1024;
+	const size_t block_size = 1 * 1024 * 1024;
 
-	/* Create a queue of requests */
+	/* Ring buffer */
+	const size_t buf_size = block_size * 129;
+	fixed_aligned_buffer buf(4096, buf_size);
+	auto buf_ptr = buf.ptr();
+	size_t buf_start = 0;
+	size_t buf_end = 0;
+
+	/* Request queue */
 	deque<read_queue_entry> q;
 
-	mutex m;
-	condition_variable cv;
-	bool received = false;
+	size_t cnt_scheduled = 0;
+	size_t cnt_output = 0;
 
-	/* Issue requests and wait for responses */
-	auto req_pos = args.offset;
-	auto req_size = args.size;
-
-	while (req_size > 0 || q.size())
+	while (cnt_output < args.size)
 	{
-		/* Issue requests */
-		while (req_size && q.size() < 128)
+		/* Schedule asynchronous reads as long as
+		 *   * there is room in the buffer
+		 *   * the size has not been reached */
+		for (;;)
 		{
-			auto to_read = min(block_size, req_size);
-			auto& e = q.emplace_back(m, cv, received, to_read);
+			auto used = buf_start >= buf_end ?
+				buf_start - buf_end :
+				(buf_size - buf_end) + buf_start;
 
-			ds.read(e.buf.ptr(), req_pos, to_read, cb_read_finished, &e);
-			req_pos += to_read;
-			req_size -= to_read;
+			if (used >= buf_size - block_size || cnt_scheduled == args.size)
+				break;
+
+			auto to_read = min(block_size, args.size - cnt_scheduled);
+
+			auto& rqe = q.emplace_back();
+			rqe.count = to_read;
+
+			ds.read(buf_ptr + buf_start, args.offset + cnt_scheduled,
+					to_read, _cb_read_finished, &rqe);
+
+			buf_start = (buf_start + to_read) % buf_size;
+			cnt_scheduled += to_read;
 		}
 
-		/* Process response */
-		if (q.front().finished.load(memory_order_acquire))
+		/* Check results and write to stdout */
+		auto& rqe = q.front();
+		unique_lock lk(rqe.m);
+		while (!rqe.finished)
+			rqe.cv.wait(lk);
+
+		if (rqe.result != sdfs::err::SUCCESS)
+			throw runtime_error("read failed: "s + sdfs::error_to_str(rqe.result));
+
+		size_t pos = 0;
+		while (pos < rqe.count)
 		{
-			auto& e = q.front();
+			auto ret = write(STDOUT_FILENO, buf_ptr + buf_end + pos, rqe.count - pos);
+			if (ret < 0)
+				throw system_error(errno, generic_category(), "write(stdout)");
 
-			if (e.status != sdfs::err::SUCCESS)
-			{
-				throw runtime_error("Failed to read from storage: "s +
-						sdfs::error_to_str(e.status));
-			}
-
-			auto pos = 0;
-			auto to_write = e.size;
-			while (to_write > 0)
-			{
-				auto res = write(STDOUT_FILENO, e.buf.ptr() + pos, to_write);
-				if (res <= 0)
-					throw system_error(errno, generic_category(), "write(stdout)");
-
-				to_write -= res;
-			}
-
-			q.pop_front();
+			pos += ret;
 		}
-		else
-		{
-			/* Wait for responses */
-			unique_lock lk(m);
-			if (!received)
-				cv.wait(lk);
 
-			if (received)
-				received = false;
-		}
+		cnt_output += rqe.count;
+
+		buf_end = (buf_end + rqe.count) % buf_size;
+		q.pop_front();
 	}
 }
 

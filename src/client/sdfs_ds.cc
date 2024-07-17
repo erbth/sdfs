@@ -409,7 +409,10 @@ void worker_thread_ctx::on_path_fd(path_t* path, int fd, uint32_t events)
 		{
 			auto& elem = path->send_queue.front();
 
+			lk.unlock();
 			auto ret = writev(fd, elem.iov, elem.iov_cnt);
+			lk.lock();
+
 			if (ret > 0)
 			{
 				while (ret > 0 && elem.iov_cnt > 0)
@@ -451,7 +454,10 @@ void worker_thread_ctx::on_path_fd(path_t* path, int fd, uint32_t events)
 	{
 		if (path->rcv_req_ptr)
 		{
+			lk.unlock();
 			auto ret = read(fd, path->rcv_req_ptr, path->rcv_req_size);
+			lk.lock();
+
 			if (ret > 0)
 			{
 				path->rcv_req_size -= ret;
