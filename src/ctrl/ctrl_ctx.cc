@@ -707,7 +707,7 @@ void ctrl_ctx::initialize_client_listener()
 
 void ctrl_ctx::initialize_start_recv_threads()
 {
-	constexpr unsigned cnt_recv_threads = 2;
+	constexpr unsigned cnt_recv_threads = 4;
 
 	/* Compute how dds will be distributed */
 	auto dds_per_thread = (dds.size() + cnt_recv_threads - 1) / cnt_recv_threads;
@@ -741,7 +741,7 @@ void ctrl_ctx::initialize_start_recv_threads()
 
 void ctrl_ctx::initialize_start_send_threads()
 {
-	constexpr unsigned cnt_send_threads = 2;
+	constexpr unsigned cnt_send_threads = 4;
 
 	/* Compute how dds will be distributed */
 	auto dds_per_send_thread = (dds.size() + cnt_send_threads - 1) / cnt_send_threads;
