@@ -417,6 +417,7 @@ void worker_thread_ctx::on_path_fd(path_t* path, int fd, uint32_t events)
 					auto cnt = min((size_t) ret, elem.iov[0].iov_len);
 					ret -= cnt;
 					elem.iov[0].iov_len -= cnt;
+					elem.iov[0].iov_base = (char*) elem.iov[0].iov_base + cnt;
 
 					if (elem.iov[0].iov_len == 0)
 					{

@@ -147,6 +147,7 @@ void send_thread_t::on_client_fd(client_path_t* path, int fd, uint32_t events)
 				auto cnt = min((size_t) ret, elem.iov[0].iov_len);
 				ret -= cnt;
 				elem.iov[0].iov_len -= cnt;
+				elem.iov[0].iov_base = (char*) elem.iov[0].iov_base + cnt;
 
 				if (elem.iov[0].iov_len == 0)
 				{
@@ -1737,6 +1738,7 @@ void ctrl_ctx::on_dd_fd(ctrl_dd* dd, int fd, uint32_t events)
 					auto cnt = min((size_t) ret, sqe.iov[0].iov_len);
 					ret -= cnt;
 					sqe.iov[0].iov_len -= cnt;
+					sqe.iov[0].iov_base = (char*) sqe.iov[0].iov_base + cnt;
 
 					if (sqe.iov[0].iov_len == 0)
 					{
