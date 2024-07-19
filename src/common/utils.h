@@ -8,6 +8,7 @@
 #include <string>
 #include <stdexcept>
 #include <system_error>
+#include <atomic>
 #include "common/dynamic_buffer.h"
 
 extern "C" {
@@ -238,6 +239,93 @@ inline T align_up(T alignment, T value)
 {
 	return (value + alignment - 1) & ~(alignment - 1);
 }
+
+
+/* For simple reference counting lifetime management */
+/* Ensure minimum data size */
+static_assert(sizeof(unsigned long) == 8);
+
+class reference_count_t final
+{
+protected:
+	std::atomic<unsigned long> _count;
+
+public:
+	reference_count_t(unsigned long initial)
+	{
+		_count.store(initial, std::memory_order_release);
+	}
+
+	reference_count_t& operator=(reference_count_t&& o) = delete;
+
+	inline unsigned long inc()
+	{
+		return _count.fetch_add(1, std::memory_order_acq_rel) + 1;
+	}
+
+	inline unsigned long dec()
+	{
+		return _count.fetch_sub(1, std::memory_order_acq_rel) - 1;
+	}
+
+	inline operator bool()
+	{
+		return _count.load(std::memory_order_acquire) > 0;
+	}
+
+	inline unsigned long value()
+	{
+		return _count.load(std::memory_order_acquire);
+	}
+
+
+	/* "Smart" reference management
+	 * The reference-type itself is NOT mt safe - additional precautions have to
+	 * be taken if required. However this should only rarely be needed in
+	 * practice. */
+	class reference final
+	{
+	protected:
+		reference_count_t* _refc;
+
+	public:
+		inline reference()
+			: _refc(nullptr)
+		{ }
+
+		inline reference(reference_count_t& refc)
+			: _refc(&refc)
+		{
+			_refc->inc();
+		}
+
+		inline reference(reference_count_t* refc)
+			: _refc(refc)
+		{
+			_refc->inc();
+		}
+
+		inline ~reference()
+		{
+			if (_refc)
+				_refc->dec();
+		}
+
+
+		inline reference(reference&& o)
+			: _refc(o._refc)
+		{
+			o._refc = nullptr;
+		}
+
+		inline reference* operator=(reference&& o)
+		{
+			_refc = o._refc;
+			o._refc = nullptr;
+			return this;
+		}
+	};
+};
 
 
 #endif /* __COMMON_UTILS_H */

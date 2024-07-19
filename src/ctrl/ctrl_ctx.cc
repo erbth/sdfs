@@ -78,11 +78,22 @@ void send_thread_t::process_inbox()
 			break;
 
 		case thread_msg_t::TYPE_SEND:
-			msg.client_path->send_queue.emplace(move(msg.sqe));
-			if (!msg.client_path->sender_enabled)
+			if (msg.client_path->send_thread_removed)
 			{
-				msg.client_path->sender_enabled = true;
-				ep.change_events(msg.client_path->wfd.get_fd(), EPOLLOUT);
+				if (msg.sqe.iio_req)
+					cctx.remove_io_request(*msg.sqe.iio_req);
+
+				cctx.efd.signal();
+			}
+			else
+			{
+				msg.client_path->send_queue.emplace(move(msg.sqe));
+				if (!msg.client_path->sender_enabled)
+				{
+					msg.client_path->sender_enabled = true;
+					ep.change_events(msg.client_path->wfd.get_fd(),
+							EPOLLOUT | EPOLLHUP | EPOLLRDHUP);
+				}
 			}
 			break;
 
@@ -107,7 +118,7 @@ void send_thread_t::_add_client_path(client_path_t* p)
 {
 	client_paths.push_back(p);
 
-	ep.add_fd(p->wfd.get_fd(), 0,
+	ep.add_fd(p->wfd.get_fd(), EPOLLHUP | EPOLLRDHUP,
 			bind_front(&send_thread_t::on_client_fd, this, p));
 }
 
@@ -125,59 +136,73 @@ void send_thread_t::_remove_client_path(client_path_t* p)
 
 	ep.remove_fd(p->wfd.get_fd());
 	client_paths.erase(i);
+	p->send_thread_removed = true;
+
+	/* Clear send queue to release references of io requests to the path */
+	while (p->send_queue.size())
+	{
+		auto& sqe = p->send_queue.front();
+		if (sqe.iio_req)
+		{
+			cctx.remove_io_request(*sqe.iio_req);
+			cctx.efd.signal();
+		}
+
+		p->send_queue.pop();
+	}
 }
 
 
 void send_thread_t::on_client_fd(client_path_t* path, int fd, uint32_t events)
 {
-	if (!(events & EPOLLOUT))
-		return;
+	bool error = events & (EPOLLHUP | EPOLLRDHUP);
 
-	bool error = false;
-
-	if (path->send_queue.size() > 0)
+	if (!error && (events & EPOLLOUT))
 	{
-		auto& elem = path->send_queue.front();
-
-		auto ret = writev(fd, elem.iov, elem.iov_cnt);
-		if (ret > 0)
+		if (path->send_queue.size() > 0)
 		{
-			while (ret > 0 && elem.iov_cnt > 0)
-			{
-				auto cnt = min((size_t) ret, elem.iov[0].iov_len);
-				ret -= cnt;
-				elem.iov[0].iov_len -= cnt;
-				elem.iov[0].iov_base = (char*) elem.iov[0].iov_base + cnt;
+			auto& elem = path->send_queue.front();
 
-				if (elem.iov[0].iov_len == 0)
+			auto ret = writev(fd, elem.iov, elem.iov_cnt);
+			if (ret > 0)
+			{
+				while (ret > 0 && elem.iov_cnt > 0)
 				{
-					elem.iov_cnt--;
-					for (int i = 0; i < elem.iov_cnt; i++)
-						elem.iov[i] = elem.iov[i+1];
+					auto cnt = min((size_t) ret, elem.iov[0].iov_len);
+					ret -= cnt;
+					elem.iov[0].iov_len -= cnt;
+					elem.iov[0].iov_base = (char*) elem.iov[0].iov_base + cnt;
+
+					if (elem.iov[0].iov_len == 0)
+					{
+						elem.iov_cnt--;
+						for (int i = 0; i < elem.iov_cnt; i++)
+							elem.iov[i] = elem.iov[i+1];
+					}
+				}
+
+				if (elem.iov_cnt == 0)
+				{
+					if (elem.cb_finished)
+						elem.cb_finished();
+
+					if (elem.iio_req)
+						cctx.remove_io_request(*elem.iio_req);
+
+					path->send_queue.pop();
 				}
 			}
-
-			if (elem.iov_cnt == 0)
+			else if (errno != EAGAIN && errno != EWOULDBLOCK)
 			{
-				if (elem.cb_finished)
-					elem.cb_finished();
-
-				if (elem.iio_req)
-					cctx.remove_io_request(*elem.iio_req);
-
-				path->send_queue.pop();
+				error = true;
 			}
 		}
-		else if (errno != EAGAIN && errno != EWOULDBLOCK)
-		{
-			error = true;
-		}
-	}
 
-	if (path->send_queue.empty())
-	{
-		path->sender_enabled = false;
-		ep.change_events(fd, 0);
+		if (path->send_queue.empty())
+		{
+			path->sender_enabled = false;
+			ep.change_events(fd, EPOLLHUP | EPOLLRDHUP);
+		}
 	}
 
 	if (error)
@@ -853,6 +878,11 @@ void ctrl_ctx::on_signal(int s)
 }
 
 
+void ctrl_ctx::on_efd()
+{
+}
+
+
 void ctrl_ctx::on_client_lfd(int fd, uint32_t events)
 {
 	struct sockaddr_in6 addr{};
@@ -869,6 +899,10 @@ void ctrl_ctx::on_client_lfd(int fd, uint32_t events)
 	auto& p = new_client_paths.emplace_back();
 	p.wfd = move(wfd);
 	p.remote_addr = addr;
+
+	/* Reference count will >= 1 as long as new io_requests referencing the path
+	 * can be created */
+	p.ref_count.inc();
 
 	ep.add_fd(p.wfd.get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP,
 			bind_front(&ctrl_ctx::on_client_path_fd, this, &p));
@@ -1006,6 +1040,10 @@ void ctrl_ctx::on_client_path_fd(client_path_t* path, int fd, uint32_t events)
 	if (disconnect)
 	{
 		ep.remove_fd(fd);
+
+		/* No new io reqeusts can be created on this path now - hence decrement
+		 * the reference count */
+		path->ref_count.dec();
 
 		/* Put path on removal list */
 		auto i = client_paths.begin();
@@ -1325,6 +1363,7 @@ bool ctrl_ctx::parse_client_message_read(
 	{
 		io_req.ctrl_ptr = this;
 		io_req.path = p;
+		io_req.path_ref = p->ref_count;
 		io_req.seq = seq;
 		io_req.offset = ser::sread_u64(ptr);
 		io_req.count = ser::sread_u64(ptr);
@@ -1451,6 +1490,7 @@ bool ctrl_ctx::parse_client_message_write(client_path_t* path,
 	{
 		io_req.ctrl_ptr = this;
 		io_req.path = path;
+		io_req.path_ref = path->ref_count;
 		io_req.seq = ser::sread_u64(ptr);
 		io_req.offset = ser::sread_u64(ptr);
 
@@ -1666,9 +1706,17 @@ void ctrl_ctx::free_probe_token(uint64_t token)
 
 void ctrl_ctx::cleanup_clients()
 {
-	while (client_paths_to_remove.size())
+	for (auto ip = client_paths_to_remove.begin(); ip != client_paths_to_remove.end();)
 	{
-		auto& p = client_paths_to_remove.front();
+		auto& p = *ip;
+
+		/* Don't remove a path as long as it is referenced */
+		if (p.ref_count)
+		{
+			ip++;
+			continue;
+		}
+
 		printf("Removing disconnected path from %s\n", in_addr_str(p.remote_addr).c_str());
 
 		/* Remove the path from the sender thread */
@@ -1711,7 +1759,8 @@ void ctrl_ctx::cleanup_clients()
 			p.client = nullptr;
 		}
 
-		client_paths_to_remove.pop_front();
+		auto i_prev = ip++;
+		client_paths_to_remove.erase(i_prev);
 	}
 }
 

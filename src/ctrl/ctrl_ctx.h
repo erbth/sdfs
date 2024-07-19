@@ -78,6 +78,7 @@ struct io_request_t
 
 	ctrl_ctx* ctrl_ptr{};      // For use by IO callbacks
 	client_path_t* path{};
+	reference_count_t::reference path_ref;
 	unsigned long seq{};
 
 	/* A buffer for the message header etc. */
@@ -150,9 +151,17 @@ struct client_path_t
 	struct sockaddr_in6 remote_addr{};
 	client_t* client = nullptr;
 
+	/* References by io_requests (and potentially other objects in the future)
+	 * */
+	reference_count_t ref_count{0};
+
 	/* MUST NOT be changed after initialization */
 	WrappedFD wfd;
 	send_thread_t* send_thread = nullptr;
+
+	/* Set by the send thread if it removed the path and new requests sent to
+	 * the send thread should be cancelled (in the send thread) */
+	bool send_thread_removed = false;
 
 	uint64_t requires_probe = 0;
 	uint64_t wait_for_probe = 0;
@@ -364,6 +373,9 @@ protected:
 		ep,
 		std::bind_front(&ctrl_ctx::on_signal, this)};
 
+	/* To wake the main loop for e.g. path cleanup */
+	EventFD efd{ep, std::bind(&ctrl_ctx::on_efd, this)};
+
 
 	/* dds */
 	std::list<ctrl_dd> dds;
@@ -396,7 +408,9 @@ protected:
 	static void _dd_io_complete_client_write(void* arg);
 	void dd_io_complete_client_write(std::list<io_request_t>::iterator io_req);
 
-	/* Slow */
+	/* Slow; must only be called from the main thread s.t. sqe cannot be
+	 * generated after a path is removed from its send thread during path
+	 * removal */
 	void send_on_client_path_static(
 			client_path_t* p, const char* static_buf, size_t static_size);
 
@@ -462,6 +476,7 @@ protected:
 	void initialize_start_send_threads();
 
 	void on_signal(int s);
+	void on_efd();
 
 	void on_client_lfd(int fd, uint32_t events);
 	void on_client_path_fd(client_path_t* path, int fd, uint32_t events);
