@@ -1,0 +1,6 @@
+[Unit]
+Description=sdfs dd-mgr
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/sdfs-dd-mgr

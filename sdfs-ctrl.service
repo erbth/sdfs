@@ -1,0 +1,11 @@
+[Unit]
+Description=sdfs ctrl
+Wants=network.target
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/sdfs-ctrl
+
+[Install]
+WantedBy=multi-user.target

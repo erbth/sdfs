@@ -5,6 +5,7 @@
 #include "config.h"
 #include "common/utils.h"
 #include "common/strformat.h"
+#include "common/daemon_utils.h"
 #include "utils.h"
 #include "dd_ctx.h"
 
@@ -18,6 +19,7 @@ void main_exc(const string& dev)
 	ctx.initialize();
 
 	fprintf(stderr, "ready.\n");
+	sdfs_systemd_notify_ready();
 
 	ctx.main();
 }

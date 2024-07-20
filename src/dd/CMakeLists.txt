@@ -3,6 +3,7 @@ add_executable(sdfs-dd
 	dd_ctx.cc
 	utils.cc
 	../common/utils.cc
+	../common/daemon_utils.cc
 	../common/exceptions.cc
 	../common/io_uring.cc
 	../common/epoll.cc
@@ -29,4 +30,4 @@ add_executable(sdfs-ddinfo
 	../common/strformat.cc
 )
 
-install(TARGETS sdfs-dd sdfs-mkdd sdfs-ddinfo DESTINATION bin)
+install(TARGETS sdfs-dd sdfs-mkdd sdfs-ddinfo DESTINATION sbin)

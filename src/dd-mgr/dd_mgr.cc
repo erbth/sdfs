@@ -1,7 +1,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
-#include <config.h>
+#include "config.h"
+#include "common/daemon_utils.h"
 #include "dd_mgr_ctx.h"
 
 using namespace std;
@@ -13,6 +14,7 @@ void main_exc()
 	ctx.initialize();
 
 	fprintf(stderr, "ready.\n");
+	sdfs_systemd_notify_ready();
 
 	ctx.main();
 }

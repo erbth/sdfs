@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include "config.h"
 #include "common/exceptions.h"
+#include "common/daemon_utils.h"
 #include "ctrl_ctx.h"
 
 using namespace std;
@@ -16,6 +17,7 @@ void main_exc(int argc, char** argv)
 	ctx.initialize();
 
 	fprintf(stderr, "ready.\n");
+	sdfs_systemd_notify_ready();
 
 	ctx.main();
 }

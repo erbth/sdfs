@@ -17,3 +17,6 @@ include_directories(PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 include_directories(PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/kernel_hdr")
 
 add_subdirectory(src)
+
+install(FILES sdfs-dd@.service sdfs-dd.target sdfs-dd-mgr.service sdfs-ctrl.service DESTINATION "/lib/systemd/system")
+install(FILES sdfs.conf.sample DESTINATION /etc/sdfs)

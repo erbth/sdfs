@@ -1,0 +1,14 @@
+[Unit]
+Description=sdfs dd %i
+Requires=sdfs-dd-mgr.service
+Wants=network.target
+PartOf=sdfs-dd.target
+After=network.target sdfs-dd-mgr.service
+Before=sdfs-dd.target
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/sdfs-dd /dev/disk/by-id/%i
+
+[Install]
+WantedBy=sdfs-dd.target
