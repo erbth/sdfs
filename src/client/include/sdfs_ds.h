@@ -1,5 +1,5 @@
-#ifndef __CLIENT_SDFS_DS_H
-#define __CLIENT_SDFS_DS_H
+#ifndef _SDFS_DS_H
+#define _SDFS_DS_H
 
 #include <vector>
 #include <string>
@@ -57,4 +57,4 @@ std::string error_to_str(int code);
 
 };
 
-#endif /* __CLIENT_SDFS_DS_H */
+#endif /* _SDFS_DS_H */

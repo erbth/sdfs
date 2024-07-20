@@ -41,7 +41,7 @@ string format_hexstr(const char* buf, size_t size)
 	for (size_t i = 0; i < size; i++)
 	{
 		char tmp[3];
-		snprintf(tmp, sizeof(buf), "%02x", (unsigned) ((unsigned char*) buf)[i]);
+		snprintf(tmp, sizeof(tmp), "%02x", (unsigned) ((unsigned char*) buf)[i]);
 		s += string(tmp, 2);
 	}
 

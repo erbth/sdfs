@@ -1,0 +1,7 @@
+/usr/sbin/sdfs-dd
+/usr/sbin/sdfs-ddinfo
+/usr/sbin/sdfs-mkdd
+/usr/sbin/sdfs-dd-mgr
+/lib/systemd/system/sdfs-dd-mgr.service
+/lib/systemd/system/sdfs-dd@.service
+/lib/systemd/system/sdfs-dd.target

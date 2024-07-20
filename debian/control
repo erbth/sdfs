@@ -1,0 +1,46 @@
+Source: sdfs
+Section: misc
+Priority: optional
+Maintainer: Thomas Erbesdobler <t.erbesdobler@gmx.de>
+Build-Depends:
+ debhelper (>=11),
+ cmake (>=3.13),
+ libfuse3-dev
+Standards-Version: 4.1.3
+# Vcs-Git: https://github.com/erbth/sdfs.git
+
+Package: sdfs-common
+Architecture: any
+Depends: ${misc:Depends}
+Description: sdfs common files
+ Common files used by several sdfs packages
+
+Package: sdfs-dd
+Architecture: any
+Depends: sdfs-common (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}
+Description: sdfs dd
+ Data daemons and accompanying tools for sdfs
+
+Package: sdfs-ctrl
+Architecture: any
+Depends: sdfs-common (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}
+Description: sdfs ctrl
+ Controller for sdfs
+
+Package: sdfs-tools
+Architecture: any
+Depends: libsdfs-ds-1-0 (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}
+Description: tools for sdfs
+ Client-side tools for sdfs like sdfs-ds
+
+Package: libsdfs-ds-1-0
+Architecture: any
+Depends: sdfs-common (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}
+Description: data service client library for sdfs
+ Client library to access sdfs on the block layer
+
+Package: libsdfs-dev
+Architecture: any
+Depends: libsdfs-ds-1-0 (= ${binary:Version}), ${misc:Depends}
+Description:
+ Development files for sdfs's client libraries
