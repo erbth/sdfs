@@ -333,7 +333,7 @@ void recv_thread_t::on_dd_fd_read(ctrl_dd* dd, int fd, uint32_t events)
 					switch (msg_num)
 					{
 					case prot::dd::reply::READ:
-						if (dd->rcv_buf_size >= 12)
+						if (dd->rcv_buf_size >= 20)
 						{
 							auto data_len = min(dd->rcv_buf_size - 8, msg_len - 8);
 							if (cctx.parse_dd_message_read(
