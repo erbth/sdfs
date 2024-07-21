@@ -198,7 +198,7 @@ void print_help()
 {
 	fprintf(stderr, R"help(SDFS block data storage tool of SDFS version %d.%d.%d
 
-    Usage: sdfs_ds_tool [options] <operation> [arguments] [more options]
+    Usage: sdfs-ds [options] <operation> [arguments] [more options]
 
 The following operations are available:
     info                     Print information about the block device

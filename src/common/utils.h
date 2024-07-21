@@ -229,7 +229,64 @@ public:
 		while (!flagged)
 			cv.wait(lk);
 	}
+
+	/* Reset after waiting */
+	inline void wait_reset()
+	{
+		std::unique_lock lk(m);
+		while (!flagged)
+			cv.wait(lk);
+
+		flagged = false;
+	}
 };
+
+/* A predefined callback function for use with sync_point */
+void cb_sync_point(void* arg);
+
+
+/* A special synchronization point to make asynchronous sdfs IOs synchronous */
+class io_promise final
+{
+protected:
+	std::mutex m;
+	std::condition_variable cv;
+
+	bool _finished = false;
+	size_t _handle{};
+	int _result{};
+
+public:
+	inline void finish(size_t handle, int res)
+	{
+		{
+			std::unique_lock lk(m);
+			_finished = true;
+			_handle = handle;
+			_result = res;
+		}
+		cv.notify_one();
+	}
+
+	inline int wait()
+	{
+		std::unique_lock lk(m);
+		while (!_finished)
+			cv.wait(lk);
+
+		_finished = false;
+
+		return _result;
+	}
+
+	inline size_t handle()
+	{
+		std::unique_lock lk(m);
+		return _handle;
+	}
+};
+
+void cb_io_promise(size_t handle, int res, void* arg);
 
 
 /* A cealing function for alignment - round up to the next multiple of @param

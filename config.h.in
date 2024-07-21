@@ -7,6 +7,7 @@
 
 /* The trailing semicolon after the version makes the value easier to compare */
 #define SDFS_DD_MAGIC "sdfs-dd v1;"
+#define SDFS_FS_SB_MAGIC "sdfs-fs v1;"
 
 #define SDFS_CTRL_PORT			10300
 #define SDFS_DD_MGR_PORT		10309

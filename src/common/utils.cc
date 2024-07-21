@@ -248,3 +248,13 @@ string gai_error_str(int code)
 {
 	return string(gai_strerror(code));
 }
+
+void cb_sync_point(void* arg)
+{
+	reinterpret_cast<sync_point*>(arg)->flag();
+}
+
+void cb_io_promise(size_t handle, int res, void* arg)
+{
+	reinterpret_cast<io_promise*>(arg)->finish(handle, res);
+}

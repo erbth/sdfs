@@ -48,4 +48,14 @@ public:
 	const char* what() const noexcept override;
 };
 
+class invalid_superblock : public std::exception
+{
+protected:
+	const std::string msg;
+
+public:
+	invalid_superblock(const std::string& msg);
+	const char* what() const noexcept override;
+};
+
 #endif /* __COMMON_EXCEPTIONS_H */

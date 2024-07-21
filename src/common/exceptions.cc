@@ -57,3 +57,14 @@ const char* io_eof_exception::what() const noexcept
 {
 	return "encountered EOF";
 }
+
+
+invalid_superblock::invalid_superblock(const string& msg)
+	: msg("invalid superblock: " + msg)
+{
+}
+
+const char* invalid_superblock::what() const noexcept
+{
+	return msg.c_str();
+}
