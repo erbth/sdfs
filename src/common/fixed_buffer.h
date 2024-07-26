@@ -50,6 +50,11 @@ public:
 		return *this;
 	};
 
+	operator bool() const
+	{
+		return buf != nullptr;
+	}
+
 	char* ptr()
 	{
 		return buf;

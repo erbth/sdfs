@@ -165,11 +165,15 @@ void FSClient::cb_lookup(request_t* req)
 
 	if (req->io_error)
 		finish_request(req, err::IO);
+
+	/* Search for entry */
+
+	/* Return entry */
 }
 
 sdfs::async_handle_t FSClient::lookup(
 		unsigned long parent_ino, const char* name, struct stat* dst,
-		cb_async_finished_t cb_finished, void* arg)
+		sdfs::cb_async_finished_t cb_finished, void* arg)
 {
 	auto req = add_request();
 
@@ -178,8 +182,8 @@ sdfs::async_handle_t FSClient::lookup(
 	req->st_buf = dst;
 
 	/* Read inode */
-	req->nodes.emplace_back();
-	read_inode(req->nodes.back(), bind_front(&FSClient::cb_lookup, this), req);
+	req->inodes.emplace_back();
+	//read_inode(req->inodes.back(), bind_front(&FSClient::cb_lookup, this), req);
 
 	return req->handle;
 }

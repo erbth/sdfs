@@ -1373,6 +1373,7 @@ bool ctrl_ctx::parse_client_message_read(
 		if (
 				io_req.count == 0 ||
 				io_req.count > 32 * 1024 * 1024 ||
+				io_req.offset > numeric_limits<size_t>::max() / 2 ||
 				io_req.offset + io_req.count > data_map.size)
 		{
 			auto ptr = io_req.static_buf;
@@ -1503,18 +1504,13 @@ bool ctrl_ctx::parse_client_message_write(client_path_t* path,
 		if (
 				io_req.count == 0 ||
 				io_req.count > 32 * 1024 * 1024 ||
+				io_req.offset > numeric_limits<size_t>::max() / 2 ||
 				io_req.offset + io_req.count > data_map.size)
 		{
-			auto ptr = io_req.static_buf;
-			prot::serialize_hdr(ptr,
-					16 + 4,
-					prot::client::RESP_WRITE,
-					io_req.seq);
-
-			ser::swrite_i32(ptr, err::IO);
-			send_on_client_path_req(iio_req, io_req.static_buf, 20);
-
-			return false;
+			/* Still parse the full request. Note that large messages may
+			 * require a lot of memory - however these shall be filtered out
+			 * earlier. */
+			io_req.error_code = err::IO;
 		}
 
 		/* Allocate buffer */
@@ -1552,6 +1548,23 @@ void ctrl_ctx::complete_parse_client_write_request(client_path_t* p)
 {
 	auto io_req = p->req;
 	p->req = nullptr;
+
+	/* Delayed handling of early error code after the entire message has been
+	 * received. */
+	if (io_req->error_code != err::SUCCESS)
+	{
+		auto ptr = io_req->static_buf;
+		prot::serialize_hdr(ptr,
+				16 + 4,
+				prot::client::RESP_WRITE,
+				io_req->seq);
+
+		ser::swrite_i32(ptr, io_req->error_code);
+		send_on_client_path_req(p->i_req, io_req->static_buf, 20);
+
+		return;
+	}
+
 
 	/* Split request into chunks */
 	io_req->cnt_dd_reqs = split_io(

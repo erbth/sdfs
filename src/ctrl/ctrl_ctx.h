@@ -100,6 +100,9 @@ struct io_request_t
 
 	/* Buffer */
 	fixed_buffer buf;
+
+	/* Early error codes from e.g. constraint checks */
+	int error_code = err::SUCCESS;
 };
 
 
