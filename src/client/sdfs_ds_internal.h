@@ -67,8 +67,6 @@ struct send_queue_element_t
 
 struct path_t final
 {
-	std::mutex m;
-
 	unsigned path_id = 0;
 	EventFD* thread_efd = nullptr;
 
@@ -94,6 +92,14 @@ struct path_t final
 	decltype(io_requests)::iterator rcv_req;
 	char* rcv_req_ptr = nullptr;
 	size_t rcv_req_size = 0;
+
+	/* A mutex for the state- and send parts. It protects:
+	 *   * wfd (but it may only be closed by the worker thread)
+	 *   * accepted (but it may only be modified by the worker thread)
+	 *   * sender_enabled
+	 *   * io_requests (but only the worker thread may delete entries)
+	 *   * send_queue (but only the worker thread may delete entries) */
+	std::mutex m_state_send;
 };
 
 struct worker_thread_ctx final
@@ -141,7 +147,6 @@ struct worker_thread_ctx final
 
 
 	void send_on_path_static(path_t* p, const char* buf, size_t size);
-	void send_on_path_static_no_lock(path_t* p, const char* buf, size_t size);
 
 
 	bool parse_message_simple(path_t* p, const char* buf, size_t size, uint32_t msg_num);
@@ -194,7 +199,8 @@ protected:
 	uint64_t probe_seq{};
 	std::atomic<uint64_t> probe_round{};
 
-	/* Returns nullptr if no path is available */
+	/* Returns nullptr if no path is available; the returned lock is for
+	 * path_t::m_state_send */
 	std::pair<path_t*, std::unique_lock<std::mutex>> choose_path(unsigned long seq);
 
 

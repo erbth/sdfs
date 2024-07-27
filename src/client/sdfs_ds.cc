@@ -212,7 +212,7 @@ void DSClient::print_path_status()
 	fprintf(stderr, "Path status:\n");
 	for (auto& p : paths)
 	{
-		unique_lock lk(p.m);
+		unique_lock lk(p.m_state_send);
 
 		fprintf(stderr, "    %d: %s (addr.: %s): %s\n",
 				p.path_id,
@@ -229,7 +229,7 @@ std::pair<path_t*, std::unique_lock<std::mutex>> DSClient::choose_path(unsigned 
 	for (size_t offset = 0; offset < path_order.size(); offset++)
 	{
 		auto p = path_order[(seq + offset) % path_order.size()];
-		unique_lock lkp(p->m);
+		unique_lock lkp(p->m_state_send);
 		if (p->accepted)
 			return {p, move(lkp)};
 	}
@@ -333,7 +333,7 @@ void worker_thread_ctx::on_eventfd()
 	/* Enable senders if required */
 	for (auto& p : paths)
 	{
-		unique_lock lkp(p->m);
+		unique_lock lkp(p->m_state_send);
 		if (p->wfd && !p->sender_enabled)
 		{
 			ep.change_events(p->wfd.get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP | EPOLLOUT);
@@ -393,8 +393,6 @@ void worker_thread_ctx::on_eventfd()
 
 void worker_thread_ctx::on_path_fd(path_t* path, int fd, uint32_t events)
 {
-	unique_lock lk(path->m);
-
 	/* Ensure fd is correct */
 	if (path->wfd.get_fd() != fd)
 		throw runtime_error("Invalid path fd");
@@ -405,13 +403,14 @@ void worker_thread_ctx::on_path_fd(path_t* path, int fd, uint32_t events)
 	/* Send data */
 	if (events & EPOLLOUT)
 	{
+		unique_lock lk_mss(path->m_state_send);
+
 		if (path->send_queue.size() > 0)
 		{
 			auto& elem = path->send_queue.front();
+			lk_mss.unlock();
 
-			lk.unlock();
 			auto ret = writev(fd, elem.iov, elem.iov_cnt);
-			lk.lock();
 
 			if (ret > 0)
 			{
@@ -430,6 +429,8 @@ void worker_thread_ctx::on_path_fd(path_t* path, int fd, uint32_t events)
 					}
 				}
 
+				lk_mss.lock();
+
 				if (elem.iov_cnt == 0)
 					path->send_queue.pop();
 			}
@@ -438,6 +439,8 @@ void worker_thread_ctx::on_path_fd(path_t* path, int fd, uint32_t events)
 				fprintf(stderr, "Write error on path %u: %s; disconnecting\n",
 						(unsigned) path->path_id, errno_str(errno).c_str());
 				disconnect = true;
+
+				lk_mss.lock();
 			}
 		}
 
@@ -454,10 +457,7 @@ void worker_thread_ctx::on_path_fd(path_t* path, int fd, uint32_t events)
 	{
 		if (path->rcv_req_ptr)
 		{
-			lk.unlock();
 			auto ret = read(fd, path->rcv_req_ptr, path->rcv_req_size);
-			lk.lock();
-
 			if (ret > 0)
 			{
 				path->rcv_req_size -= ret;
@@ -577,6 +577,8 @@ void worker_thread_ctx::on_path_fd(path_t* path, int fd, uint32_t events)
 
 	if (disconnect)
 	{
+		unique_lock lk_mss(path->m_state_send);
+
 		ep.remove_fd(fd);
 
 		path->accepted = false;
@@ -602,12 +604,8 @@ unique_ptr<io_request_t> worker_thread_ctx::remove_io_request(path_t* p, uint64_
 
 void worker_thread_ctx::send_on_path_static(path_t* p, const char* buf, size_t size)
 {
-	unique_lock lk(p->m);
-	send_on_path_static_no_lock(p, buf, size);
-}
+	unique_lock lk(p->m_state_send);
 
-void worker_thread_ctx::send_on_path_static_no_lock(path_t* p, const char* buf, size_t size)
-{
 	if (!p->wfd)
 		return;
 
@@ -695,7 +693,10 @@ bool worker_thread_ctx::parse_message_accept(
 	}
 
 	//fprintf(stderr, "Path %u accepted by remote\n", (unsigned) p->path_id);
-	p->accepted = true;
+	{
+		unique_lock lk_mss(p->m_state_send);
+		p->accepted = true;
+	}
 
 	/* Send CONNECT on next path, if any */
 	path_t* next_p = nullptr;
@@ -720,7 +721,7 @@ bool worker_thread_ctx::parse_message_accept(
 
 		ser::swrite_u32(ptr, client_id->load(memory_order_acquire));
 
-		send_on_path_static_no_lock(next_p, buf, 20);
+		send_on_path_static(next_p, buf, 20);
 	}
 	else
 	{
@@ -762,7 +763,7 @@ bool worker_thread_ctx::parse_message_req_probe(
 	for (auto p2 : paths)
 	{
 		if (p2 != p && p2->accepted)
-			send_on_path_static_no_lock(p2, msg_buf, 24);
+			send_on_path_static(p2, msg_buf, 24);
 	}
 
 	/* Instruct other threads to reflect the probe */
@@ -808,9 +809,13 @@ bool worker_thread_ctx::parse_message_read(
 	auto res = ser::sread_i32(buf);
 
 	/* Find io request */
+	unique_lock lk_mss(p->m_state_send);
+
 	auto i_io_req = p->io_requests.find(seq);
 	if (i_io_req == p->io_requests.end())
 		return true;
+
+	lk_mss.unlock();
 
 	auto& io_req = i_io_req->second;
 
@@ -831,12 +836,18 @@ bool worker_thread_ctx::parse_message_read(
 	if (res != err::SUCCESS || buf_size == size)
 	{
 		auto _io_req = move(io_req);
+
+		lk_mss.lock();
 		p->io_requests.erase(i_io_req);
+		lk_mss.unlock();
+
 		_io_req->cb_finished(seq, res, _io_req->user_arg);
 		return false;
 	}
 
 	/* Setup reading for the remaining data */
+	lk_mss.lock();
+
 	p->rcv_req = i_io_req;
 	p->rcv_req_ptr = io_req->data_ptr + buffered_cnt;
 	p->rcv_req_size = io_req->data_size - buffered_cnt;
@@ -867,7 +878,13 @@ bool worker_thread_ctx::parse_message_write(
 bool worker_thread_ctx::finish_message_read(path_t* p)
 {
 	auto io_req = move(p->rcv_req->second);
-	p->io_requests.erase(p->rcv_req);
+
+	{
+		unique_lock lk_mss(p->m_state_send);
+
+		p->io_requests.erase(p->rcv_req);
+	}
+
 	io_req->cb_finished(io_req->seq, err::SUCCESS, io_req->user_arg);
 
 	return false;
@@ -881,7 +898,7 @@ void worker_thread_ctx::main()
 	/* Add paths to epoll instance */
 	for (auto p : paths)
 	{
-		unique_lock lk(p->m);
+		unique_lock lk(p->m_state_send);
 
 		ep.add_fd(p->wfd.get_fd(), EPOLLIN | EPOLLHUP | EPOLLRDHUP,
 				bind_front(&worker_thread_ctx::on_path_fd, this, p));
