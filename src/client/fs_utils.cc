@@ -71,10 +71,10 @@ size_t inode_t::get_allocated_size() const
 bool inode_t::enough_space_for_file(const std::string& name) const
 {
 	size_t entry_size = 0;
-	for (const auto& [f_name, f_node_id, f_type] : files)
-		entry_size += 1 + f_name.size() + 8 + 1;
+	for (const auto& [f_name, f_node_id] : files)
+		entry_size += 1 + f_name.size() + 8;
 
-	entry_size += 1 + name.size() + 8 + 1;
+	entry_size += 1 + name.size() + 8;
 
 	return entry_size <= 3480;
 }
@@ -112,7 +112,7 @@ void inode_t::serialize(char* buf) const
 		else
 		{
 			size_t entry_size = 0;
-			for (const auto& [name, f_node_id, f_type] : files)
+			for (const auto& [name, f_node_id] : files)
 			{
 				if (name.size() > 255 || name.size() == 0)
 					throw invalid_argument("filename too long or empty");
@@ -120,7 +120,7 @@ void inode_t::serialize(char* buf) const
 				if (f_node_id == 0)
 					throw invalid_argument("dir entry node_id is 0");
 
-				entry_size += 1 + name.size() + 8 + 1;
+				entry_size += 1 + name.size() + 8;
 
 				if (entry_size > 3480)
 					throw invalid_argument("file reference data structure too large");
@@ -129,7 +129,6 @@ void inode_t::serialize(char* buf) const
 				memcpy(ptr, name.c_str(), name.size());
 				ptr += name.size();
 				ser::swrite_u64(ptr, f_node_id);
-				ser::swrite_u8(ptr, f_type);
 			}
 		}
 	}
@@ -189,9 +188,7 @@ void inode_t::parse(const char* buf)
 				if (f_node_id == 0)
 					break;
 
-				auto f_type = ser::sread_u8(ptr);
-
-				files.emplace_back(string(buf, namesz), f_node_id, f_type);
+				files.emplace_back(string(buf, namesz), f_node_id);
 			}
 		}
 	}
@@ -199,4 +196,22 @@ void inode_t::parse(const char* buf)
 	{
 		throw invalid_argument("Invalid inode type: `" + to_string(type) + "'");
 	}
+}
+
+
+void fill_st_buf(const inode_t* node, struct stat* st_buf)
+{
+	memset(st_buf, 0, sizeof(*(st_buf)));
+
+	st_buf->st_ino = node->node_id;
+
+	if (node->type == inode_t::TYPE_DIRECTORY)
+		st_buf->st_mode = 0755 | S_IFDIR;
+	else
+		st_buf->st_mode = 0644 | S_IFREG;
+
+	st_buf->st_nlink = node->nlink;
+	st_buf->st_size = node->size;
+	st_buf->st_blksize = 1024 * 1024;
+	st_buf->st_blocks = align_up(node->size, 1024 * 1024UL) / 512;
 }

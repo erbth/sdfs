@@ -25,6 +25,12 @@ struct fs_attr_t
 	size_t inodes_used;
 };
 
+struct dir_entry_t
+{
+	unsigned long ino;
+	std::string name;
+};
+
 
 class FSClient final
 {
@@ -40,6 +46,12 @@ public:
 			cb_async_finished_t cb_finished, void* arg);
 
 	async_handle_t lookup(unsigned long parent_ino, const char* name, struct stat* dst,
+			cb_async_finished_t cb_finished, void* arg);
+
+	async_handle_t getattr(unsigned long ino, struct stat& dst,
+			cb_async_finished_t cb_finished, void* arg);
+
+	async_handle_t readdir(unsigned long ino, std::vector<dir_entry_t>& dst,
 			cb_async_finished_t cb_finished, void* arg);
 };
 

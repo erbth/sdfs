@@ -6,6 +6,11 @@
 #include <tuple>
 #include <string>
 
+extern "C" {
+#include <sys/types.h>
+#include <sys/stat.h>
+}
+
 struct superblock_t
 {
 	size_t raw_size{};
@@ -26,6 +31,11 @@ struct superblock_t
 
 struct inode_t
 {
+	/* The inode number is used by functions like fill_st_buf, but not stored on
+	 * disk. It follows implicitely from the inodes location in the inode
+	 * directory. */
+	unsigned long node_id = 0;
+
 	/* Actual inode data */
 	enum inode_type : unsigned
 	{
@@ -62,7 +72,7 @@ struct inode_t
 
 
 	/* For directories (name, inode, type) */
-	std::vector<std::tuple<std::string, unsigned long, unsigned>> files;
+	std::vector<std::tuple<std::string, unsigned long>> files;
 
 	bool enough_space_for_file(const std::string& name) const;
 
@@ -71,6 +81,9 @@ struct inode_t
 	void serialize(char* buf) const;
 	void parse(const char* buf);
 };
+
+
+void fill_st_buf(const inode_t* node, struct stat* st_buf);
 
 
 /* @param raw_size is used as integrity check */

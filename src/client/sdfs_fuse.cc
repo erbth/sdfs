@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <stdexcept>
 #include <vector>
 #include <string>
@@ -11,6 +12,7 @@
 #include "config.h"
 #include "common/exceptions.h"
 #include "common/file_config.h"
+#include "common/dynamic_buffer.h"
 #include "sdfs_fs_internal.h"
 
 using namespace std;
@@ -79,6 +81,35 @@ int convert_error_code(int c)
 
 
 /* Contexts for individual operations */
+struct req_lookup
+{
+	fuse_req_t req;
+
+	struct fuse_entry_param fep{};
+};
+
+struct req_getattr
+{
+	fuse_req_t req;
+
+	struct stat st_buf{};
+};
+
+
+struct req_readdir
+{
+	fuse_req_t req;
+	size_t size;
+	off_t off;
+
+	vector<sdfs::dir_entry_t> entries;
+	vector<sdfs::dir_entry_t>::iterator i_entry;
+	struct stat st_buf{};
+
+	dynamic_buffer output_buf;
+	size_t output_off = 0;
+};
+
 struct req_statfs
 {
 	fuse_req_t req;
@@ -103,15 +134,32 @@ struct ctx_t final
 	struct fuse_args f_args{};
 
 	/* Operations */
-	static void _op_lookup(fuse_req_t req, fuse_ino_t parent, const char* name)
+	static void _cb_op_lookup(sdfs::async_handle_t handle, int res, void* arg)
 	{
-		g_ctx->op_lookup(req, parent, name);
+		auto int_req = reinterpret_cast<req_lookup*>(arg);
+
+		if (res != sdfs::err::SUCCESS)
+		{
+			check_call(fuse_reply_err(int_req->req, convert_error_code(res)),
+					"fuse_reply_err");
+		}
+		else
+		{
+			int_req->fep.ino = int_req->fep.attr.st_ino;
+			check_call(fuse_reply_entry(int_req->req, &int_req->fep),
+					"fuse_reply_entry");
+		}
+
+		delete int_req;
 	}
 
-	void op_lookup(fuse_req_t req, fuse_ino_t parent, const char* name)
+	static void _op_lookup(fuse_req_t req, fuse_ino_t parent, const char* name)
 	{
-		printf("lookup: %lu, %s\n", parent, name);
-		check_call(fuse_reply_err(req, ENOSYS), "fuse_reply_err");
+		auto int_req = new req_lookup();
+		int_req->req = req;
+
+		g_ctx->fsc.lookup(parent, name, &int_req->fep.attr,
+				_cb_op_lookup, int_req);
 	}
 
 
@@ -126,14 +174,30 @@ struct ctx_t final
 	}
 
 
-	static void _op_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
+	static void _cb_op_getattr(sdfs::async_handle_t handle, int res, void* arg)
 	{
-		g_ctx->op_getattr(req, ino, fi);
+		auto int_req = reinterpret_cast<req_getattr*>(arg);
+
+		if (res != sdfs::err::SUCCESS)
+		{
+			check_call(fuse_reply_err(int_req->req, convert_error_code(res)),
+					"fuse_reply_err");
+		}
+		else
+		{
+			check_call(fuse_reply_attr(int_req->req, &int_req->st_buf, 0),
+					"fuse_reply_attr");
+		}
+
+		delete int_req;
 	}
 
-	void op_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
+	static void _op_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
 	{
-		check_call(fuse_reply_err(req, ENOSYS), "fuse_reply_err");
+		auto int_req = new req_getattr();
+		int_req->req = req;
+
+		g_ctx->fsc.getattr(ino, int_req->st_buf, _cb_op_getattr, int_req);
 	}
 
 
@@ -219,16 +283,145 @@ struct ctx_t final
 	}
 
 
+	static void _cb_op_readdir2(sdfs::async_handle_t handle, int res, void* arg)
+	{
+		auto int_req = reinterpret_cast<req_readdir*>(arg);
+
+		if (res != sdfs::err::SUCCESS && res != sdfs::err::NOENT)
+		{
+			check_call(fuse_reply_err(int_req->req, convert_error_code(res)),
+						"fuse_reply_err");
+
+			delete int_req;
+			return;
+		}
+
+		/* Add entry to output buffer */
+		if (res != sdfs::err::NOENT)
+		{
+			auto i_next = int_req->i_entry++;
+			auto next_off =
+				i_next == int_req->entries.end() ?
+					numeric_limits<off_t>::max() :
+					i_next->ino;
+
+			/* Determine entry size and check if it exceeds the requested
+			 * maximum size */
+			auto e_size = fuse_add_direntry(
+					int_req->req,
+					int_req->output_buf.ptr() + int_req->output_off,
+					0,
+					int_req->i_entry->name.c_str(),
+					&int_req->st_buf,
+					next_off);
+
+			auto new_size = int_req->output_off + e_size;
+			if (new_size > int_req->size)
+			{
+				/* Return the current buffer or error if it is still empty */
+				if (int_req->output_off == 0)
+				{
+					check_call(fuse_reply_err(int_req->req, EINVAL), "fuse_reply_err");
+				}
+				else
+				{
+					check_call(fuse_reply_buf(int_req->req,
+								int_req->output_buf.ptr(), int_req->output_off),
+							"fuse_reply_buf");
+				}
+
+				delete int_req;
+				return;
+			}
+
+			int_req->output_buf.ensure_size(new_size);
+
+			/* Serialize entry */
+			fuse_add_direntry(
+					int_req->req,
+					int_req->output_buf.ptr() + int_req->output_off,
+					new_size,
+					int_req->i_entry->name.c_str(),
+					&int_req->st_buf,
+					next_off);
+
+			int_req->output_off = new_size;
+		}
+
+		/* If another entry is present, read its attributes */
+		if (++int_req->i_entry != int_req->entries.end())
+		{
+			g_ctx->fsc.getattr(int_req->i_entry->ino, int_req->st_buf,
+					_cb_op_readdir2, int_req);
+		}
+		else
+		{
+			/* Return buffer */
+			check_call(fuse_reply_buf(int_req->req,
+						int_req->output_buf.ptr(), int_req->output_off),
+					"fuse_reply_buf");
+
+			delete int_req;
+			return;
+		}
+	}
+
+	static void _cb_op_readdir(sdfs::async_handle_t handle, int res, void* arg)
+	{
+		auto int_req = reinterpret_cast<req_readdir*>(arg);
+
+		if (res != sdfs::err::SUCCESS)
+		{
+			check_call(fuse_reply_err(int_req->req, convert_error_code(res)),
+						"fuse_reply_err");
+
+			delete int_req;
+			return;
+		}
+
+		/* Order the entries by name to obtain a stable order for the offset
+		 * field */
+		sort(int_req->entries.begin(), int_req->entries.end(),
+				[](auto& a, auto& b){ return a.name < b.name; });
+
+		/* Skip over entries */
+		auto i = int_req->entries.begin();
+		if (int_req->off != 0)
+			for (; i != int_req->entries.end() && i->ino != (unsigned long) int_req->off; i++);
+
+		int_req->entries.erase(int_req->entries.begin(), i);
+
+		/* End of directory - this can happen at this point if the directory is
+		 * modified during the read operation */
+		if (int_req->entries.empty())
+		{
+			check_call(fuse_reply_buf(int_req->req, nullptr, 0), "fuse_reply_buf");
+			delete int_req;
+			return;
+		}
+
+		/* Read entry types */
+		int_req->i_entry = int_req->entries.begin();
+		g_ctx->fsc.getattr(int_req->i_entry->ino, int_req->st_buf,
+				_cb_op_readdir2, int_req);
+	}
+
 	static void _op_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 			off_t off, struct fuse_file_info* fi)
 	{
-		g_ctx->op_readdir(req, ino, size, off, fi);
-	}
+		if (off == numeric_limits<off_t>::max())
+		{
+			/* End of directory */
+			check_call(fuse_reply_buf(req, nullptr, 0), "fuse_reply_buf");
+			return;
+		}
 
-	void op_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
-			struct fuse_file_info* fi)
-	{
-		check_call(fuse_reply_err(req, ENOSYS), "fuse_reply_err");
+		auto int_req = new req_readdir();
+		int_req->req = req;
+		int_req->size = size;
+		int_req->off = off;
+
+		g_ctx->fsc.readdir(ino, int_req->entries, _cb_op_readdir, int_req);
 	}
 
 
@@ -300,7 +493,7 @@ struct ctx_t final
 	static constexpr struct fuse_lowlevel_ops f_ops = {
 		.lookup = _op_lookup,
 		//.forget = _op_forget,
-		//.getattr = _op_getattr,
+		.getattr = _op_getattr,
 		//.mkdir = _op_mkdir,
 		//.unlink = _op_unlink,
 		//.rmdir = _op_rmdir,
@@ -308,7 +501,7 @@ struct ctx_t final
 		//.read = _op_read,
 		//.write = _op_write,
 		//.release = _op_release,
-		//.readdir = _op_readdir,
+		.readdir = _op_readdir,
 		.statfs = _op_statfs,
 		//.create = _op_create
 	};

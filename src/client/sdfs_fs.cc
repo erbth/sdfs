@@ -125,13 +125,78 @@ void FSClient::cb_read_inode_allocator(size_t handle, int res, void* arg)
 }
 
 
+void FSClient::read_inode(unsigned long node_id, inode_t& node,
+		cb_dsio_t cb, request_t* req)
+{
+	if (node_id == 0 || node_id >= sb.inode_count)
+	{
+		req->io_error = true;
+
+		req->finished_reqs.fetch_add(1, memory_order_acq_rel);
+		cb(req);
+		return;
+	}
+
+	auto c = new cb_read_inode_ctx();
+
+	try
+	{
+		c->req = req;
+		c->cb = cb;
+		c->node_id = node_id;
+		c->node = &node;
+
+		dsc.read(c->buf, sb.inode_directory_offset + node_id * 4096, 4096,
+				cb_read_inode, c);
+	}
+	catch (...)
+	{
+		delete c;
+		throw;
+	}
+}
+
+void FSClient::cb_read_inode(size_t handle, int res, void* arg)
+{
+	auto c = reinterpret_cast<cb_read_inode_ctx*>(arg);
+	auto req = c->req;
+	auto cb = c->cb;
+
+	try
+	{
+		if (res == err::SUCCESS)
+		{
+			c->node->parse(c->buf);
+			c->node->node_id = c->node_id;
+		}
+		else
+		{
+			req->io_error = true;
+		}
+
+		delete c;
+	}
+	catch (...)
+	{
+		delete c;
+		throw;
+	}
+
+	req->finished_reqs.fetch_add(1, memory_order_acq_rel);
+	cb(req);
+}
+
+
 void FSClient::cb_getfsattr(request_t* req)
 {
 	if (req->finished_reqs.load(memory_order_acquire) != 2)
 		return;
 
 	if (req->io_error)
+	{
 		finish_request(req, err::IO);
+		return;
+	}
 
 	req->fs_attr->size = sb.usable_size;
 	req->fs_attr->used = req->block_allocator.count_allocated() * 1024 * 1024UL;
@@ -164,11 +229,62 @@ void FSClient::cb_lookup(request_t* req)
 	req->finished_reqs.load(memory_order_acquire);
 
 	if (req->io_error)
+	{
 		finish_request(req, err::IO);
+		return;
+	}
 
-	/* Search for entry */
+	auto& node = req->inodes.back();
+	if (node.type == inode_t::TYPE_DIRECTORY)
+	{
+		/* Search for entry */
+		for (auto& [name, node_id] : node.files)
+		{
+			if (name == req->name && node_id != 0)
+			{
+				/* Retrieve the entry's inode */
+				req->inodes.pop_back();
+				req->inodes.emplace_back();
 
-	/* Return entry */
+				read_inode(node_id, req->inodes.back(),
+						bind_front(&FSClient::cb_lookup2, this), req);
+				return;
+			}
+		}
+	}
+	else if (node.type == inode_t::TYPE_FILE)
+	{
+		/* Return error */
+		finish_request(req, err::NOTDIR);
+		return;
+	}
+
+	/* Return NOENT */
+	finish_request(req, err::NOENT);
+}
+
+void FSClient::cb_lookup2(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (req->io_error)
+	{
+		finish_request(req, err::IO);
+		return;
+	}
+
+	auto& node = req->inodes.back();
+	if (node.type != inode_t::TYPE_DIRECTORY && node.type != inode_t::TYPE_FILE)
+	{
+		/* This is actually a dangling link in the parent directory - for
+		 * robustness, just ignore it. */
+		finish_request(req, err::NOENT);
+		return;
+	}
+
+	/* Fill out the destination st_buf */
+	fill_st_buf(&node, req->st_buf);
+	finish_request(req, err::SUCCESS);
 }
 
 sdfs::async_handle_t FSClient::lookup(
@@ -179,11 +295,108 @@ sdfs::async_handle_t FSClient::lookup(
 
 	req->cb_finished = cb_finished;
 	req->cb_finished_arg = arg;
+	req->name = name;
 	req->st_buf = dst;
 
 	/* Read inode */
 	req->inodes.emplace_back();
-	//read_inode(req->inodes.back(), bind_front(&FSClient::cb_lookup, this), req);
+	read_inode(parent_ino, req->inodes.back(),
+			bind_front(&FSClient::cb_lookup, this), req);
+
+	return req->handle;
+}
+
+
+void FSClient::cb_getattr(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (req->io_error)
+	{
+		finish_request(req, err::IO);
+		return;
+	}
+
+	auto& node = req->inodes.back();
+	if (node.type != inode_t::TYPE_DIRECTORY && node.type != inode_t::TYPE_FILE)
+	{
+		finish_request(req, err::NOENT);
+		return;
+	}
+
+	/* Fill out the destination st_buf */
+	fill_st_buf(&node, req->st_buf);
+	finish_request(req, err::SUCCESS);
+}
+
+sdfs::async_handle_t FSClient::getattr(unsigned long ino, struct stat& dst,
+		sdfs::cb_async_finished_t cb_finished, void* arg)
+{
+	auto req = add_request();
+
+	req->cb_finished = cb_finished;
+	req->cb_finished_arg = arg;
+	req->st_buf = &dst;
+
+		/* Read inode */
+		req->inodes.emplace_back();
+	read_inode(ino, req->inodes.back(),
+			bind_front(&FSClient::cb_getattr, this), req);
+
+	return req->handle;
+}
+
+
+void FSClient::cb_readdir(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (req->io_error)
+	{
+		finish_request(req, err::IO);
+		return;
+	}
+
+	auto& node = req->inodes.back();
+	switch (node.type)
+	{
+	case inode_t::TYPE_FILE:
+		finish_request(req, err::NOTDIR);
+		return;
+
+	case inode_t::TYPE_DIRECTORY:
+		break;
+
+	default:
+		finish_request(req, err::NOENT);
+		return;
+	}
+
+	for (const auto& [name, ino] : node.files)
+	{
+		sdfs::dir_entry_t e{};
+		e.ino = ino;
+		e.name = name;
+
+		req->dir_entries->push_back(e);
+	}
+
+	finish_request(req, err::SUCCESS);
+}
+
+sdfs::async_handle_t FSClient::readdir(unsigned long ino, std::vector<sdfs::dir_entry_t>& dst,
+		sdfs::cb_async_finished_t cb_finished, void* arg)
+{
+	auto req = add_request();
+
+	req->cb_finished = cb_finished;
+	req->cb_finished_arg = arg;
+	req->dir_entries = &dst;
+
+	/* Read directory inode */
+	req->inodes.emplace_back();
+	read_inode(ino, req->inodes.back(),
+			bind_front(&FSClient::cb_readdir, this), req);
 
 	return req->handle;
 }

@@ -239,18 +239,20 @@ int main_exc(args_t args)
 
 
 	/* Try to read superblock */
-	superblock_t sb;
 	bool have_sb = false;
+	{
+		superblock_t sb;
 
-	try
-	{
-		sb = read_sb(dsc, raw_size);
-		print_sb(sb);
-		have_sb = true;
-	}
-	catch (const invalid_superblock& e)
-	{
-		printf("Invalid filesystem: %s\n", e.what());
+		try
+		{
+			sb = read_sb(dsc, raw_size);
+			print_sb(sb);
+			have_sb = true;
+		}
+		catch (const invalid_superblock& e)
+		{
+			printf("Invalid filesystem: %s\n", e.what());
+		}
 	}
 
 	if (!args.format)
@@ -266,36 +268,40 @@ int main_exc(args_t args)
 	printf("Formatting filesystem...\n");
 
 	/* Build superblock */
+	superblock_t sb;
+
 	if (raw_size % 4096)
 		throw runtime_error("raw size is not a multiple of 4096");
 
+	sb.raw_size = raw_size;
+
 	/* Start with maximum block count for metadata size calculation */
-	size_t block_count = raw_size / (1024 * 1024);
+	sb.block_count = sb.raw_size / (1024 * 1024);
 
 	/* min(1e6, 5% of raw size) */
-	size_t inode_count = min(raw_size / (20 * 4096), 1000 * 1000UL);
+	sb.inode_count = min(sb.raw_size / (20 * 4096), 1000 * 1000UL);
 
-	size_t inode_directory_size = inode_count * 4096;
-	size_t inode_allocator_size = align_up(4096UL, (inode_count + 7) / 8);
-	size_t block_allocator_size = align_up(4096UL, (block_count + 7) / 8);
+	sb.inode_directory_size = sb.inode_count * 4096;
+	sb.inode_allocator_size = align_up(4096UL, (sb.inode_count + 7) / 8);
+	sb.block_allocator_size = align_up(4096UL, (sb.block_count + 7) / 8);
 
-	size_t metadata_size = 4096 + inode_directory_size + inode_allocator_size +
-		block_allocator_size;
+	size_t metadata_size = 4096 + sb.inode_directory_size +
+		sb.inode_allocator_size + sb.block_allocator_size;
 
 	/* Adjust block count to actually usable value */
-	block_count = (raw_size - metadata_size)  / (1024 * 1024);
+	sb.block_count = (sb.raw_size - metadata_size)  / (1024 * 1024);
 
 	/* Serialize suberblock */
 	char sb_buf[4096];
 	auto sb_ptr = sb_buf;
 
-	ser::swrite_u64(sb_ptr, raw_size);
-	ser::swrite_u64(sb_ptr, block_count);
-	ser::swrite_u64(sb_ptr, inode_count);
+	ser::swrite_u64(sb_ptr, sb.raw_size);
+	ser::swrite_u64(sb_ptr, sb.block_count);
+	ser::swrite_u64(sb_ptr, sb.inode_count);
 
-	ser::swrite_u64(sb_ptr, inode_directory_size);
-	ser::swrite_u64(sb_ptr, inode_allocator_size);
-	ser::swrite_u64(sb_ptr, block_allocator_size);
+	ser::swrite_u64(sb_ptr, sb.inode_directory_size);
+	ser::swrite_u64(sb_ptr, sb.inode_allocator_size);
+	ser::swrite_u64(sb_ptr, sb.block_allocator_size);
 
 	superblock_calculate_offsets(sb);
 
@@ -305,7 +311,7 @@ int main_exc(args_t args)
 
 
 	printf("Clearing metadata regions...\n");
-	write_zero(dsc, raw_size - metadata_size, metadata_size);
+	write_zero(dsc, sb.raw_size - metadata_size, metadata_size);
 
 
 	printf("Writing root directory...\n");
@@ -316,8 +322,8 @@ int main_exc(args_t args)
 	root.size = 2;
 	root.mtime = get_wt_now();
 
-	root.files.emplace_back(".", 1, inode_t::TYPE_DIRECTORY);
-	root.files.emplace_back("..", 1, inode_t::TYPE_DIRECTORY);
+	root.files.emplace_back(".", 1);
+	root.files.emplace_back("..", 1);
 
 	char buf[4096];
 	root.serialize(buf);

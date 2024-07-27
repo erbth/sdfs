@@ -38,5 +38,19 @@ async_handle_t SHLIB_EXPORTED FSClient::lookup(
 	return FSCLIENT(client)->lookup(parent_ino, name, dst, cb_finished, arg);
 }
 
+async_handle_t SHLIB_EXPORTED FSClient::getattr(
+		unsigned long ino, struct stat& dst,
+		cb_async_finished_t cb_finished, void* arg)
+{
+	return FSCLIENT(client)->getattr(ino, dst, cb_finished, arg);
+}
+
+async_handle_t SHLIB_EXPORTED FSClient::readdir(
+		unsigned long ino, vector<dir_entry_t>& dst,
+		cb_async_finished_t cb_finished, void* arg)
+{
+	return FSCLIENT(client)->readdir(ino, dst, cb_finished, arg);
+}
+
 
 }
