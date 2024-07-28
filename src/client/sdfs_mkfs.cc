@@ -332,7 +332,7 @@ int main_exc(args_t args)
 
 	/* Mark inode allocated */
 	memset(buf, 0, 4096);
-	buf[0] = 0x10;
+	buf[0] = 0x02;
 	write_data(dsc, buf, sb.inode_allocator_offset, 4096);
 
 

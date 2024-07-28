@@ -126,6 +126,14 @@ struct req_getattr
 };
 
 
+struct req_mkdir
+{
+	fuse_req_t req;
+
+	struct fuse_entry_param fep{};
+};
+
+
 struct req_readdir
 {
 	fuse_req_t req;
@@ -234,15 +242,34 @@ struct ctx_t final
 	}
 
 
+	static void _cb_op_mkdir(sdfs::async_handle_t handle, int res, void* arg)
+	{
+		auto int_req = reinterpret_cast<req_mkdir*>(arg);
+
+		if (res != sdfs::err::SUCCESS)
+		{
+			check_call(fuse_reply_err(int_req->req, convert_error_code(res)),
+					"fuse_reply_err");
+		}
+		else
+		{
+			adapt_user_group(int_req->req, int_req->fep.attr);
+
+			int_req->fep.ino = int_req->fep.attr.st_ino;
+			check_call(fuse_reply_entry(int_req->req, &int_req->fep),
+					"fuse_reply_entry");
+		}
+
+		delete int_req;
+	}
+
 	static void _op_mkdir(fuse_req_t req, fuse_ino_t parent, const char* name,
 			mode_t mode)
 	{
-		g_ctx->op_mkdir(req, parent, name, mode);
-	}
+		auto int_req = new req_mkdir();
+		int_req->req = req;
 
-	void op_mkdir(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode)
-	{
-		check_call(fuse_reply_err(req, ENOSYS), "fuse_reply_err");
+		g_ctx->fsc.mkdir(parent, name, int_req->fep.attr, _cb_op_mkdir, int_req);
 	}
 
 
@@ -531,7 +558,7 @@ struct ctx_t final
 		.lookup = _op_lookup,
 		//.forget = _op_forget,
 		.getattr = _op_getattr,
-		//.mkdir = _op_mkdir,
+		.mkdir = _op_mkdir,
 		//.unlink = _op_unlink,
 		//.rmdir = _op_rmdir,
 		//.open = _op_open,

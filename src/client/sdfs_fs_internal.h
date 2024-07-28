@@ -20,6 +20,30 @@ struct allocator_t
 	fixed_buffer buf;
 
 	size_t count_allocated();
+
+	inline bool is_free(size_t e)
+	{
+		auto b = e / 8;
+		auto msk = 1 << (e % 8);
+
+		return (buf.ptr()[b] & msk) == 0;
+	}
+
+	inline void mark_allocated(size_t e)
+	{
+		auto b = e / 8;
+		auto msk = 1 << (e % 8);
+
+		buf.ptr()[b] |= msk;
+	}
+
+	inline void mark_free(size_t e)
+	{
+		auto b = e / 8;
+		auto msk = 1 << (e % 8);
+
+		buf.ptr()[b] &= ~msk;
+	}
 };
 
 
@@ -31,6 +55,12 @@ struct request_t
 	allocator_t inode_allocator;
 	allocator_t block_allocator;
 
+	/* NOTE: The use of this with a simple .load does not guarantee a
+	 * race-condition free execution order if multiple operations of the same
+	 * request are performed concurrently. However one can instead use fetch_add
+	 * to check for completion and compare with twice the count of operations
+	 * (-1 because fetch_add atomically returns the value immediately before the
+	 * operation). */
 	std::atomic<unsigned> finished_reqs{0};
 	bool io_error{false};
 
@@ -58,6 +88,7 @@ class FSClient final
 {
 protected:
 	using cb_dsio_t = std::function<void(request_t*)>;
+	using cb_err_t = std::function<void(int ret, request_t*)>;
 
 	struct cb_dsio_req_patch
 	{
@@ -65,11 +96,18 @@ protected:
 		request_t* req;
 	};
 
-	struct cb_read_inode_ctx : public cb_dsio_req_patch
+	struct cb_inode_ctx : public cb_dsio_req_patch
 	{
 		unsigned long node_id;
 		inode_t* node;
 		char buf[4096];
+	};
+
+	struct cb_allocate_inode_ctx
+	{
+		cb_err_t cb;
+		unsigned long* node_id;
+		unsigned long new_id = 0;
 	};
 
 	sdfs::DSClient dsc;
@@ -92,8 +130,19 @@ protected:
 	void read_inode_allocator(allocator_t&, cb_dsio_t, request_t*);
 	void read_inode(unsigned long node_id, inode_t&, cb_dsio_t, request_t*);
 
-	static void cb_read_inode_allocator(size_t handle, int res, void* arg);
+	void write_block_allocator(allocator_t&, cb_dsio_t, request_t*);
+	void write_inode_allocator(allocator_t&, cb_dsio_t, request_t*);
+	void write_inode(unsigned long node_id, inode_t&, cb_dsio_t, request_t*);
+
+	void allocate_inode(unsigned long& node_id, cb_err_t, request_t*);
+	void free_inode(unsigned long node_id, cb_err_t, request_t*);
+
+	static void cb_allocator(size_t handle, int res, void* arg);
 	static void cb_read_inode(size_t handle, int read, void* arg);
+	static void cb_write_inode(size_t handle, int read, void* arg);
+
+	void cb_allocate_inode(cb_allocate_inode_ctx c, request_t* req);
+	void cb_allocate_inode2(cb_allocate_inode_ctx c, request_t* req);
 
 
 	/* Callbacks for fs operations */
@@ -102,6 +151,10 @@ protected:
 	void cb_lookup2(request_t* req);
 	void cb_getattr(request_t* req);
 	void cb_readdir(request_t* req);
+	void cb_mkdir(request_t* req);
+	void cb_mkdir2(int res, request_t* req);
+	void cb_mkdir3(request_t* req);
+	void cb_mkdir4(request_t* req);
 
 public:
 	FSClient(const std::vector<std::string>& srv_portals);
@@ -118,6 +171,9 @@ public:
 			sdfs::cb_async_finished_t cb_finished, void* arg);
 
 	sdfs::async_handle_t readdir(unsigned long ino, std::vector<sdfs::dir_entry_t>& dst,
+			sdfs::cb_async_finished_t cb_finished, void* arg);
+
+	sdfs::async_handle_t mkdir(unsigned long parent, const char* name, struct stat& dst,
 			sdfs::cb_async_finished_t cb_finished, void* arg);
 };
 
