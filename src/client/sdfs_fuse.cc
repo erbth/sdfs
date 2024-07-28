@@ -35,6 +35,28 @@ struct args_t final
 struct ctx_t;
 static ctx_t* g_ctx = nullptr;
 
+
+/* Convert to absolute path */
+string resolve_path(const char* p)
+{
+	auto resolved = realpath(p, nullptr);
+	if (!resolved)
+		throw system_error(errno, generic_category(), "resolve_path(mountpoint)");
+
+	try
+	{
+		string s(resolved);
+		free(resolved);
+		return s;
+	}
+	catch (...)
+	{
+		free(resolved);
+		throw;
+	}
+}
+
+
 inline int check_call(int ret, const char* fn_name)
 {
 	if (ret < 0)
@@ -77,6 +99,14 @@ int convert_error_code(int c)
 	default:
 		return EIO;
 	};
+}
+
+
+void adapt_user_group(fuse_req_t req, struct stat& st_buf)
+{
+	auto fctx = fuse_req_ctx(req);
+	st_buf.st_uid = fctx->uid;
+	st_buf.st_gid = fctx->gid;
 }
 
 
@@ -145,6 +175,8 @@ struct ctx_t final
 		}
 		else
 		{
+			adapt_user_group(int_req->req, int_req->fep.attr);
+
 			int_req->fep.ino = int_req->fep.attr.st_ino;
 			check_call(fuse_reply_entry(int_req->req, &int_req->fep),
 					"fuse_reply_entry");
@@ -185,6 +217,7 @@ struct ctx_t final
 		}
 		else
 		{
+			adapt_user_group(int_req->req, int_req->st_buf);
 			check_call(fuse_reply_attr(int_req->req, &int_req->st_buf, 0),
 					"fuse_reply_attr");
 		}
@@ -299,7 +332,11 @@ struct ctx_t final
 		/* Add entry to output buffer */
 		if (res != sdfs::err::NOENT)
 		{
-			auto i_next = int_req->i_entry++;
+			adapt_user_group(int_req->req, int_req->st_buf);
+
+			auto i_next = int_req->i_entry;
+			i_next++;
+
 			auto next_off =
 				i_next == int_req->entries.end() ?
 					numeric_limits<off_t>::max() :
@@ -524,11 +561,13 @@ struct ctx_t final
 
 			fuse_session_destroy(fse);
 		}
+
+		fuse_opt_free_args(&f_args);
 	}
 
 	void build_fuse_args()
 	{
-		f_argv.push_back("sdfs-fs");
+		f_argv.push_back("sdfs-fuse");
 
 		if (args.fuse_allow_other)
 			f_argv.push_back("-oallow_other");
@@ -630,7 +669,8 @@ args_t parse_args(int argc, char** argv)
 				if (args.mountpoint.size())
 					throw invalid_cmd_args("Multiple mountpoints given");
 
-				args.mountpoint = arg;
+				/* Convert to absolute path */
+				args.mountpoint = resolve_path(arg);
 			}
 			else
 			{
@@ -727,6 +767,9 @@ void main_exc(args_t args)
 
 	ctx.initialize();
 	ctx.main();
+
+	/* Ensure that no asynchronous callbacks will happen after this point */
+	g_ctx = nullptr;
 }
 
 

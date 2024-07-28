@@ -213,5 +213,9 @@ void fill_st_buf(const inode_t* node, struct stat* st_buf)
 	st_buf->st_nlink = node->nlink;
 	st_buf->st_size = node->size;
 	st_buf->st_blksize = 1024 * 1024;
-	st_buf->st_blocks = align_up(node->size, 1024 * 1024UL) / 512;
+
+	st_buf->st_blocks = node->get_allocated_size() / 512;
+
+	st_buf->st_mtim.tv_sec = node->mtime / 1000000;
+	st_buf->st_mtim.tv_nsec = (node->mtime % 1000000) * 1000;
 }
