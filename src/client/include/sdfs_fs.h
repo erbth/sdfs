@@ -56,6 +56,9 @@ public:
 
 	async_handle_t mkdir(unsigned long parent, const char* name, struct stat& dst,
 			cb_async_finished_t cb_finished, void* arg);
+
+	async_handle_t rmdir(unsigned long parent, const char* name,
+			cb_async_finished_t cb_finished, void* arg);
 };
 
 };

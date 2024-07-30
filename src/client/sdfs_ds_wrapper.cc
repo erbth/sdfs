@@ -75,6 +75,9 @@ std::string SHLIB_EXPORTED error_to_str(int code)
 	case err::NXIO:
 		return "No such device or address"s;
 
+	case err::NOTEMPTY:
+		return "Directory not empty";
+
 	default:
 		return "Unknown error code"s;
 	}

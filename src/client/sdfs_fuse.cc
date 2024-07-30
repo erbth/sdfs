@@ -96,6 +96,9 @@ int convert_error_code(int c)
 	case sdfs::err::NXIO:
 		return ENXIO;
 
+	case sdfs::err::NOTEMPTY:
+		return ENOTEMPTY;
+
 	default:
 		return EIO;
 	};
@@ -111,6 +114,12 @@ void adapt_user_group(fuse_req_t req, struct stat& st_buf)
 
 
 /* Contexts for individual operations */
+struct req_generic
+{
+	fuse_req_t req;
+};
+
+
 struct req_lookup
 {
 	fuse_req_t req;
@@ -284,14 +293,22 @@ struct ctx_t final
 	}
 
 
-	static void _op_rmdir(fuse_req_t req, fuse_ino_t parent, const char* name)
+	static void _cb_op_rmdir(sdfs::async_handle_t handle, int res, void* arg)
 	{
-		g_ctx->op_unlink(req, parent, name);
+		auto int_req = reinterpret_cast<req_generic*>(arg);
+
+		check_call(fuse_reply_err(int_req->req, convert_error_code(res)),
+				"fuse_reply_err");
+
+		delete int_req;
 	}
 
-	void op_rmdir(fuse_req_t req, fuse_ino_t parent, const char* name)
+	static void _op_rmdir(fuse_req_t req, fuse_ino_t parent, const char* name)
 	{
-		check_call(fuse_reply_err(req, ENOSYS), "fuse_reply_err");
+		auto int_req = new req_generic();
+		int_req->req = req;
+
+		g_ctx->fsc.rmdir(parent, name, _cb_op_rmdir, int_req);
 	}
 
 
@@ -560,7 +577,7 @@ struct ctx_t final
 		.getattr = _op_getattr,
 		.mkdir = _op_mkdir,
 		//.unlink = _op_unlink,
-		//.rmdir = _op_rmdir,
+		.rmdir = _op_rmdir,
 		//.open = _op_open,
 		//.read = _op_read,
 		//.write = _op_write,

@@ -59,5 +59,12 @@ async_handle_t SHLIB_EXPORTED FSClient::mkdir(
 	return FSCLIENT(client)->mkdir(parent, name, dst, cb_finished, arg);
 }
 
+async_handle_t SHLIB_EXPORTED FSClient::rmdir(
+		unsigned long parent, const char* name,
+		cb_async_finished_t cb_finished, void* arg)
+{
+	return FSCLIENT(client)->rmdir(parent, name, cb_finished, arg);
+}
+
 
 }

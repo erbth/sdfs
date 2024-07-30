@@ -76,7 +76,7 @@ struct request_t
 	std::string name;
 
 	/* Other data needed for requests */
-	std::vector<inode_t> inodes;
+	std::list<inode_t> inodes;
 
 	uint64_t handle{};
 	sdfs::cb_async_finished_t cb_finished{};
@@ -110,6 +110,12 @@ protected:
 		unsigned long new_id = 0;
 	};
 
+	struct cb_free_inode_ctx
+	{
+		cb_dsio_t cb;
+		unsigned long node_id;
+	};
+
 	sdfs::DSClient dsc;
 
 	size_t raw_size = 0;
@@ -132,10 +138,11 @@ protected:
 
 	void write_block_allocator(allocator_t&, cb_dsio_t, request_t*);
 	void write_inode_allocator(allocator_t&, cb_dsio_t, request_t*);
-	void write_inode(unsigned long node_id, inode_t&, cb_dsio_t, request_t*);
+	void write_inode(unsigned long node_id, const inode_t&, cb_dsio_t, request_t*);
 
+	/* These two operations increment the finished_req counter by 3 */
 	void allocate_inode(unsigned long& node_id, cb_err_t, request_t*);
-	void free_inode(unsigned long node_id, cb_err_t, request_t*);
+	void free_inode(unsigned long node_id, cb_dsio_t, request_t*);
 
 	static void cb_allocator(size_t handle, int res, void* arg);
 	static void cb_read_inode(size_t handle, int read, void* arg);
@@ -143,6 +150,8 @@ protected:
 
 	void cb_allocate_inode(cb_allocate_inode_ctx c, request_t* req);
 	void cb_allocate_inode2(cb_allocate_inode_ctx c, request_t* req);
+	void cb_free_inode(cb_free_inode_ctx c, request_t* req);
+	void cb_free_inode2(cb_free_inode_ctx c, request_t* req);
 
 
 	/* Callbacks for fs operations */
@@ -155,6 +164,9 @@ protected:
 	void cb_mkdir2(int res, request_t* req);
 	void cb_mkdir3(request_t* req);
 	void cb_mkdir4(request_t* req);
+	void cb_rmdir(request_t* req);
+	void cb_rmdir2(request_t* req);
+	void cb_rmdir3(request_t* req);
 
 public:
 	FSClient(const std::vector<std::string>& srv_portals);
@@ -174,6 +186,9 @@ public:
 			sdfs::cb_async_finished_t cb_finished, void* arg);
 
 	sdfs::async_handle_t mkdir(unsigned long parent, const char* name, struct stat& dst,
+			sdfs::cb_async_finished_t cb_finished, void* arg);
+
+	sdfs::async_handle_t rmdir(unsigned long parent, const char* name,
 			sdfs::cb_async_finished_t cb_finished, void* arg);
 };
 
