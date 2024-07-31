@@ -58,6 +58,17 @@ public:
 			cb_async_finished_t cb_finished, void* arg);
 
 	async_handle_t rmdir(unsigned long parent, const char* name,
+			bool auto_free_inode, unsigned long* ino,
+			cb_async_finished_t cb_finished, void* arg);
+
+	async_handle_t create(unsigned long parent, const char* name, struct stat& dst,
+			cb_async_finished_t cb_finished, void* arg);
+
+	async_handle_t unlink(unsigned long parent, const char* name,
+			bool auto_free_inode, unsigned long* ino,
+			cb_async_finished_t cb_finished, void* arg);
+
+	async_handle_t free_inode_explicit(unsigned long ino,
 			cb_async_finished_t cb_finished, void* arg);
 };
 

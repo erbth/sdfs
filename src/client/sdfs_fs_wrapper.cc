@@ -61,9 +61,31 @@ async_handle_t SHLIB_EXPORTED FSClient::mkdir(
 
 async_handle_t SHLIB_EXPORTED FSClient::rmdir(
 		unsigned long parent, const char* name,
+		bool auto_free_inode, unsigned long* ino,
 		cb_async_finished_t cb_finished, void* arg)
 {
-	return FSCLIENT(client)->rmdir(parent, name, cb_finished, arg);
+	return FSCLIENT(client)->rmdir(parent, name, auto_free_inode, ino, cb_finished, arg);
+}
+
+async_handle_t SHLIB_EXPORTED FSClient::create(
+		unsigned long parent, const char* name, struct stat& dst,
+		cb_async_finished_t cb_finished, void* arg)
+{
+	return FSCLIENT(client)->create(parent, name, dst, cb_finished, arg);
+}
+
+async_handle_t SHLIB_EXPORTED FSClient::unlink(
+		unsigned long parent, const char* name,
+		bool auto_free_inode, unsigned long* ino,
+		cb_async_finished_t cb_finished, void* arg)
+{
+	return FSCLIENT(client)->unlink(parent, name, auto_free_inode, ino, cb_finished, arg);
+}
+
+async_handle_t SHLIB_EXPORTED FSClient::free_inode_explicit(unsigned long ino,
+		cb_async_finished_t cb_finished, void* arg)
+{
+	return FSCLIENT(client)->free_inode_explicit(ino, cb_finished, arg);
 }
 
 

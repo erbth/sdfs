@@ -59,7 +59,7 @@ add_executable(sdfs-fuse
 	../common/file_config.cc
 )
 
-target_link_libraries(sdfs-fuse PRIVATE "${LIBFUSE_LIBRARIES}" sdfs_fs)
+target_link_libraries(sdfs-fuse PRIVATE "${LIBFUSE_LIBRARIES}" sdfs_fs sdfs_ds)
 target_include_directories(sdfs-fuse PRIVATE
 	"${LIBFUSE_INCLUDE_DIRS}"
 	"${CMAKE_CURRENT_SOURCE_DIR}/include")

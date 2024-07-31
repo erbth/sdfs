@@ -354,6 +354,16 @@ void FSClient::cb_allocate_inode2(cb_allocate_inode_ctx c, request_t* req)
 
 void FSClient::free_inode(unsigned long node_id, cb_dsio_t cb, request_t* req)
 {
+	/* Check if inode number is in range */
+	if (node_id == 0 || node_id >= sb.inode_count)
+	{
+		req->io_error = true;
+
+		req->finished_reqs.fetch_add(3, memory_order_acq_rel);
+		cb(req);
+		return;
+	}
+
 	/* Read inode allocator */
 	cb_free_inode_ctx c;
 	c.cb = cb;
@@ -388,6 +398,58 @@ void FSClient::cb_free_inode2(cb_free_inode_ctx c, request_t* req)
 
 	c.cb(req);
 	return;
+}
+
+
+void FSClient::free_blocks_of_file(inode_t& node, cb_dsio_t cb, request_t* req)
+{
+	cb_block_allocation_ctx c;
+	c.cb = cb;
+	c.node = &node;
+
+	if (c.node->allocations.empty())
+	{
+		req->finished_reqs.fetch_add(3, memory_order_acq_rel);
+		c.cb(req);
+		return;
+	}
+
+	read_block_allocator(req->block_allocator,
+			bind_front(&FSClient::cb_free_blocks_of_file, this, c), req);
+}
+
+void FSClient::cb_free_blocks_of_file(cb_block_allocation_ctx c, request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (req->io_error)
+	{
+		req->finished_reqs.fetch_add(2, memory_order_acq_rel);
+		c.cb(req);
+		return;
+	}
+
+	/* Mark allocations free */
+	for (auto& a : c.node->allocations)
+	{
+		for (
+				size_t i = a.offset / (1024 * 1024);
+				i < (a.offset + a.size) / (1024 * 1024);
+				i++)
+		{
+			req->block_allocator.mark_free(i);
+		}
+	}
+
+	/* Write block allocator */
+	write_block_allocator(req->block_allocator,
+			bind_front(&FSClient::cb_free_blocks_of_file2, this, c), req);
+}
+
+void FSClient::cb_free_blocks_of_file2(cb_block_allocation_ctx c, request_t* req)
+{
+	req->finished_reqs.fetch_add(1, memory_order_acq_rel);
+	c.cb(req);
 }
 
 
@@ -828,29 +890,37 @@ void FSClient::cb_rmdir2(request_t* req)
 		return;
 	}
 
+	if (req->dst_ino)
+		*req->dst_ino = node.node_id;
+
 	/* Write parent inode */
 	auto& parent = req->inodes.front();
 	write_inode(parent.node_id, parent,
 			bind_front(&FSClient::cb_rmdir3, this), req);
 
-	/* Write child inode */
-	node.type = inode_t::TYPE_FREE;
-	write_inode(node.node_id, node,
-			bind_front(&FSClient::cb_rmdir3, this), req);
+	if (req->auto_free_inode)
+	{
+		/* Write child inode */
+		node.type = inode_t::TYPE_FREE;
+		write_inode(node.node_id, node,
+				bind_front(&FSClient::cb_rmdir3, this), req);
 
-	/* Free inode */
-	free_inode(node.node_id, bind_front(&FSClient::cb_rmdir3, this), req);
+		/* Free inode */
+		free_inode(node.node_id, bind_front(&FSClient::cb_rmdir3, this), req);
+	}
 }
 
 void FSClient::cb_rmdir3(request_t* req)
 {
-	if (req->finished_reqs.fetch_add(1, memory_order_acq_rel) != 9)
+	unsigned nr_reqs = req->auto_free_inode ? 9 : 3;
+	if (req->finished_reqs.fetch_add(1, memory_order_acq_rel) != nr_reqs)
 		return;
 
 	finish_request(req, req->io_error ? err::IO : err::SUCCESS);
 }
 
 sdfs::async_handle_t FSClient::rmdir(unsigned long parent, const char* name,
+		bool auto_free_inode, unsigned long* ino,
 		sdfs::cb_async_finished_t cb_finished, void* arg)
 {
 	auto req = add_request();
@@ -858,11 +928,313 @@ sdfs::async_handle_t FSClient::rmdir(unsigned long parent, const char* name,
 	req->cb_finished = cb_finished;
 	req->cb_finished_arg = arg;
 	req->name = name;
+	req->auto_free_inode = auto_free_inode;
+	req->dst_ino = ino;
 
 	/* Read parent inode */
 	req->inodes.emplace_back();
 	read_inode(parent, req->inodes.back(),
 			bind_front(&FSClient::cb_rmdir, this), req);
+
+	return req->handle;
+}
+
+
+void FSClient::cb_create(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (req->io_error)
+	{
+		finish_request(req, err::IO);
+		return;
+	}
+
+	switch (req->inodes.front().type)
+	{
+	case inode_t::TYPE_DIRECTORY:
+		break;
+
+	case inode_t::TYPE_FILE:
+		finish_request(req, err::NOTDIR);
+		return;
+
+	default:
+		finish_request(req, err::NOENT);
+		return;
+	}
+
+	/* Check for space */
+	if (!req->inodes.front().enough_space_for_file(req->name))
+	{
+		finish_request(req, err::NOSPC);
+		return;
+	}
+
+	/* Allocate a new inode */
+	req->inodes.emplace_back();
+	allocate_inode(req->inodes.back().node_id,
+			bind_front(&FSClient::cb_create2, this), req);
+
+}
+
+void FSClient::cb_create2(int res, request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (res != err::SUCCESS)
+	{
+		finish_request(req, res);
+		return;
+	}
+
+	/* Check supplied name here s.t. it happens from a different thread */
+	if (req->name.size() == 0)
+	{
+		finish_request(req, err::INVAL);
+		return;
+	}
+	else if (req->name.size() > 255)
+	{
+		finish_request(req, err::NAMETOOLONG);
+		return;
+	}
+
+	/* Populate inode */
+	auto& node = req->inodes.back();
+
+	node.type = inode_t::TYPE_FILE;
+	node.nlink = 1;
+	node.mtime = get_wt_now();
+
+	/* Write inode */
+	write_inode(node.node_id, node,
+			bind_front(&FSClient::cb_create3, this), req);
+}
+
+void FSClient::cb_create3(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (req->io_error)
+	{
+		finish_request(req, err::IO);
+		return;
+	}
+
+	/* Update parent */
+	auto& node = req->inodes.front();
+
+	node.size++;
+	node.nlink++;
+
+	node.files.emplace_back(req->name, req->inodes.back().node_id);
+	node.mtime = get_wt_now();
+
+	/* Write parent */
+	write_inode(node.node_id, node,
+			bind_front(&FSClient::cb_create4, this), req);
+}
+
+void FSClient::cb_create4(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (req->io_error)
+	{
+		finish_request(req, err::IO);
+		return;
+	}
+
+	fill_st_buf(&req->inodes.back(), req->st_buf);
+	finish_request(req, req->io_error ? err::IO : err::SUCCESS);
+}
+
+sdfs::async_handle_t FSClient::create(unsigned long parent, const char* name, struct stat& dst,
+		sdfs::cb_async_finished_t cb_finished, void* arg)
+{
+	auto req = add_request();
+
+	req->cb_finished = cb_finished;
+	req->cb_finished_arg = arg;
+	req->name = name;
+	req->st_buf = &dst;
+
+	/* Read parent inode and check for space */
+	req->inodes.emplace_back();
+	read_inode(parent, req->inodes.back(),
+			bind_front(&FSClient::cb_create, this), req);
+
+	return req->handle;
+}
+
+
+void FSClient::cb_unlink(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (req->io_error)
+	{
+		finish_request(req, err::IO);
+		return;
+	}
+
+	switch (req->inodes.front().type)
+	{
+	case inode_t::TYPE_DIRECTORY:
+		break;
+
+	case inode_t::TYPE_FILE:
+		finish_request(req, err::NOTDIR);
+		return;
+
+	default:
+		finish_request(req, err::NOENT);
+		return;
+	}
+
+	auto& parent = req->inodes.front();
+
+	/* Find file */
+	auto i = parent.files.begin();
+	for (; i != parent.files.end() && get<0>(*i) != req->name; i++);
+
+	if (i == parent.files.end())
+	{
+		finish_request(req, err::NOENT);
+		return;
+	}
+
+	auto ino = get<1>(*i);
+
+	/* Update parent inode */
+	parent.nlink--;
+	parent.size--;
+	parent.files.erase(i);
+
+	/* Load child inode */
+	req->inodes.emplace_back();
+	read_inode(ino, req->inodes.back(),
+			bind_front(&FSClient::cb_unlink2, this), req);
+}
+
+void FSClient::cb_unlink2(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (req->io_error)
+	{
+		finish_request(req, err::IO);
+		return;
+	}
+
+	auto& node = req->inodes.back();
+	switch (node.type)
+	{
+	case inode_t::TYPE_FILE:
+		break;
+
+	case inode_t::TYPE_DIRECTORY:
+		finish_request(req, err::ISDIR);
+		return;
+
+	default:
+		finish_request(req, err::NOENT);
+		return;
+	}
+
+	if (req->dst_ino)
+		*req->dst_ino = node.node_id;
+
+	/* Write parent inode */
+	auto& parent = req->inodes.front();
+	write_inode(parent.node_id, parent,
+			bind_front(&FSClient::cb_unlink3, this), req);
+
+	if (req->auto_free_inode)
+	{
+		/* Write child inode */
+		node.type = inode_t::TYPE_FREE;
+		write_inode(node.node_id, node,
+				bind_front(&FSClient::cb_unlink3, this), req);
+
+		/* Free inode */
+		free_inode(node.node_id, bind_front(&FSClient::cb_unlink3, this), req);
+
+		/* Free blocks */
+		free_blocks_of_file(node, bind_front(&FSClient::cb_unlink3, this), req);
+	}
+}
+
+void FSClient::cb_unlink3(request_t* req)
+{
+	unsigned nr_reqs = req->auto_free_inode ? 12 : 3;
+	if (req->finished_reqs.fetch_add(1, memory_order_acq_rel) != nr_reqs)
+		return;
+
+	finish_request(req, req->io_error ? err::IO : err::SUCCESS);
+}
+
+sdfs::async_handle_t FSClient::unlink(unsigned long parent, const char* name,
+		bool auto_free_inode, unsigned long* ino,
+		sdfs::cb_async_finished_t cb_finished, void* arg)
+{
+	auto req = add_request();
+
+	req->cb_finished = cb_finished;
+	req->cb_finished_arg = arg;
+	req->name = name;
+	req->auto_free_inode = auto_free_inode;
+	req->dst_ino = ino;
+
+	/* Read parent inode */
+	req->inodes.emplace_back();
+	read_inode(parent, req->inodes.back(),
+			bind_front(&FSClient::cb_unlink, this), req);
+
+	return req->handle;
+}
+
+
+void FSClient::cb_free_inode_explicit(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	/* Write child inode */
+	auto& node = req->inodes.back();
+
+	node.type = inode_t::TYPE_FREE;
+	write_inode(node.node_id, node,
+			bind_front(&FSClient::cb_free_inode_explicit2, this), req);
+
+	/* Free inode */
+	free_inode(node.node_id, bind_front(&FSClient::cb_free_inode_explicit2, this), req);
+
+	/* Free blocks */
+	free_blocks_of_file(node, bind_front(&FSClient::cb_free_inode_explicit2, this), req);
+}
+
+void FSClient::cb_free_inode_explicit2(request_t* req)
+{
+	if (req->finished_reqs.fetch_add(1, memory_order_acq_rel) != 10)
+		return;
+
+	finish_request(req, req->io_error ? err::IO : err::SUCCESS);
+}
+
+sdfs::async_handle_t FSClient::free_inode_explicit(unsigned long ino,
+		sdfs::cb_async_finished_t cb_finished, void* arg)
+{
+	auto req = add_request();
+
+	req->cb_finished = cb_finished;
+	req->cb_finished_arg = arg;
+
+	/* Read inode */
+	req->inodes.emplace_back();
+
+	read_inode(ino, req->inodes.back(),
+			bind_front(&FSClient::cb_free_inode_explicit, this), req);
 
 	return req->handle;
 }

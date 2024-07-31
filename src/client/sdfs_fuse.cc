@@ -7,6 +7,8 @@
 #include <stdexcept>
 #include <vector>
 #include <string>
+#include <map>
+#include <mutex>
 #include <new>
 #include <fuse_lowlevel.h>
 #include "config.h"
@@ -34,6 +36,8 @@ struct args_t final
 
 struct ctx_t;
 static ctx_t* g_ctx = nullptr;
+
+sdfs::FSClient* g_fsc = nullptr;
 
 
 /* Convert to absolute path */
@@ -113,10 +117,96 @@ void adapt_user_group(fuse_req_t req, struct stat& st_buf)
 }
 
 
+/* Keeping track of inode lookup count
+ *
+ * NOTE: on unmount, not all lookup counts are brought to zero using forget().
+ * Hence dangling inodes may not be removed in this case, leading to an inode
+ * leak in these cases. */
+void cb_free_inode(sdfs::async_handle_t, int res, void* arg)
+{
+	unsigned long ino = (uintptr_t) arg;
+
+	if (res != sdfs::err::SUCCESS)
+	{
+		throw runtime_error(
+				"Failed to free inode " + to_string(ino) + ": " +
+				sdfs::error_to_str(res));
+	}
+}
+
+class InodeReferenceCounter final
+{
+protected:
+	mutex m;
+
+	struct counter_t
+	{
+		size_t count = 0;
+		bool free_on_zero = false;
+	};
+
+	map<unsigned long, counter_t> counters;
+
+public:
+	void increment(unsigned long ino, size_t count = 1)
+	{
+		unique_lock lk(m);
+
+		auto i = counters.find(ino);
+		if (i == counters.end())
+		{
+			bool inserted;
+			tie(i, inserted) = counters.insert({ino, counter_t()});
+		}
+
+		i->second.count += count;
+	}
+
+	void decrement(unsigned long ino, size_t count = 1)
+	{
+		unique_lock lk(m);
+		auto i = counters.find(ino);
+		if (i == counters.end())
+			throw runtime_error("Attempted to decrement unknown inode's lookup count");
+
+		if (i->second.count < count)
+			throw runtime_error("Attempted to decrement an inode's lookup count below zero");
+
+		i->second.count -= count;
+
+		if (i->second.count == 0)
+		{
+			if (i->second.free_on_zero)
+			{
+				/* Free inode */
+				g_fsc->free_inode_explicit(ino, cb_free_inode,
+						reinterpret_cast<void*>((uintptr_t) ino));
+			}
+
+			counters.erase(i);
+		}
+	}
+
+	void free(unsigned long ino)
+	{
+		unique_lock lk(m);
+		auto i = counters.find(ino);
+		if (i != counters.end())
+			i->second.free_on_zero = true;
+		else
+			g_fsc->free_inode_explicit(ino, cb_free_inode,
+					reinterpret_cast<void*>((uintptr_t) ino));
+	}
+};
+
+InodeReferenceCounter inode_ref_counter;
+
+
 /* Contexts for individual operations */
-struct req_generic
+struct req_unlink
 {
 	fuse_req_t req;
+	unsigned long ino;
 };
 
 
@@ -166,6 +256,15 @@ struct req_statfs
 };
 
 
+struct req_create
+{
+	fuse_req_t req;
+
+	struct fuse_entry_param fep{};
+	struct fuse_file_info fi;
+};
+
+
 /* FUSE context */
 struct ctx_t final
 {
@@ -192,11 +291,23 @@ struct ctx_t final
 		}
 		else
 		{
-			adapt_user_group(int_req->req, int_req->fep.attr);
+			auto node_id = int_req->fep.attr.st_ino;
 
+			adapt_user_group(int_req->req, int_req->fep.attr);
 			int_req->fep.ino = int_req->fep.attr.st_ino;
-			check_call(fuse_reply_entry(int_req->req, &int_req->fep),
-					"fuse_reply_entry");
+
+			inode_ref_counter.increment(node_id);
+
+			try
+			{
+				check_call(fuse_reply_entry(int_req->req, &int_req->fep),
+						"fuse_reply_entry");
+			}
+			catch (...)
+			{
+				inode_ref_counter.decrement(node_id);
+				throw;
+			}
 		}
 
 		delete int_req;
@@ -212,14 +323,10 @@ struct ctx_t final
 	}
 
 
-	static void _op_forget(fuse_req_t req, fuse_ino_t ino, uint64_t lookup)
+	static void _op_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
 	{
-		g_ctx->op_forget(req, ino, lookup);
-	}
-
-	void op_forget(fuse_req_t req, fuse_ino_t ino, uint64_t lookup)
-	{
-		check_call(fuse_reply_err(req, ENOSYS), "fuse_reply_err");
+		inode_ref_counter.decrement(ino, nlookup);
+		fuse_reply_none(req);
 	}
 
 
@@ -262,11 +369,23 @@ struct ctx_t final
 		}
 		else
 		{
-			adapt_user_group(int_req->req, int_req->fep.attr);
+			auto node_id = int_req->fep.attr.st_ino;
 
+			adapt_user_group(int_req->req, int_req->fep.attr);
 			int_req->fep.ino = int_req->fep.attr.st_ino;
-			check_call(fuse_reply_entry(int_req->req, &int_req->fep),
-					"fuse_reply_entry");
+
+			inode_ref_counter.increment(node_id);
+
+			try
+			{
+				check_call(fuse_reply_entry(int_req->req, &int_req->fep),
+						"fuse_reply_entry");
+			}
+			catch (...)
+			{
+				inode_ref_counter.decrement(node_id);
+				throw;
+			}
 		}
 
 		delete int_req;
@@ -282,33 +401,49 @@ struct ctx_t final
 	}
 
 
-	static void _op_unlink(fuse_req_t req, fuse_ino_t parent, const char* name)
+	static void _cb_op_unlink(sdfs::async_handle_t handle, int res, void* arg)
 	{
-		g_ctx->op_unlink(req, parent, name);
+		auto int_req = reinterpret_cast<req_unlink*>(arg);
+
+		check_call(fuse_reply_err(int_req->req, convert_error_code(res)),
+				"fuse_reply_err");
+
+		auto node_id = int_req->ino;
+		delete int_req;
+
+		if (res == sdfs::err::SUCCESS)
+			inode_ref_counter.free(node_id);
 	}
 
-	void op_unlink(fuse_req_t req, fuse_ino_t parent, const char* name)
+	static void _op_unlink(fuse_req_t req, fuse_ino_t parent, const char* name)
 	{
-		check_call(fuse_reply_err(req, ENOSYS), "fuse_reply_err");
+		auto int_req = new req_unlink();
+		int_req->req = req;
+
+		g_ctx->fsc.unlink(parent, name, false, &int_req->ino, _cb_op_unlink, int_req);
 	}
 
 
 	static void _cb_op_rmdir(sdfs::async_handle_t handle, int res, void* arg)
 	{
-		auto int_req = reinterpret_cast<req_generic*>(arg);
+		auto int_req = reinterpret_cast<req_unlink*>(arg);
 
 		check_call(fuse_reply_err(int_req->req, convert_error_code(res)),
 				"fuse_reply_err");
 
+		auto node_id = int_req->ino;
 		delete int_req;
+
+		if (res == sdfs::err::SUCCESS)
+			inode_ref_counter.free(node_id);
 	}
 
 	static void _op_rmdir(fuse_req_t req, fuse_ino_t parent, const char* name)
 	{
-		auto int_req = new req_generic();
+		auto int_req = new req_unlink();
 		int_req->req = req;
 
-		g_ctx->fsc.rmdir(parent, name, _cb_op_rmdir, int_req);
+		g_ctx->fsc.rmdir(parent, name, false, &int_req->ino, _cb_op_rmdir, int_req);
 	}
 
 
@@ -558,25 +693,61 @@ struct ctx_t final
 	}
 
 
+	static void _cb_op_create(sdfs::async_handle_t handle, int res, void* arg)
+	{
+		auto int_req = reinterpret_cast<req_create*>(arg);
+
+		if (res != sdfs::err::SUCCESS)
+		{
+			check_call(fuse_reply_err(int_req->req, convert_error_code(res)),
+					"fuse_reply_err");
+		}
+		else
+		{
+			auto node_id = int_req->fep.attr.st_ino;
+
+			adapt_user_group(int_req->req, int_req->fep.attr);
+
+			int_req->fi.fh = 0;
+			int_req->fi.direct_io = true;
+			int_req->fi.keep_cache = false;
+
+			int_req->fep.ino = int_req->fep.attr.st_ino;
+
+			inode_ref_counter.increment(node_id);
+
+			try
+			{
+				check_call(fuse_reply_create(int_req->req, &int_req->fep, &int_req->fi),
+						"fuse_reply_create");
+			}
+			catch (...)
+			{
+				inode_ref_counter.decrement(node_id);
+				throw;
+			}
+		}
+
+		delete int_req;
+	}
+
 	static void _op_create(fuse_req_t req, fuse_ino_t parent, const char* name,
 			mode_t mode, struct fuse_file_info* fi)
 	{
-		g_ctx->op_create(req, parent, name, mode, fi);
-	}
+		auto int_req = new req_create();
+		int_req->req = req;
+		int_req->fi = *fi;
 
-	void op_create(fuse_req_t req, fuse_ino_t parent, const char* name,
-			mode_t mode, struct fuse_file_info* fi)
-	{
-		check_call(fuse_reply_err(req, ENOSYS), "fuse_reply_err");
+		g_ctx->fsc.create(parent, name, int_req->fep.attr, _cb_op_create, int_req);
 	}
 
 
 	static constexpr struct fuse_lowlevel_ops f_ops = {
 		.lookup = _op_lookup,
-		//.forget = _op_forget,
+		.forget = _op_forget,
 		.getattr = _op_getattr,
 		.mkdir = _op_mkdir,
-		//.unlink = _op_unlink,
+		.unlink = _op_unlink,
 		.rmdir = _op_rmdir,
 		//.open = _op_open,
 		//.read = _op_read,
@@ -584,7 +755,7 @@ struct ctx_t final
 		//.release = _op_release,
 		.readdir = _op_readdir,
 		.statfs = _op_statfs,
-		//.create = _op_create
+		.create = _op_create
 	};
 
 
@@ -808,12 +979,14 @@ void main_exc(args_t args)
 {
 	ctx_t ctx(args);
 	g_ctx = &ctx;
+	g_fsc = &g_ctx->fsc;
 
 	ctx.initialize();
 	ctx.main();
 
 	/* Ensure that no asynchronous callbacks will happen after this point */
 	g_ctx = nullptr;
+	g_fsc = nullptr;
 }
 
 
