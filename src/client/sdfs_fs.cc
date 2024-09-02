@@ -601,6 +601,49 @@ vector<tuple<size_t, size_t, size_t>> FSClient::map_chunk(
 
 void FSClient::obtain_inode(unsigned long ino, cb_dsio_t cb, request_t* req)
 {
+	/* Check if the inode is in the cache and the cache entry not stale */
+	{
+		shared_lock lk(m_inode_cache);
+		auto i = inode_cache.find(ino);
+		if (i != inode_cache.end())
+		{
+			auto& [t,c_node] = i->second;
+
+			auto t_now = get_monotonic_time();
+			if (t <= t_now && (t_now - t) < 100000000ULL)
+			{
+				cnt_inode_cache_hit.fetch_add(1, memory_order_relaxed);
+
+				/* Copy to avoid carrying locks */
+				req->inodes.emplace_back(c_node);
+				req->c_inode = &req->inodes.back();
+
+				req->finished_reqs.fetch_add(2, memory_order_acq_rel);
+				cb(req);
+				return;
+			}
+		}
+	}
+
+	cnt_inode_cache_miss.fetch_add(1, memory_order_relaxed);
+
+
+	/* Remove all stale cache entries */
+	{
+		unique_lock lk(m_inode_cache);
+
+		auto t_now = get_monotonic_time();
+
+		for (auto i = inode_cache.begin(); i != inode_cache.end();)
+		{
+			auto cur = i++;
+
+			auto t = cur->first;
+			if (t > t_now || (t_now - t) >= 100000000ULL)
+				inode_cache.erase(cur);
+		}
+	}
+
 	/* Read inode */
 	req->inodes.emplace_back();
 	read_inode(ino, req->inodes.back(),
@@ -621,12 +664,25 @@ void FSClient::cb_obtain_inode(cb_dsio_t cb, request_t* req)
 	}
 
 	/* Add inode to cache if not cached in the meantime */
+	{
+		unique_lock lk(m_inode_cache);
 
-	/* Return inode from cache */
+		if (inode_cache.find(node.node_id) == inode_cache.end())
+			inode_cache.emplace(node.node_id, make_pair(get_monotonic_time(), node));
+	}
+
+	/* Return inode */
 	req->c_inode = &node;
 
 	req->finished_reqs.fetch_add(1, memory_order_acq_rel);
 	cb(req);
+}
+
+
+void FSClient::expunge_cached_inode(unsigned long ino)
+{
+	unique_lock lk(m_inode_cache);
+	inode_cache.erase(ino);
 }
 
 
@@ -1084,6 +1140,9 @@ void FSClient::cb_rmdir2(request_t* req)
 
 		/* Free inode */
 		free_inode(node.node_id, bind_front(&FSClient::cb_rmdir3, this), req);
+
+		/* Expunge inode from the cache */
+		expunge_cached_inode(node.node_id);
 	}
 }
 
@@ -1338,6 +1397,9 @@ void FSClient::cb_unlink2(request_t* req)
 		/* Free inode */
 		free_inode(node.node_id, bind_front(&FSClient::cb_unlink3, this), req);
 
+		/* Expunge inode from the cache */
+		expunge_cached_inode(node.node_id);
+
 		/* Free blocks */
 		free_blocks_of_file(node, bind_front(&FSClient::cb_unlink3, this), req);
 	}
@@ -1386,6 +1448,8 @@ void FSClient::cb_free_inode_explicit(request_t* req)
 
 	/* Free inode */
 	free_inode(node.node_id, bind_front(&FSClient::cb_free_inode_explicit2, this), req);
+
+	/* Expunge indoe from the cache */
 
 	/* Free blocks */
 	free_blocks_of_file(node, bind_front(&FSClient::cb_free_inode_explicit2, this), req);
@@ -1527,12 +1591,13 @@ void FSClient::cb_write(request_t* req)
 
 	/* Expunge inode from the cache s.t. no partly altered version of it remains
 	 * cached. */
-	/* TODO: put into inodes.back() (currently is by the way how obtain_inode is
-	 * implemented) and expunge */
+	req->inodes.emplace_back(*req->c_inode);
+	req->c_inode = nullptr;
+	auto& node = req->inodes.back();
+
+	expunge_cached_inode(node.node_id);
 
 	/* Allocate additional space if required */
-	auto& node = *req->c_inode;
-
 	auto req_end = req->offset + req->size;
 	auto allocated_size = node.get_allocated_size();
 	if (allocated_size < req_end)

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <map>
 #include <functional>
+#include <shared_mutex>
 #include "sdfs_ds_internal.h"
 #include "sdfs_fs.h"
 #include "fs_utils.h"
@@ -197,10 +198,21 @@ protected:
 	static std::vector<std::tuple<size_t, size_t, size_t>> map_chunk(
 			const inode_t& node, size_t offset, size_t size);
 
+	/* Increments the finished_req counter by 2, and uses req->inodes */
 	void obtain_inode(unsigned long ino, cb_dsio_t, request_t*);
 
-	/* Increments the finished_req counter by 2, and uses req->inodes */
 	void cb_obtain_inode(cb_dsio_t, request_t*);
+
+
+	std::shared_mutex m_inode_cache;
+	std::map<unsigned long, std::pair<unsigned long long, inode_t>> inode_cache;
+
+	void expunge_cached_inode(unsigned long ino);
+
+
+	/* Statistics */
+	std::atomic<unsigned long> cnt_inode_cache_miss{0};
+	std::atomic<unsigned long> cnt_inode_cache_hit{0};
 
 
 	/* Callbacks for fs operations */
