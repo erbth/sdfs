@@ -88,5 +88,20 @@ async_handle_t SHLIB_EXPORTED FSClient::free_inode_explicit(unsigned long ino,
 	return FSCLIENT(client)->free_inode_explicit(ino, cb_finished, arg);
 }
 
+async_handle_t SHLIB_EXPORTED FSClient::read(
+		unsigned long ino, size_t offset, size_t size, size_t& dst_size, char* buf,
+		cb_async_finished_t cb_finished, void* arg)
+{
+	return FSCLIENT(client)->read(ino, offset, size, dst_size, buf,
+			cb_finished, arg);
+}
+
+async_handle_t SHLIB_EXPORTED FSClient::write(
+		unsigned long ino, size_t offset, size_t size, const char* buf,
+		cb_async_finished_t cb_finished, void* arg)
+{
+	return FSCLIENT(client)->write(ino, offset, size, buf, cb_finished, arg);
+}
+
 
 }

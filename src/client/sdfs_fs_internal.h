@@ -5,6 +5,7 @@
 
 #include <list>
 #include <atomic>
+#include <map>
 #include <functional>
 #include "sdfs_ds_internal.h"
 #include "sdfs_fs.h"
@@ -63,22 +64,35 @@ struct request_t
 	 * operation). */
 	std::atomic<unsigned> finished_reqs{0};
 	bool io_error{false};
+	bool err_no_spc{false};
 
-	/* Destination buffer */
+	unsigned expected_reqs{0};
+
+	/* Destination buffers / variadic argument */
 	union
 	{
 		sdfs::fs_attr_t* fs_attr;
 		struct stat* st_buf;
 		std::vector<sdfs::dir_entry_t>* dir_entries;
 		unsigned long* dst_ino;
+		char* rd_buf;
+		const char* wr_buf;
 	};
+
+	size_t* dst_size;
 
 	/* Arguments */
 	std::string name;
 	bool auto_free_inode{false};
 
+	size_t offset{};
+	size_t size{};
+
 	/* Other data needed for requests */
 	std::list<inode_t> inodes;
+
+	/* Cached inode obtained with obtain_inode */
+	inode_t* c_inode = nullptr;
 
 	uint64_t handle{};
 	sdfs::cb_async_finished_t cb_finished{};
@@ -121,7 +135,9 @@ protected:
 	struct cb_block_allocation_ctx
 	{
 		cb_dsio_t cb;
-		inode_t* node;
+		inode_t* node{};
+
+		size_t to_allocate{};
 	};
 
 	sdfs::DSClient dsc;
@@ -153,8 +169,8 @@ protected:
 	void free_inode(unsigned long node_id, cb_dsio_t, request_t*);
 
 	static void cb_allocator(size_t handle, int res, void* arg);
-	static void cb_read_inode(size_t handle, int read, void* arg);
-	static void cb_write_inode(size_t handle, int read, void* arg);
+	static void cb_read_inode(size_t handle, int res, void* arg);
+	static void cb_write_inode(size_t handle, int res, void* arg);
 
 	void cb_allocate_inode(cb_allocate_inode_ctx c, request_t* req);
 	void cb_allocate_inode2(cb_allocate_inode_ctx c, request_t* req);
@@ -166,6 +182,25 @@ protected:
 
 	void cb_free_blocks_of_file(cb_block_allocation_ctx c, request_t* req);
 	void cb_free_blocks_of_file2(cb_block_allocation_ctx c, request_t* req);
+
+	/* Increments the finished_req counter by 3.
+	 * This does NOT write the inode! */
+	void allocate_blocks_for_file(inode_t& node, size_t to_allocate,
+			cb_dsio_t, request_t*);
+
+	void cb_allocate_blocks_for_file(cb_block_allocation_ctx c, request_t* req);
+	void cb_allocate_blocks_for_file2(cb_block_allocation_ctx c, request_t* req);
+
+
+	/* Working with (regular) files and the file inode cache */
+	/* @returns [(offset_data, offset_buffer, size)] */
+	static std::vector<std::tuple<size_t, size_t, size_t>> map_chunk(
+			const inode_t& node, size_t offset, size_t size);
+
+	void obtain_inode(unsigned long ino, cb_dsio_t, request_t*);
+
+	/* Increments the finished_req counter by 2, and uses req->inodes */
+	void cb_obtain_inode(cb_dsio_t, request_t*);
 
 
 	/* Callbacks for fs operations */
@@ -195,6 +230,14 @@ protected:
 
 	void cb_free_inode_explicit(request_t* req);
 	void cb_free_inode_explicit2(request_t* req);
+
+	void cb_read(request_t* req);
+	static void cb_read2(size_t handle, int res, void* arg);
+
+	void cb_write(request_t* req);
+	void cb_write2(request_t* req);
+	void cb_write3(request_t* req);
+	static void cb_write4(size_t handle, int req, void* arg);
 
 public:
 	FSClient(const std::vector<std::string>& srv_portals);
@@ -235,10 +278,16 @@ public:
 			bool auto_free_inode, unsigned long* ino,
 			sdfs::cb_async_finished_t cb_finished, void* arg);
 
-	sdfs::async_handle_t read();
-	sdfs::async_handle_t write();
-
 	sdfs::async_handle_t free_inode_explicit(unsigned long ino,
+			sdfs::cb_async_finished_t cb_finished, void* arg);
+
+	/* @param dst_size will be updated with the actual size read. 0 means EOF */
+	sdfs::async_handle_t read(
+			unsigned long ino, size_t offset, size_t size, size_t& dst_size, char* buf,
+			sdfs::cb_async_finished_t cb_finished, void* arg);
+
+	sdfs::async_handle_t write(
+			unsigned long ino, size_t offset, size_t size, const char* buf,
 			sdfs::cb_async_finished_t cb_finished, void* arg);
 };
 

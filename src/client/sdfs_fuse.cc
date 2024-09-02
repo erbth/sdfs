@@ -14,6 +14,7 @@
 #include "config.h"
 #include "common/exceptions.h"
 #include "common/file_config.h"
+#include "common/fixed_buffer.h"
 #include "common/dynamic_buffer.h"
 #include "sdfs_fs_internal.h"
 
@@ -265,6 +266,15 @@ struct req_create
 };
 
 
+struct req_io
+{
+	fuse_req_t req;
+
+	size_t act_size{};
+	fixed_buffer buf;
+};
+
+
 /* FUSE context */
 struct ctx_t final
 {
@@ -449,49 +459,89 @@ struct ctx_t final
 
 	static void _op_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
 	{
-		g_ctx->op_open(req, ino, fi);
+		fi->fh = 0;
+		fi->direct_io = true;
+		fi->keep_cache = false;
+
+		check_call(fuse_reply_open(req, fi), "fuse_reply_open");
 	}
 
-	void op_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
+
+	static void _cb_op_read(sdfs::async_handle_t handle, int res, void* arg)
 	{
-		check_call(fuse_reply_err(req, ENOSYS), "fuse_reply_err");
-	}
+		auto int_req = reinterpret_cast<req_io*>(arg);
 
+		try
+		{
+			if (res != sdfs::err::SUCCESS)
+			{
+				check_call(fuse_reply_err(int_req->req, convert_error_code(res)),
+						"fuse_reply_err");
+			}
+			else
+			{
+				check_call(fuse_reply_buf(int_req->req, int_req->buf.ptr(), int_req->act_size),
+						"fuse_reply_buf");
+			}
+		}
+		catch (...)
+		{
+			delete int_req;
+			throw;
+		}
+
+		delete int_req;
+	}
 
 	static void _op_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 			struct fuse_file_info* fi)
 	{
-		g_ctx->op_read(req, ino, size, off, fi);
+		auto int_req = new req_io();
+
+		int_req->req = req;
+		int_req->buf = fixed_buffer(size);
+
+		g_ctx->fsc.read(ino, off, size, int_req->act_size, int_req->buf.ptr(),
+				_cb_op_read, int_req);
 	}
 
-	void op_read(fuse_req_t req, fuse_ino_t ino, size_t sizse, off_t off,
-			struct fuse_file_info* fi)
+
+	static void _cb_op_write(sdfs::async_handle_t handle, int res, void* arg)
 	{
-		check_call(fuse_reply_err(req, ENOSYS), "fuse_reply_err");
-	}
+		auto int_req = reinterpret_cast<req_io*>(arg);
+		auto req = int_req->req;
+		auto size = int_req->act_size;
+		delete int_req;
 
+		if (res != sdfs::err::SUCCESS)
+		{
+			check_call(fuse_reply_err(req, convert_error_code(res)),
+					"fuse_reply_err");
+		}
+		else
+		{
+			check_call(fuse_reply_write(req, size), "fuse_reply_write");
+		}
+	}
 
 	static void _op_write(fuse_req_t req, fuse_ino_t ino, const char* buf, size_t size,
 			off_t off, struct fuse_file_info* fi)
 	{
-		g_ctx->op_write(req, ino, buf, size, off, fi);
-	}
+		auto int_req = new req_io();
 
-	void op_write(fuse_req_t req, fuse_ino_t ino, const char* buf, size_t size,
-			off_t off, struct fuse_file_info* fi)
-	{
-		check_call(fuse_reply_err(req, ENOSYS), "fuse_reply_err");
+		int_req->req = req;
+		int_req->buf = fixed_buffer(size);
+		int_req->act_size = size;
+
+		memcpy(int_req->buf.ptr(), buf, size);
+
+		g_ctx->fsc.write(ino, off, size, int_req->buf.ptr(), _cb_op_write, int_req);
 	}
 
 
 	static void _op_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
 	{
-		g_ctx->op_release(req, ino, fi);
-	}
-
-	void op_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
-	{
-		check_call(fuse_reply_err(req, ENOSYS), "fuse_reply_err");
+		check_call(fuse_reply_err(req, 0), "fuse_reply_err");
 	}
 
 
@@ -749,10 +799,10 @@ struct ctx_t final
 		.mkdir = _op_mkdir,
 		.unlink = _op_unlink,
 		.rmdir = _op_rmdir,
-		//.open = _op_open,
-		//.read = _op_read,
-		//.write = _op_write,
-		//.release = _op_release,
+		.open = _op_open,
+		.read = _op_read,
+		.write = _op_write,
+		.release = _op_release,
 		.readdir = _op_readdir,
 		.statfs = _op_statfs,
 		.create = _op_create

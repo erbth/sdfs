@@ -453,6 +453,183 @@ void FSClient::cb_free_blocks_of_file2(cb_block_allocation_ctx c, request_t* req
 }
 
 
+void FSClient::allocate_blocks_for_file(inode_t& node, size_t to_allocate,
+		cb_dsio_t cb, request_t* req)
+{
+	cb_block_allocation_ctx c;
+	c.cb = cb;
+	c.node = &node;
+	c.to_allocate = to_allocate;
+
+	/* Load block allocator */
+	read_block_allocator(req->block_allocator,
+			bind_front(&FSClient::cb_allocate_blocks_for_file, this, c), req);
+}
+
+void FSClient::cb_allocate_blocks_for_file(cb_block_allocation_ctx c, request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (req->io_error)
+	{
+		req->finished_reqs.fetch_add(2, memory_order_acq_rel);
+		c.cb(req);
+		return;
+	}
+
+	auto node = c.node;
+	ssize_t to_allocate = c.to_allocate;
+
+	/* Overflow (second clause: potentially later overflow) */
+	if (
+			to_allocate <= 0 ||
+			to_allocate > numeric_limits<ssize_t>::max() - 1024 * 1024 * 1024L)
+	{
+		req->io_error = true;
+		req->finished_reqs.fetch_add(2, memory_order_acq_rel);
+		c.cb(req);
+		return;
+	}
+
+
+	/* Ensure allocated size alignment based on file size to limit the rate of
+	 * required allocation calls */
+	auto new_size = node->get_allocated_size() + to_allocate;
+	size_t granularity = 1;
+
+	if (new_size > 1024 * (1024 * 1024UL))
+		granularity = 1024 * (1024 * 1024UL);
+	else if (new_size > 100 * (1024 * 1024UL))
+		granularity = 100 * (1024 * 1024UL);
+	else if (new_size > 10 * (1024 * 1024UL))
+		granularity = 10 * (1024 * 1024UL);
+
+	auto min_new_size = ((new_size + granularity - 1) / granularity) * granularity;
+	to_allocate += min_new_size - new_size;
+
+
+	/* Allocate blocks */
+	/* Begin search at the beginning where spinning disks are fastest */
+	size_t i_block = 0;
+
+	constexpr size_t block_size = 1024 * 1024;
+
+	while (i_block < sb.block_count && to_allocate > 0)
+	{
+		if (req->block_allocator.is_free(i_block))
+		{
+			req->block_allocator.mark_allocated(i_block);
+
+			/* Try to merge with last allocation */
+			auto b_offset = i_block * block_size;
+			if (node->allocations.size() &&
+					node->allocations.back().offset + node->allocations.back().size == b_offset)
+			{
+				node->allocations.back().size += block_size;
+			}
+			else
+			{
+				/* Inode already full */
+				if (node->allocations.size() >= 240)
+					break;
+
+				node->allocations.emplace_back(b_offset, block_size);
+			}
+
+			to_allocate -= block_size;
+		}
+
+		i_block++;
+	}
+
+	if (to_allocate > 0)
+	{
+		req->io_error = true;
+		req->err_no_spc = true;
+		c.cb(req);
+		return;
+	}
+
+	/* Write block allocator */
+	write_block_allocator(req->block_allocator,
+			bind_front(&FSClient::cb_allocate_blocks_for_file2, this, c), req);
+}
+
+void FSClient::cb_allocate_blocks_for_file2(cb_block_allocation_ctx c, request_t* req)
+{
+	req->finished_reqs.fetch_add(1, memory_order_acq_rel);
+	c.cb(req);
+}
+
+
+vector<tuple<size_t, size_t, size_t>> FSClient::map_chunk(
+		const inode_t& node, size_t offset, size_t size)
+{
+	vector<tuple<size_t, size_t, size_t>> ret;
+
+	size_t ptr = 0;
+	auto chunk_end = offset + size;
+
+	for (const auto& a : node.allocations)
+	{
+		/* Check for overlap */
+		auto a_end = ptr + a.size;
+
+		if (a_end <= offset)
+		{
+			ptr += a.size;
+			continue;
+		}
+
+		if (ptr >= chunk_end)
+			break;
+
+		/* Start of overlap relative to allocation */
+		size_t off_alloc = ptr >= offset ? 0 : offset - ptr;
+
+		/* Size of overlap */
+		size_t common_start = max(ptr, offset);
+		size_t common_size = min(a_end, chunk_end) - common_start;
+
+		ret.emplace_back(a.offset + off_alloc, ptr, common_size);
+		ptr = a_end;
+	}
+
+	return ret;
+}
+
+
+void FSClient::obtain_inode(unsigned long ino, cb_dsio_t cb, request_t* req)
+{
+	/* Read inode */
+	req->inodes.emplace_back();
+	read_inode(ino, req->inodes.back(),
+			bind_front(&FSClient::cb_obtain_inode, this, cb), req);
+}
+
+void FSClient::cb_obtain_inode(cb_dsio_t cb, request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	auto& node = req->inodes.back();
+
+	if (req->io_error || node.type == inode_t::TYPE_FREE)
+	{
+		req->finished_reqs.fetch_add(1, memory_order_acq_rel);
+		cb(req);
+		return;
+	}
+
+	/* Add inode to cache if not cached in the meantime */
+
+	/* Return inode from cache */
+	req->c_inode = &node;
+
+	req->finished_reqs.fetch_add(1, memory_order_acq_rel);
+	cb(req);
+}
+
+
 void FSClient::cb_getfsattr(request_t* req)
 {
 	if (req->finished_reqs.fetch_add(1, memory_order_acq_rel) != 3)
@@ -1235,6 +1412,210 @@ sdfs::async_handle_t FSClient::free_inode_explicit(unsigned long ino,
 
 	read_inode(ino, req->inodes.back(),
 			bind_front(&FSClient::cb_free_inode_explicit, this), req);
+
+	return req->handle;
+}
+
+
+void FSClient::cb_read(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (req->io_error || !req->c_inode)
+	{
+		finish_request(req, err::IO);
+		return;
+	}
+
+	/* Check request parameters
+	 * If the offset == file size, EOF will be returned later.
+	 * (the last clause checks for overflow) */
+	if (
+			(req->offset > req->c_inode->size) ||
+			req->size + req->offset < req->offset)
+	{
+		finish_request(req, err::INVAL);
+		return;
+	}
+
+	req->size = min(req->c_inode->size - req->offset, req->size);
+	*req->dst_size = req->size;
+
+	if (req->size == 0)
+	{
+		finish_request(req, err::SUCCESS);
+		return;
+	}
+
+	/* Map requested chunk to allocations */
+	auto chunks = map_chunk(*req->c_inode, req->offset, req->size);
+	if (chunks.size() == 0)
+	{
+		finish_request(req, err::IO);
+		return;
+	}
+
+	/* Read data */
+	req->finished_reqs.store(0, memory_order_release);
+	req->expected_reqs = chunks.size() - 1;
+
+	for (auto [o_d, o_b, s] : chunks)
+		dsc.read(req->rd_buf + o_b, o_d, s, cb_read2, req);
+}
+
+void FSClient::cb_read2(size_t handle, int res, void* arg)
+{
+	auto req = reinterpret_cast<request_t*>(arg);
+
+	/* NOTE: This assumes that bool-writes do not cause conflicts that turn an
+	 * existing or written true-value into false */
+	if (res != err::SUCCESS)
+		req->io_error = true;
+
+	auto cnt_reqs = req->finished_reqs.fetch_add(1, memory_order_acq_rel);
+	if (cnt_reqs != req->expected_reqs)
+		return;
+
+	req->fsc->finish_request(req, req->io_error ? err::IO : err:: SUCCESS);
+}
+
+sdfs::async_handle_t FSClient::read(
+		unsigned long ino, size_t offset, size_t size, size_t& dst_size, char* buf,
+		sdfs::cb_async_finished_t cb_finished, void* arg)
+{
+	auto req = add_request();
+
+	req->cb_finished = cb_finished;
+	req->cb_finished_arg = arg;
+	req->offset = offset;
+	req->size = size;
+	req->dst_size = &dst_size;
+	req->rd_buf = buf;
+
+	/* Obtain inode */
+	obtain_inode(ino, bind_front(&FSClient::cb_read, this), req);
+
+	return req->handle;
+}
+
+
+void FSClient::cb_write(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (req->io_error || !req->c_inode)
+	{
+		finish_request(req, err::IO);
+		return;
+	}
+
+	/* Check request parameters
+	 * (the last clause checks for overflow) */
+	if (
+			req->offset > req->c_inode->size ||
+			req->size + req->offset < req->offset)
+	{
+		finish_request(req, err::INVAL);
+		return;
+	}
+
+	if (req->size == 0)
+	{
+		finish_request(req, err::SUCCESS);
+		return;
+	}
+
+	/* Expunge inode from the cache s.t. no partly altered version of it remains
+	 * cached. */
+	/* TODO: put into inodes.back() (currently is by the way how obtain_inode is
+	 * implemented) and expunge */
+
+	/* Allocate additional space if required */
+	auto& node = *req->c_inode;
+
+	auto req_end = req->offset + req->size;
+	auto allocated_size = node.get_allocated_size();
+	if (allocated_size < req_end)
+	{
+		allocate_blocks_for_file(node, req_end - allocated_size,
+				bind_front(&FSClient::cb_write2, this), req);
+	}
+	else
+	{
+		cb_write2(req);
+	}
+}
+
+void FSClient::cb_write2(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (req->io_error)
+	{
+		finish_request(req, req->err_no_spc ? err::NOSPC : err::IO);
+		return;
+	}
+
+	/* Update inode */
+	auto& node = req->inodes.back();
+
+	node.size = max(node.size, req->offset + req->size);
+	node.mtime = get_wt_now();
+
+	/* Write inode */
+	write_inode(node.node_id, node, bind_front(&FSClient::cb_write3, this), req);
+}
+
+void FSClient::cb_write3(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	/* Map chunk to allocations */
+	auto chunks = map_chunk(*req->c_inode, req->offset, req->size);
+	if (chunks.size() == 0)
+	{
+		finish_request(req, err::IO);
+		return;
+	}
+
+	/* Write data */
+	req->finished_reqs.store(0, memory_order_release);
+	req->expected_reqs = chunks.size() - 1;
+
+	for (auto [o_d, o_b, s] : chunks)
+		dsc.write(req->wr_buf + o_b, o_d, s, cb_write4, req);
+}
+
+void FSClient::cb_write4(size_t handle, int res, void* arg)
+{
+	auto req = reinterpret_cast<request_t*>(arg);
+
+	/* NOTE: This assumes that bool-writes do not cause conflicts that turn an
+	 * existing or written true-value into false */
+	if (res != err::SUCCESS)
+		req->io_error = true;
+
+	auto cnt_reqs = req->finished_reqs.fetch_add(1, memory_order_acq_rel);
+	if (cnt_reqs != req->expected_reqs)
+		return;
+
+	req->fsc->finish_request(req, req->io_error ? err::IO : err::SUCCESS);
+}
+
+sdfs::async_handle_t FSClient::write(
+		unsigned long ino, size_t offset, size_t size, const char* buf,
+		sdfs::cb_async_finished_t cb_finished, void* arg)
+{
+	auto req = add_request();
+
+	req->cb_finished = cb_finished;
+	req->cb_finished_arg = arg;
+	req->offset = offset;
+	req->size = size;
+	req->wr_buf = buf;
+
+	/* Obtain inode */
+	obtain_inode(ino, bind_front(&FSClient::cb_write, this), req);
 
 	return req->handle;
 }

@@ -70,6 +70,14 @@ public:
 
 	async_handle_t free_inode_explicit(unsigned long ino,
 			cb_async_finished_t cb_finished, void* arg);
+
+	async_handle_t read(
+			unsigned long ino, size_t offset, size_t size, size_t& dst_size, char* buf,
+			cb_async_finished_t cb_finished, void* arg);
+
+	async_handle_t write(
+			unsigned long ino, size_t offset, size_t size, const char* buf,
+			cb_async_finished_t cb_finished, void* arg);
 };
 
 };
