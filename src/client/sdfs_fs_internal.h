@@ -251,6 +251,10 @@ protected:
 	void cb_write3(request_t* req);
 	static void cb_write4(size_t handle, int req, void* arg);
 
+	void cb_truncate(request_t* req);
+	void cb_truncate2(request_t* req);
+	void cb_truncate3(request_t* req);
+
 public:
 	FSClient(const std::vector<std::string>& srv_portals);
 	~FSClient();
@@ -300,6 +304,10 @@ public:
 
 	sdfs::async_handle_t write(
 			unsigned long ino, size_t offset, size_t size, const char* buf,
+			sdfs::cb_async_finished_t cb_finished, void* arg);
+
+	sdfs::async_handle_t truncate(
+			unsigned long ino,
 			sdfs::cb_async_finished_t cb_finished, void* arg);
 };
 

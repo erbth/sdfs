@@ -103,5 +103,12 @@ async_handle_t SHLIB_EXPORTED FSClient::write(
 	return FSCLIENT(client)->write(ino, offset, size, buf, cb_finished, arg);
 }
 
+async_handle_t SHLIB_EXPORTED FSClient::truncate(
+		unsigned long ino,
+		cb_async_finished_t cb_finished, void* arg)
+{
+	return FSCLIENT(client)->truncate(ino, cb_finished, arg);
+}
+
 
 }

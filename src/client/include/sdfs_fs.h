@@ -78,6 +78,10 @@ public:
 	async_handle_t write(
 			unsigned long ino, size_t offset, size_t size, const char* buf,
 			cb_async_finished_t cb_finished, void* arg);
+
+	async_handle_t truncate(
+			unsigned long ino,
+			cb_async_finished_t cb_finished, void* arg);
 };
 
 };

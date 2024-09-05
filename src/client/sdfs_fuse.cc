@@ -265,6 +265,13 @@ struct req_create
 	struct fuse_file_info fi;
 };
 
+struct req_open
+{
+	fuse_req_t req;
+
+	struct fuse_file_info fi;
+};
+
 
 struct req_io
 {
@@ -457,13 +464,42 @@ struct ctx_t final
 	}
 
 
+	static void _cb_op_open(sdfs::async_handle_t handle, int res, void* arg)
+	{
+		auto int_req = reinterpret_cast<req_open*>(arg);
+		auto req = int_req->req;
+		auto fi = int_req->fi;
+		delete int_req;
+
+		if (res == sdfs::err::SUCCESS)
+		{
+			check_call(fuse_reply_open(req, &fi), "fuse_reply_open");
+		}
+		else
+		{
+			check_call(fuse_reply_err(req, convert_error_code(res)),
+					"fuse_reply_err");
+		}
+	}
+
 	static void _op_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
 	{
 		fi->fh = 0;
 		fi->direct_io = true;
 		fi->keep_cache = false;
 
-		check_call(fuse_reply_open(req, fi), "fuse_reply_open");
+		if (fi->flags & O_TRUNC)
+		{
+			auto int_req = new req_open();
+			int_req->req = req;
+			int_req->fi = *fi;
+
+			g_ctx->fsc.truncate(ino, _cb_op_open, int_req);
+		}
+		else
+		{
+			check_call(fuse_reply_open(req, fi), "fuse_reply_open");
+		}
 	}
 
 

@@ -568,6 +568,7 @@ vector<tuple<size_t, size_t, size_t>> FSClient::map_chunk(
 	vector<tuple<size_t, size_t, size_t>> ret;
 
 	size_t ptr = 0;
+	size_t buf_ptr = 0;
 	auto chunk_end = offset + size;
 
 	for (const auto& a : node.allocations)
@@ -591,8 +592,9 @@ vector<tuple<size_t, size_t, size_t>> FSClient::map_chunk(
 		size_t common_start = max(ptr, offset);
 		size_t common_size = min(a_end, chunk_end) - common_start;
 
-		ret.emplace_back(a.offset + off_alloc, ptr, common_size);
+		ret.emplace_back(a.offset + off_alloc, buf_ptr, common_size);
 		ptr = a_end;
+		buf_ptr += common_size;
 	}
 
 	return ret;
@@ -1636,7 +1638,7 @@ void FSClient::cb_write3(request_t* req)
 	req->finished_reqs.load(memory_order_acquire);
 
 	/* Map chunk to allocations */
-	auto chunks = map_chunk(*req->c_inode, req->offset, req->size);
+	auto chunks = map_chunk(req->inodes.back(), req->offset, req->size);
 	if (chunks.size() == 0)
 	{
 		finish_request(req, err::IO);
@@ -1681,6 +1683,72 @@ sdfs::async_handle_t FSClient::write(
 
 	/* Obtain inode */
 	obtain_inode(ino, bind_front(&FSClient::cb_write, this), req);
+
+	return req->handle;
+}
+
+
+void FSClient::cb_truncate(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (req->io_error || !req->c_inode)
+	{
+		finish_request(req, err::IO);
+		return;
+	}
+
+	/* Expunge inode from the cache s.t. no partly altered version of it remains
+	 * cached. */
+	req->inodes.emplace_back(*req->c_inode);
+	req->c_inode = nullptr;
+	auto& node = req->inodes.back();
+
+	expunge_cached_inode(node.node_id);
+
+	/* Free blocks */
+	free_blocks_of_file(node, bind_front(&FSClient::cb_truncate2, this), req);
+}
+
+void FSClient::cb_truncate2(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	if (req->io_error)
+	{
+		finish_request(req, err::IO);
+		return;
+	}
+
+	/* Remove allocations from inode and set size to 0 */
+	auto& node = req->inodes.back();
+	node.allocations.clear();
+
+	node.size = 0;
+
+	/* Write inode */
+	write_inode(node.node_id, node,
+			bind_front(&FSClient::cb_truncate3, this), req);
+}
+
+void FSClient::cb_truncate3(request_t* req)
+{
+	req->finished_reqs.load(memory_order_acquire);
+
+	finish_request(req, req->io_error ? err::IO : err::SUCCESS);
+}
+
+sdfs::async_handle_t FSClient::truncate(
+		unsigned long ino,
+		sdfs::cb_async_finished_t cb_finished, void* arg)
+{
+	auto req = add_request();
+
+	req->cb_finished = cb_finished;
+	req->cb_finished_arg = arg;
+
+	/* Obtain inode */
+	obtain_inode(ino, bind_front(&FSClient::cb_truncate, this), req);
 
 	return req->handle;
 }
