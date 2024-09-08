@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <list>
 #include <mutex>
 #include <new>
 #include <fuse_lowlevel.h>
@@ -201,6 +202,41 @@ public:
 };
 
 InodeReferenceCounter inode_ref_counter;
+
+
+/* Per opened file data */
+struct file_data_t
+{
+	bool append = false;
+};
+
+mutex m_file_data_list;
+list<file_data_t> file_data_list;
+
+inline file_data_t* get_file_data(struct fuse_file_info* fi)
+{
+	return reinterpret_cast<file_data_t*>(fi->fh);
+}
+
+inline file_data_t* create_file_data()
+{
+	unique_lock lk(m_file_data_list);
+	return &file_data_list.emplace_back();
+}
+
+inline void remove_file_data(file_data_t* fd)
+{
+	unique_lock lk(m_file_data_list);
+
+	for (auto i = file_data_list.begin(); i != file_data_list.end(); i++)
+	{
+		if (&(*i) == fd)
+		{
+			file_data_list.erase(i);
+			return;
+		}
+	}
+}
 
 
 /* Contexts for individual operations */
@@ -473,6 +509,10 @@ struct ctx_t final
 
 		if (res == sdfs::err::SUCCESS)
 		{
+			auto fd = create_file_data();
+			fd->append = fi.flags & O_APPEND;
+			fi.fh = reinterpret_cast<intptr_t>(fd);
+
 			check_call(fuse_reply_open(req, &fi), "fuse_reply_open");
 		}
 		else
@@ -498,6 +538,10 @@ struct ctx_t final
 		}
 		else
 		{
+			auto fd = create_file_data();
+			fd->append = fi->flags & O_APPEND;
+			fi->fh = reinterpret_cast<intptr_t>(fd);
+
 			check_call(fuse_reply_open(req, fi), "fuse_reply_open");
 		}
 	}
@@ -571,12 +615,17 @@ struct ctx_t final
 
 		memcpy(int_req->buf.ptr(), buf, size);
 
+		/* Handle O_APPEND */
+		if (get_file_data(fi)->append)
+			off = -1;
+
 		g_ctx->fsc.write(ino, off, size, int_req->buf.ptr(), _cb_op_write, int_req);
 	}
 
 
 	static void _op_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
 	{
+		remove_file_data(get_file_data(fi));
 		check_call(fuse_reply_err(req, 0), "fuse_reply_err");
 	}
 
@@ -794,7 +843,10 @@ struct ctx_t final
 
 			adapt_user_group(int_req->req, int_req->fep.attr);
 
-			int_req->fi.fh = 0;
+			auto fd = create_file_data();
+			fd->append = int_req->fi.flags & O_APPEND;
+			int_req->fi.fh = reinterpret_cast<intptr_t>(fd);
+
 			int_req->fi.direct_io = true;
 			int_req->fi.keep_cache = false;
 

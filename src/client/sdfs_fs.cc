@@ -1575,6 +1575,10 @@ void FSClient::cb_write(request_t* req)
 		return;
 	}
 
+	/* Adapt offset for append writes */
+	if (req->append)
+		req->offset = req->c_inode->size;
+
 	/* Check request parameters
 	 * (the last clause checks for overflow) */
 	if (
@@ -1670,14 +1674,19 @@ void FSClient::cb_write4(size_t handle, int res, void* arg)
 }
 
 sdfs::async_handle_t FSClient::write(
-		unsigned long ino, size_t offset, size_t size, const char* buf,
+		unsigned long ino, off_t offset, size_t size, const char* buf,
 		sdfs::cb_async_finished_t cb_finished, void* arg)
 {
 	auto req = add_request();
 
 	req->cb_finished = cb_finished;
 	req->cb_finished_arg = arg;
-	req->offset = offset;
+
+	if (offset == -1)
+		req->append = true;
+	else
+		req->offset = offset;
+
 	req->size = size;
 	req->wr_buf = buf;
 

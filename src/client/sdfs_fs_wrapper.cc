@@ -97,7 +97,7 @@ async_handle_t SHLIB_EXPORTED FSClient::read(
 }
 
 async_handle_t SHLIB_EXPORTED FSClient::write(
-		unsigned long ino, size_t offset, size_t size, const char* buf,
+		unsigned long ino, off_t offset, size_t size, const char* buf,
 		cb_async_finished_t cb_finished, void* arg)
 {
 	return FSCLIENT(client)->write(ino, offset, size, buf, cb_finished, arg);

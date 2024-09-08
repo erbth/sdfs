@@ -17,6 +17,9 @@
 class FSClient;
 
 
+static_assert(sizeof(off_t) >= sizeof(size_t));
+
+
 struct allocator_t
 {
 	fixed_buffer buf;
@@ -88,6 +91,7 @@ struct request_t
 
 	size_t offset{};
 	size_t size{};
+	bool append = false;
 
 	/* Other data needed for requests */
 	std::list<inode_t> inodes;
@@ -302,8 +306,9 @@ public:
 			unsigned long ino, size_t offset, size_t size, size_t& dst_size, char* buf,
 			sdfs::cb_async_finished_t cb_finished, void* arg);
 
+	/* @param offset of -1 means append (i.e. like O_APPEND) */
 	sdfs::async_handle_t write(
-			unsigned long ino, size_t offset, size_t size, const char* buf,
+			unsigned long ino, off_t offset, size_t size, const char* buf,
 			sdfs::cb_async_finished_t cb_finished, void* arg);
 
 	sdfs::async_handle_t truncate(
