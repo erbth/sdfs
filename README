@@ -1,12 +1,21 @@
-Sequential Data FileSystem
+# Sequential Data FileSystem (sdfs)
 
 A simple distributed filesystem for sequential data.
 
 libsdfs_ds:  block data storage client library
 libsdfs_fs:  filesystem client library; builds on top of libsdfs-ds
 
+sdfs-ds:     Simple block IO client
+sdfs-mkfs:   Format a sdfs storage for use as filesystem (or display information
+             about it)
+sdfs-fuse:   fuse filesystem client
+
 Restrictions:
-  * parallel unaligned writes can overwrite each other (race condition on the
+  * Parallel unaligned writes can overwrite each other (race condition on the
 	unaltered bytes)
 
-  * optimized for sequential reads; writes are (probably) slower
+  * Optimized for sequential reads; writes are (probably) slower
+
+  * The filesystem does not implement locking. Hence parallel writes and reads
+	can overlap each other and produce corrupt data, including corrupting the
+	filesystem
