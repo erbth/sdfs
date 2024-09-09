@@ -29,9 +29,14 @@ Description: sdfs ctrl
 
 Package: sdfs-tools
 Architecture: any
-Depends: libsdfs-ds-1-0 (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}
+Depends:
+ libsdfs-ds-1-0 (= ${binary:Version}),
+ libsdfs-fs-1-0 (= ${binary:Version}),
+ ${shlibs:Depends},
+ ${misc:Depends}
 Description: tools for sdfs
- Client-side tools for sdfs like sdfs-ds
+ Client-side tools for sdfs like sdfs-ds and sdfs-mkfs. This package includes
+ the fuse filesystem client sdfs-fuse.
 
 Package: libsdfs-ds-1-0
 Architecture: any
@@ -39,8 +44,18 @@ Depends: sdfs-common (= ${binary:Version}), ${shlibs:Depends}, ${misc:Depends}
 Description: data service client library for sdfs
  Client library to access sdfs on the block layer
 
+Package: libsdfs-fs-1-0
+Architecture: any
+Depends:
+ sdfs-common (= ${binary:Version}),
+ libsdfs-ds-1-0 (= ${binary:Version}),
+ ${shlibs:Depends},
+ ${misc:Depends}
+Description: filesystem client library for sdfs
+ Client library to access sdfs on the filesystem layer
+
 Package: libsdfs-dev
 Architecture: any
-Depends: libsdfs-ds-1-0 (= ${binary:Version}), ${misc:Depends}
+Depends: libsdfs-ds-1-0 (= ${binary:Version}), libsdfs-fs-1-0 (= ${binary:Version}), ${misc:Depends}
 Description:
  Development files for sdfs's client libraries

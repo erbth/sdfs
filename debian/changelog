@@ -1,3 +1,9 @@
+sdfs (1.0.1) unstable; urgency=medium
+
+  * Filesystem support
+
+ -- Thomas Erbesdobler <t.erbesdobler@gmx.de>  Tue, 10 Sep 2024 01:00:15 +0200
+
 sdfs (1.0.0) unstable; urgency=medium
 
   * Initial packaged version
