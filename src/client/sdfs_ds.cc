@@ -594,6 +594,8 @@ void worker_thread_ctx::on_path_fd(path_t* path, int fd, uint32_t events)
 
 unique_ptr<io_request_t> worker_thread_ctx::remove_io_request(path_t* p, uint64_t seq)
 {
+	unique_lock lk_mss(p->m_state_send);
+
 	auto i = p->io_requests.find(seq);
 	if (i == p->io_requests.end())
 		return nullptr;
