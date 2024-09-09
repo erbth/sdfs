@@ -604,6 +604,8 @@ vector<tuple<size_t, size_t, size_t>> FSClient::map_chunk(
 void FSClient::obtain_inode(unsigned long ino, cb_dsio_t cb, request_t* req)
 {
 	/* Check if the inode is in the cache and the cache entry not stale */
+	bool found = false;
+
 	{
 		shared_lock lk(m_inode_cache);
 		auto i = inode_cache.find(ino);
@@ -620,11 +622,17 @@ void FSClient::obtain_inode(unsigned long ino, cb_dsio_t cb, request_t* req)
 				req->inodes.emplace_back(c_node);
 				req->c_inode = &req->inodes.back();
 
-				req->finished_reqs.fetch_add(2, memory_order_acq_rel);
-				cb(req);
-				return;
+				found = true;
 			}
 		}
+	}
+
+	/* Call callback outside of lock */
+	if (found)
+	{
+		req->finished_reqs.fetch_add(2, memory_order_acq_rel);
+		cb(req);
+		return;
 	}
 
 	cnt_inode_cache_miss.fetch_add(1, memory_order_relaxed);
