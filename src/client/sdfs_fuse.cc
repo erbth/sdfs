@@ -333,6 +333,13 @@ struct ctx_t final
 	struct fuse_args f_args{};
 
 	/* Operations */
+	static void _op_init(void* userdata, struct fuse_conn_info* conn)
+	{
+		/* Allow for extensive async io */
+		conn->max_background = 128;
+	}
+
+
 	static void _cb_op_lookup(sdfs::async_handle_t handle, int res, void* arg)
 	{
 		auto int_req = reinterpret_cast<req_lookup*>(arg);
@@ -881,6 +888,7 @@ struct ctx_t final
 
 
 	static constexpr struct fuse_lowlevel_ops f_ops = {
+		.init = _op_init,
 		.lookup = _op_lookup,
 		.forget = _op_forget,
 		.getattr = _op_getattr,
