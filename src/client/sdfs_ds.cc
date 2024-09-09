@@ -110,10 +110,13 @@ void DSClient::init_paths(const vector<string>& srv_portals)
 							socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0),
 							"socket");
 
-					path.addr.sin6_addr = ((const struct sockaddr_in6&) ai->ai_addr).sin6_addr;
+					path.addr.sin6_addr = ((const struct sockaddr_in6*) ai->ai_addr)->sin6_addr;
 
 					if (connect(wfd.get_fd(), (const struct sockaddr*) &path.addr, sizeof(path.addr)) == 0)
+					{
+						path.wfd = move(wfd);
 						break;
+					}
 				}
 
 				freeaddrinfo(addrs);
