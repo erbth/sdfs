@@ -614,7 +614,7 @@ void FSClient::obtain_inode(unsigned long ino, cb_dsio_t cb, request_t* req)
 			auto& [t,c_node] = i->second;
 
 			auto t_now = get_monotonic_time();
-			if (t <= t_now && (t_now - t) < 100000000ULL)
+			if (t <= t_now && (t_now - t) < 1000000000ULL)
 			{
 				cnt_inode_cache_hit.fetch_add(1, memory_order_relaxed);
 
@@ -637,7 +637,6 @@ void FSClient::obtain_inode(unsigned long ino, cb_dsio_t cb, request_t* req)
 
 	cnt_inode_cache_miss.fetch_add(1, memory_order_relaxed);
 
-
 	/* Remove all stale cache entries */
 	{
 		unique_lock lk(m_inode_cache);
@@ -649,7 +648,7 @@ void FSClient::obtain_inode(unsigned long ino, cb_dsio_t cb, request_t* req)
 			auto cur = i++;
 
 			auto t = cur->first;
-			if (t > t_now || (t_now - t) >= 100000000ULL)
+			if (t > t_now || (t_now - t) >= 1000000000ULL)
 				inode_cache.erase(cur);
 		}
 	}
