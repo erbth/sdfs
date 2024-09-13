@@ -21,6 +21,7 @@ sdfs-mkfs:   Format a sdfs storage for use as filesystem (or display information
 sdfs-fuse:   fuse filesystem client
 
 Restrictions:
+
   * Parallel unaligned writes can overwrite each other (race condition on the
 	unaltered bytes)
 
@@ -33,3 +34,7 @@ Restrictions:
 	or size is changed. However for writing into an existing file without
 	extending its size will only lead to undeterministic mtime overwriting,
 	which is not a problem.
+
+  * No rate-limiting: If the asynchronous IO requests in flight from clients is
+    too high, the disks may return errors (which propagate as IO errors to the
+    sdfs-client).

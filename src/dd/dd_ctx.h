@@ -208,6 +208,9 @@ protected:
 
 	void write_req_write(disk_io_req* qe);
 
+	/* Error logging */
+	void log_io_error(disk_io_req*, int code);
+
 public:
 	const std::string device_file;
 

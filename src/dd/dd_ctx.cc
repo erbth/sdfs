@@ -396,6 +396,8 @@ void dd_ctx::on_read_io_finished(disk_io_req* qe, int res)
 {
 	if (res <= 0)
 	{
+		log_io_error(qe, -res);
+
 		send_message_to_client(
 				qe->client,
 				prot::dd::reply::read(qe->client_request_id, err::IO));
@@ -488,6 +490,8 @@ void dd_ctx::on_write_read_finished(disk_io_req* qe, int res)
 {
 	if (res <= 0)
 	{
+		log_io_error(qe, -res);
+
 		send_message_to_client(
 				qe->client,
 				prot::dd::reply::write(qe->client_request_id, err::IO));
@@ -536,6 +540,8 @@ void dd_ctx::on_write_io_finished(disk_io_req* qe, int res)
 {
 	if (res <= 0)
 	{
+		log_io_error(qe, -res);
+
 		send_message_to_client(
 				qe->client,
 				prot::dd::reply::write(qe->client_request_id, err::IO));
@@ -658,6 +664,15 @@ void dd_ctx::on_epoll_ready(int res)
 
 	io_uring.submit_poll(epoll.get_fd(), POLLIN,
 			bind_front(&dd_ctx::on_epoll_ready, this));
+}
+
+
+void dd_ctx::log_io_error(disk_io_req* qe, int code)
+{
+	char buf[1024];
+	fprintf(stderr, "dd %u: IO error `%s' at offset %zu, size %zu\n",
+			di.id, strerror_r(code, buf, sizeof(buf)),
+			qe->io_offset, qe->io_length);
 }
 
 
