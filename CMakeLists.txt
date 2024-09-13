@@ -6,7 +6,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -O3 -std=gnu++20 -gdwarf-2")
 
 set(SDFS_VERSION_MAJOR 1)
 set(SDFS_VERSION_MINOR 0)
-set(SDFS_VERSION_PATCH 2)
+set(SDFS_VERSION_PATCH 3)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBFUSE REQUIRED fuse3)

@@ -965,8 +965,6 @@ struct ctx_t final
 		if (fuse_session_mount(fse, args.mountpoint.c_str()))
 			throw runtime_error("fuse_session_mount failed");
 		session_mounted = true;
-
-		fuse_daemonize(args.fuse_foreground);
 	}
 
 	void main()
@@ -1123,6 +1121,9 @@ The following options are available:
 
 void main_exc(args_t args)
 {
+	/* Fork to background before starting client threads */
+	fuse_daemonize(args.fuse_foreground);
+
 	ctx_t ctx(args);
 	g_ctx = &ctx;
 	g_fsc = &g_ctx->fsc;
