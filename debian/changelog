@@ -1,3 +1,10 @@
+sdfs (1.0.4) unstable; urgency=medium
+
+  * Log IO errors
+  * Increased inode cache time
+
+ -- Thomas Erbesdobler <t.erbesdobler@gmx.de>  Sat, 14 Sep 2024 02:11:43 +0200
+
 sdfs (1.0.3) unstable; urgency=medium
 
   * Fixed fork-to-background
