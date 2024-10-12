@@ -1,3 +1,9 @@
+sdfs (1.0.5) unstable; urgency=medium
+
+  * Some fixes discovered through new warnings of a new compiler version
+
+ -- Thomas Erbesdobler <t.erbesdobler@gmx.de>  Sat, 12 Oct 2024 21:23:11 +0200
+
 sdfs (1.0.4) unstable; urgency=medium
 
   * Log IO errors

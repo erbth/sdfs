@@ -280,7 +280,7 @@ void dd_mgr_ctx::on_client_conn(int fd, uint32_t events)
 		wfd = cfd;
 		cfd = -1;
 
-		clients.push_back(move(wfd));
+		clients.emplace_back(move(wfd));
 	}
 	catch (...)
 	{

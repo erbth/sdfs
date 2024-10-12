@@ -54,7 +54,7 @@ set_target_properties(sdfs_fs PROPERTIES
 
 # FUSE client for the filesystem
 add_executable(sdfs-fuse
-	sdfs_fuse
+	sdfs_fuse.cc
 	../common/exceptions.cc
 	../common/file_config.cc
 )

@@ -330,7 +330,7 @@ void DSClient::wt_signal_all_except(unsigned thread_id)
 
 void worker_thread_ctx::on_eventfd()
 {
-	if (wt_quit->load(memory_order_release))
+	if (wt_quit->load(memory_order_acquire))
 		stop_thread = true;
 
 	/* Enable senders if required */

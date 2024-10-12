@@ -43,6 +43,13 @@ struct dd_queued_msg final
 	{
 	}
 
+	inline dd_queued_msg(
+			disk_io_req* io_req,
+			size_t msg_len)
+		: vbuf(io_req), msg_len(msg_len)
+	{
+	}
+
 	const char* buf_ptr();
 
 	inline void return_buffer(dynamic_aligned_buffer_pool& pool)

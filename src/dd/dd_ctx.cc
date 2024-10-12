@@ -611,7 +611,7 @@ bool dd_ctx::send_message_to_client(disk_io_req* qe)
 
 	/* qe->req_offset is the negative header size */
 	auto msg_len = qe->length_for_send;
-	client->send_queue.emplace(move(qe), msg_len);
+	client->send_queue.emplace(qe, msg_len);
 
 	if (was_empty)
 		epoll.change_events(client->get_fd(), EPOLLIN | EPOLLOUT | EPOLLHUP | EPOLLRDHUP);
